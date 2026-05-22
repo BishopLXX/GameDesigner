@@ -3,15 +3,17 @@ from __future__ import annotations
 import copy
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QPoint, QPointF, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
+    QIcon,
     QPainter,
     QPainterPath,
     QPen,
     QPixmap,
 )
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -20,6 +22,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGraphicsItem,
     QGraphicsObject,
+    QGraphicsProxyWidget,
     QGraphicsScene,
     QGraphicsView,
     QGroupBox,
@@ -214,6 +217,7 @@ class NodeFrameItem(QGraphicsItem):
 class EditorFieldItem(QGraphicsObject):
     changed = Signal()
     clicked = Signal(int)
+    activated = Signal(int)
 
     def __init__(self, index: int, field: NodeField, theme: str) -> None:
         super().__init__()
@@ -297,6 +301,7 @@ class EditorFieldItem(QGraphicsObject):
     def mouseDoubleClickEvent(self, event) -> None:  # type: ignore[override]
         self.clicked.emit(self.index)
         self.setSelected(True)
+        self.activated.emit(self.index)
         event.accept()
 
     def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
@@ -331,9 +336,29 @@ class EditorFieldItem(QGraphicsObject):
         return pos.x() >= rect.right() - FIELD_HANDLE and pos.y() >= rect.bottom() - FIELD_HANDLE
 
 
+class InlineFieldEditor(QPlainTextEdit):
+    editingFinished = Signal()
+
+    def focusOutEvent(self, event) -> None:  # type: ignore[override]
+        self.editingFinished.emit()
+        super().focusOutEvent(event)
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter) and event.modifiers() & Qt.ControlModifier:
+            self.editingFinished.emit()
+            event.accept()
+            return
+        if event.key() == Qt.Key_Escape:
+            self.editingFinished.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
 class FieldCanvas(QGraphicsView):
     fieldSelected = Signal(int)
     fieldActivated = Signal(int)
+    fieldContentEdited = Signal(int)
     fieldChanged = Signal()
     cardAddRequested = Signal(str, float, float)
     cardDeleteRequested = Signal(int)
@@ -348,6 +373,9 @@ class FieldCanvas(QGraphicsView):
         self.selected_index: int | None = 0 if fields else None
         self._panning = False
         self._last_pan = QPointF()
+        self._inline_proxy: QGraphicsProxyWidget | None = None
+        self._inline_editor: InlineFieldEditor | None = None
+        self._inline_index: int | None = None
         self.scene_obj = QGraphicsScene(self)
         self.setScene(self.scene_obj)
         self.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing | QPainter.SmoothPixmapTransform)
@@ -387,6 +415,7 @@ class FieldCanvas(QGraphicsView):
             y += step
 
     def refresh(self, selected_index: int | None = None) -> None:
+        self._close_inline_editor(emit_changed=False)
         self.scene_obj.clear()
         self.selected_index = selected_index if selected_index is not None else self.selected_index
         width, height = self._card_size()
@@ -395,6 +424,7 @@ class FieldCanvas(QGraphicsView):
         for index, field in enumerate(self.fields):
             item = EditorFieldItem(index, field, self.theme)
             item.clicked.connect(self._select_item)
+            item.activated.connect(self._activate_item)
             item.changed.connect(self.fieldChanged.emit)
             item.setSelected(index == self.selected_index)
             self.scene_obj.addItem(item)
@@ -419,8 +449,7 @@ class FieldCanvas(QGraphicsView):
         if event.button() == Qt.LeftButton:
             item = self._field_at(event.position().toPoint())
             if item:
-                self._select_item(item.index)
-                self.fieldActivated.emit(item.index)
+                self._activate_item(item.index)
                 event.accept()
                 return
         super().mouseDoubleClickEvent(event)
@@ -466,11 +495,81 @@ class FieldCanvas(QGraphicsView):
             self.cardAddRequested.emit("image", field_x, field_y)
 
     def _select_item(self, index: int) -> None:
+        if self._inline_index != index:
+            self._close_inline_editor()
         self.selected_index = index
         for item in self.scene_obj.items():
             if isinstance(item, EditorFieldItem):
                 item.setSelected(item.index == index)
         self.fieldSelected.emit(index)
+
+    def _activate_item(self, index: int) -> None:
+        self._select_item(index)
+        if index < 0 or index >= len(self.fields):
+            return
+        field = self.fields[index]
+        if field.data_type == "图片":
+            self.fieldActivated.emit(index)
+            return
+        self._start_inline_editor(index)
+
+    def _start_inline_editor(self, index: int) -> None:
+        self._close_inline_editor()
+        if index < 0 or index >= len(self.fields):
+            return
+        field = self.fields[index]
+        editor = InlineFieldEditor()
+        editor.setPlainText(field.value)
+        editor.setObjectName("inlineFieldEditor")
+        editor.setStyleSheet(
+            "QPlainTextEdit#inlineFieldEditor {"
+            "border: 2px solid #007AFF;"
+            "border-radius: 8px;"
+            "padding: 6px;"
+            f"color: {field.text_color or '#1D1D1F'};"
+            f"background: {field.bg_color or '#FFFFFF'};"
+            "}"
+        )
+        font = editor.font()
+        font.setPointSize(max(8, min(48, field.font_size)))
+        editor.setFont(font)
+        editor.textChanged.connect(lambda index=index: self._apply_inline_text(index))
+        editor.editingFinished.connect(lambda: self._close_inline_editor())
+
+        proxy = QGraphicsProxyWidget()
+        proxy.setWidget(editor)
+        proxy.setZValue(100)
+        proxy.setPos(QPointF(field.x + 6, HEADER_HEIGHT + field.y + 6))
+        proxy.resize(max(40.0, field.width - 12), max(30.0, field.height - 12))
+        self.scene_obj.addItem(proxy)
+        self._inline_proxy = proxy
+        self._inline_editor = editor
+        self._inline_index = index
+        editor.setFocus()
+        editor.selectAll()
+
+    def _apply_inline_text(self, index: int) -> None:
+        if not self._inline_editor or index < 0 or index >= len(self.fields):
+            return
+        field = self.fields[index]
+        if field.data_type == "图片":
+            return
+        field.value = self._inline_editor.toPlainText()
+        self.fieldContentEdited.emit(index)
+
+    def _close_inline_editor(self, emit_changed: bool = True) -> None:
+        if not self._inline_proxy:
+            self._inline_editor = None
+            self._inline_index = None
+            return
+        proxy = self._inline_proxy
+        self._inline_proxy = None
+        self._inline_editor = None
+        self._inline_index = None
+        self.scene_obj.removeItem(proxy)
+        proxy.deleteLater()
+        if emit_changed:
+            self.fieldChanged.emit()
 
     def _field_at(self, pos: QPoint) -> EditorFieldItem | None:
         for item in self.items(pos):
@@ -534,20 +633,19 @@ class NodeEditorDialog(QDialog):
         self.font_size = QLineEdit()
         self.text_color = QLineEdit()
         self.bg_color = QLineEdit()
-        self.h_align = QComboBox()
-        self.h_align.addItem("左", "left")
-        self.h_align.addItem("居中", "center")
-        self.h_align.addItem("右", "right")
-        self.v_align = QComboBox()
-        self.v_align.addItem("上", "top")
-        self.v_align.addItem("居中", "center")
-        self.v_align.addItem("下", "bottom")
+        self.h_align_group = QButtonGroup(self)
+        self.h_align_group.setExclusive(True)
+        self.v_align_group = QButtonGroup(self)
+        self.v_align_group.setExclusive(True)
+        self.h_align_buttons: dict[str, QToolButton] = {}
+        self.v_align_buttons: dict[str, QToolButton] = {}
         self.pin_buttons: dict[str, QToolButton] = {}
 
         self.canvas = FieldCanvas(self.fields, theme)
         self.canvas.set_header(self.title_edit.text(), self.icon_edit.text(), self.color_edit.text())
         self.canvas.fieldSelected.connect(self._load_selected_props)
         self.canvas.fieldActivated.connect(self._focus_field_value)
+        self.canvas.fieldContentEdited.connect(self._on_canvas_field_content_edited)
         self.canvas.fieldChanged.connect(self._on_field_changed)
         self.canvas.cardAddRequested.connect(self._add_card_at)
         self.canvas.cardDeleteRequested.connect(self._delete_card_at)
@@ -573,6 +671,7 @@ class NodeEditorDialog(QDialog):
 
     def _side_panel(self) -> QWidget:
         panel = QWidget()
+        panel.setMinimumWidth(356)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(12, 0, 0, 0)
         layout.setSpacing(12)
@@ -588,8 +687,8 @@ class NodeEditorDialog(QDialog):
 
         props = QGroupBox("选中卡片属性")
         props_layout = QVBoxLayout(props)
-        props_layout.setContentsMargins(14, 16, 14, 12)
-        props_layout.setSpacing(7)
+        props_layout.setContentsMargins(12, 16, 12, 12)
+        props_layout.setSpacing(8)
         self.content_label = QLabel("内容")
         self.image_label = QLabel("图片")
         self.image_row = self._path_row(self.image_path, "选择图片", self._pick_image)
@@ -679,14 +778,14 @@ class NodeEditorDialog(QDialog):
         row = QWidget()
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
+        layout.setSpacing(5)
         for prop, label, editor in (
             ("x", "X", self.field_x),
             ("y", "Y", self.field_y),
             ("width", "宽", self.field_w),
             ("height", "高", self.field_h),
         ):
-            layout.addWidget(self._compact_pin_input(prop, label, editor, 44))
+            layout.addWidget(self._compact_pin_input(prop, label, editor, 42))
         return row
 
     def _font_row(self) -> QWidget:
@@ -700,13 +799,35 @@ class NodeEditorDialog(QDialog):
 
     def _alignment_row(self) -> QWidget:
         row = QWidget()
-        layout = QHBoxLayout(row)
+        layout = QVBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
-        layout.addWidget(QLabel("横向"))
-        layout.addWidget(self.h_align, 1)
-        layout.addWidget(QLabel("纵向"))
-        layout.addWidget(self.v_align, 1)
+        layout.setSpacing(6)
+        layout.addWidget(
+            self._alignment_button_row(
+                "横向",
+                self.h_align_group,
+                self.h_align_buttons,
+                (
+                    ("left", "左对齐"),
+                    ("center", "水平居中"),
+                    ("right", "右对齐"),
+                ),
+                horizontal=True,
+            )
+        )
+        layout.addWidget(
+            self._alignment_button_row(
+                "纵向",
+                self.v_align_group,
+                self.v_align_buttons,
+                (
+                    ("top", "顶端对齐"),
+                    ("center", "垂直居中"),
+                    ("bottom", "底端对齐"),
+                ),
+                horizontal=False,
+            )
+        )
         return row
 
     def _background_row(self) -> QWidget:
@@ -718,8 +839,10 @@ class NodeEditorDialog(QDialog):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(2)
         name = QLabel(label)
+        name.setFixedWidth(16 if len(label) == 1 else 24)
         editor.setAlignment(Qt.AlignCenter)
         editor.setFixedWidth(width)
+        editor.setMinimumWidth(width)
         layout.addWidget(name)
         layout.addWidget(editor)
         layout.addWidget(self._pin_button(prop, 20))
@@ -730,14 +853,82 @@ class NodeEditorDialog(QDialog):
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
-        button = QPushButton("选")
-        button.setFixedWidth(32)
+        name = QLabel(label)
+        name.setFixedWidth(42)
+        edit.setMinimumWidth(0)
+        button = QToolButton(row)
+        button.setObjectName("colorPickButton")
+        button.setText("…")
+        button.setToolTip(f"选择{label}")
+        button.setFixedSize(28, 28)
         button.clicked.connect(slot)
-        layout.addWidget(QLabel(label))
+        layout.addWidget(name)
         layout.addWidget(edit, 1)
         layout.addWidget(button)
         layout.addWidget(self._pin_button(prop, 20))
         return row
+
+    def _alignment_button_row(
+        self,
+        label: str,
+        group: QButtonGroup,
+        buttons: dict[str, QToolButton],
+        options: tuple[tuple[str, str], ...],
+        *,
+        horizontal: bool,
+    ) -> QWidget:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(5)
+        label_widget = QLabel(label)
+        label_widget.setFixedWidth(42)
+        layout.addWidget(label_widget)
+        for value, tooltip in options:
+            button = QToolButton(row)
+            button.setObjectName("alignToolButton")
+            button.setCheckable(True)
+            button.setToolTip(tooltip)
+            button.setIcon(self._alignment_icon(value, horizontal))
+            button.setIconSize(QSize(18, 18))
+            button.setFixedSize(30, 30)
+            button.toggled.connect(lambda checked, button=button: self._on_alignment_toggled(button, checked))
+            group.addButton(button)
+            buttons[value] = button
+            layout.addWidget(button)
+        layout.addStretch(1)
+        return row
+
+    def _alignment_icon(self, value: str, horizontal: bool) -> QIcon:
+        colors = palette(self.theme)
+        pixmap = QPixmap(22, 22)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        color = QColor(colors["text"])
+        muted = QColor(colors["text_muted"])
+        muted.setAlpha(95)
+        painter.setPen(QPen(muted, 1))
+        painter.drawRoundedRect(QRectF(3.5, 3.5, 15, 15), 3, 3)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(color)
+        if horizontal:
+            widths = (9, 13, 11)
+            y_positions = (6, 10, 14)
+            for width, y in zip(widths, y_positions):
+                if value == "center":
+                    x = (22 - width) / 2
+                elif value == "right":
+                    x = 17 - width
+                else:
+                    x = 5
+                painter.drawRoundedRect(QRectF(x, y, width, 2), 1, 1)
+        else:
+            top = {"top": 5, "center": 8, "bottom": 11}.get(value, 5)
+            for offset, width in ((0, 12), (4, 9), (8, 12)):
+                painter.drawRoundedRect(QRectF((22 - width) / 2, top + offset, width, 2), 1, 1)
+        painter.end()
+        return QIcon(pixmap)
 
     def _pin_button(self, prop: str, size: int = 26) -> QToolButton:
         pin = QToolButton()
@@ -786,8 +977,6 @@ class NodeEditorDialog(QDialog):
         ):
             widget.textChanged.connect(self._apply_props)
         self.field_type.currentTextChanged.connect(self._on_field_type_changed)
-        self.h_align.currentIndexChanged.connect(self._apply_props)
-        self.v_align.currentIndexChanged.connect(self._apply_props)
         self.field_value.textChanged.connect(self._apply_props)
 
     def _ensure_visual_layout(self) -> None:
@@ -812,9 +1001,29 @@ class NodeEditorDialog(QDialog):
             return None
         return self.fields[index]
 
-    def _set_combo_data(self, combo: QComboBox, value: str) -> None:
-        index = combo.findData(value)
-        combo.setCurrentIndex(index if index >= 0 else 0)
+    def _set_alignment_value(self, buttons: dict[str, QToolButton], value: str, fallback: str) -> None:
+        target = buttons.get(value) or buttons.get(fallback)
+        if not target:
+            return
+        for button in buttons.values():
+            button.blockSignals(True)
+        target.setChecked(True)
+        for button in buttons.values():
+            button.blockSignals(False)
+
+    def _alignment_value(self, buttons: dict[str, QToolButton], fallback: str) -> str:
+        for value, button in buttons.items():
+            if button.isChecked():
+                return value
+        return fallback
+
+    def _set_alignment_enabled(self, enabled: bool) -> None:
+        for button in (*self.h_align_buttons.values(), *self.v_align_buttons.values()):
+            button.setEnabled(enabled)
+
+    def _on_alignment_toggled(self, _button: QToolButton, checked: bool) -> None:
+        if checked:
+            self._apply_props()
 
     def _load_selected_props(self, index: int) -> None:
         self._updating = True
@@ -834,8 +1043,8 @@ class NodeEditorDialog(QDialog):
             ):
                 widget.clear()
             self.field_value.setPlainText("")
-            self._set_combo_data(self.h_align, "left")
-            self._set_combo_data(self.v_align, "top")
+            self._set_alignment_value(self.h_align_buttons, "left", "left")
+            self._set_alignment_value(self.v_align_buttons, "top", "top")
             self._updating = False
             self._update_type_controls()
             self._update_pin_controls()
@@ -851,8 +1060,8 @@ class NodeEditorDialog(QDialog):
         self.font_size.setText(str(field.font_size))
         self.text_color.setText(field.text_color)
         self.bg_color.setText(field.bg_color)
-        self._set_combo_data(self.h_align, field.text_h_align)
-        self._set_combo_data(self.v_align, field.text_v_align)
+        self._set_alignment_value(self.h_align_buttons, field.text_h_align, "left")
+        self._set_alignment_value(self.v_align_buttons, field.text_v_align, "top")
         self._updating = False
         self._update_type_controls()
         self._update_pin_controls()
@@ -884,8 +1093,7 @@ class NodeEditorDialog(QDialog):
         self.image_picker_row.setVisible(show_image)
         self.field_value.setEnabled(show_content)
         self.image_path.setEnabled(show_image)
-        self.h_align.setEnabled(has_field)
-        self.v_align.setEnabled(has_field)
+        self._set_alignment_enabled(has_field)
         if self.image_button:
             self.image_button.setEnabled(show_image)
 
@@ -935,8 +1143,8 @@ class NodeEditorDialog(QDialog):
         field.font_size = max(8, min(48, int(self._float_text(self.font_size, field.font_size))))
         field.text_color = self.text_color.text().strip() or "#1D1D1F"
         field.bg_color = self.bg_color.text().strip() or "#FFFFFF"
-        field.text_h_align = str(self.h_align.currentData() or "left")
-        field.text_v_align = str(self.v_align.currentData() or "top")
+        field.text_h_align = self._alignment_value(self.h_align_buttons, "left")
+        field.text_v_align = self._alignment_value(self.v_align_buttons, "top")
         self._normalize_export_props_for_type(field)
         self.canvas.refresh(self.canvas.selected_index)
 
@@ -945,6 +1153,16 @@ class NodeEditorDialog(QDialog):
             self._load_selected_props(self.canvas.selected_index)
         selected_index = self.canvas.selected_index
         QTimer.singleShot(0, lambda: self.canvas.refresh(selected_index))
+
+    def _on_canvas_field_content_edited(self, index: int) -> None:
+        if self._updating or index != self.canvas.selected_index:
+            return
+        field = self._selected_field()
+        if not field or field.data_type == "图片":
+            return
+        self.field_value.blockSignals(True)
+        self.field_value.setPlainText(field.value)
+        self.field_value.blockSignals(False)
 
     def _focus_field_value(self, index: int) -> None:
         self._load_selected_props(index)

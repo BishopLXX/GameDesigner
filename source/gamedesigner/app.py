@@ -5,8 +5,23 @@ import re
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, QSize, Qt, QUrl, Signal
-from PySide6.QtGui import QAction, QCloseEvent, QCursor, QDesktopServices, QFontMetrics, QIcon, QKeySequence, QPixmap, QShortcut
+from PySide6.QtCore import QPoint, QRectF, QSize, Qt, QUrl, Signal
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QCloseEvent,
+    QCursor,
+    QDesktopServices,
+    QFont,
+    QFontMetrics,
+    QIcon,
+    QKeySequence,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+    QShortcut,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -16,6 +31,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QSizePolicy,
+    QSplashScreen,
     QStatusBar,
     QTabBar,
     QTabWidget,
@@ -26,16 +42,18 @@ from PySide6.QtWidgets import (
 )
 
 from .csv_io import export_all_canvas_csv
-from .models import CanvasData, Node, NodeField, ProjectData, default_project, new_id
+from .models import BlueprintGroup, CanvasData, Node, NodeField, ProjectData, default_project, default_tech_tree_node, new_id
 from .project_files.linked_documents import (
     create_link_document,
     delete_link_document,
     delete_link_document_copy,
+    rename_link_document,
     sync_link_document_copy,
 )
 from .qt_canvas import NodeGraphView
 from .qt_dialogs import NodeEditorDialog, ProjectSettingsDialog, TemplateManagerDialog
 from .qt_fonts import configure_fonts
+from .qt_i18n import install_qt_translations
 from .qt_theme import stylesheet
 from .storage import (
     PROJECT_SUFFIX,
@@ -65,6 +83,7 @@ HTBOTTOM = 15
 HTBOTTOMLEFT = 16
 HTBOTTOMRIGHT = 17
 RESIZE_BORDER = 6
+STARTUP_SPLASH_SIZE = QSize(520, 190)
 
 
 def _app_icon_path() -> Path | None:
@@ -81,6 +100,63 @@ def _app_icon_path() -> Path | None:
         if candidate.exists():
             return candidate
     return None
+
+
+def _startup_splash() -> QSplashScreen:
+    pixmap = QPixmap(STARTUP_SPLASH_SIZE)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+
+    rect = QRectF(10, 10, STARTUP_SPLASH_SIZE.width() - 20, STARTUP_SPLASH_SIZE.height() - 20)
+    shadow = QPainterPath()
+    shadow.addRoundedRect(rect.adjusted(0, 8, 0, 8), 22, 22)
+    shadow_color = QColor("#000000")
+    shadow_color.setAlpha(46)
+    painter.fillPath(shadow, shadow_color)
+
+    panel = QPainterPath()
+    panel.addRoundedRect(rect, 22, 22)
+    painter.fillPath(panel, QColor("#15151B"))
+    painter.setPen(QPen(QColor("#2E2E38"), 1))
+    painter.drawPath(panel)
+
+    icon_rect = QRectF(38, 46, 56, 56)
+    icon_path = QPainterPath()
+    icon_path.addRoundedRect(icon_rect, 14, 14)
+    painter.fillPath(icon_path, QColor("#0A84FF"))
+    painter.setPen(QColor("#FFFFFF"))
+    icon_font = QFont()
+    icon_font.setPointSize(20)
+    icon_font.setBold(True)
+    painter.setFont(icon_font)
+    painter.drawText(icon_rect, Qt.AlignCenter, "GD")
+
+    title_font = QFont()
+    title_font.setPointSize(18)
+    title_font.setBold(True)
+    painter.setFont(title_font)
+    painter.setPen(QColor("#F5F5F7"))
+    painter.drawText(QRectF(118, 47, 350, 34), Qt.AlignLeft | Qt.AlignVCenter, "GameDesigner")
+
+    message_font = QFont()
+    message_font.setPointSize(10)
+    painter.setFont(message_font)
+    painter.setPen(QColor("#A1A1AA"))
+    painter.drawText(QRectF(120, 84, 350, 26), Qt.AlignLeft | Qt.AlignVCenter, "正在启动工程...")
+
+    bar_rect = QRectF(120, 126, 314, 5)
+    bar_bg = QPainterPath()
+    bar_bg.addRoundedRect(bar_rect, 2.5, 2.5)
+    painter.fillPath(bar_bg, QColor("#30303B"))
+    bar_fg = QPainterPath()
+    bar_fg.addRoundedRect(QRectF(bar_rect.x(), bar_rect.y(), 116, bar_rect.height()), 2.5, 2.5)
+    painter.fillPath(bar_fg, QColor("#0A84FF"))
+    painter.end()
+
+    splash = QSplashScreen(pixmap)
+    splash.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+    return splash
 
 
 class ProjectPage(QWidget):
@@ -511,6 +587,9 @@ class GameDesignerApp(QMainWindow):
         canvas.nodeFolderRequested.connect(lambda node_id, page=page: self._open_welcome_project_folder(page, node_id))
         canvas.nodeEditRequested.connect(self._edit_node)
         canvas.nodeDeleteRequested.connect(self._delete_node_by_id)
+        canvas.nodesDeleteRequested.connect(self._delete_nodes_by_ids)
+        canvas.groupDeleteRequested.connect(self._delete_group_by_id)
+        canvas.groupEditRequested.connect(self._edit_group)
         canvas.edgeEditRequested.connect(self._edit_edge)
         canvas.edgeDeleteRequested.connect(self._delete_edge_by_id)
         canvas.edgeStyleRequested.connect(self._set_edge_style)
@@ -518,6 +597,7 @@ class GameDesignerApp(QMainWindow):
         canvas.createNodeRequested.connect(self._add_node_at)
         canvas.createCanvasNodeRequested.connect(self._add_canvas_node_at)
         canvas.createLinkNodeRequested.connect(self._add_link_node_at)
+        canvas.createGroupRequested.connect(self._add_blueprint_group_at)
         canvas.createTemplateNodeRequested.connect(self._add_node_from_template_at)
         canvas.templateManagerRequested.connect(self._manage_templates)
         canvas.openProjectRequested.connect(self._open_project)
@@ -823,14 +903,18 @@ class GameDesignerApp(QMainWindow):
                 self._open_canvas_page(page.project, page.path, page.project.root_canvas_id)
                 return
         try:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            QApplication.processEvents()
             project = load_project(project_path)
+            self._ensure_project_dirs(project, project_path)
+            self._sync_settings_from_project(project)
+            self._remember_project(project_path)
+            self._add_page(project, project_path, dirty=False, canvas_data=project.root_canvas())
         except Exception as exc:  # noqa: BLE001 - selected by user.
             QMessageBox.critical(self, "打开失败", f"无法打开项目：\n{exc}")
             return
-        self._ensure_project_dirs(project, project_path)
-        self._sync_settings_from_project(project)
-        self._remember_project(project_path)
-        self._add_page(project, project_path, dirty=False, canvas_data=project.root_canvas())
+        finally:
+            QApplication.restoreOverrideCursor()
 
     def _open_canvas_page(
         self,
@@ -908,6 +992,11 @@ class GameDesignerApp(QMainWindow):
         file_format = node.link_format if node.link_format in {"md", "txt"} else "md"
         if not node.link_path:
             node.link_path = create_link_document(project_path, node.title or "新文档", file_format)
+        else:
+            old_path = node.link_path
+            node.link_path = rename_link_document(project_path, node.link_path, node.title or "新文档")
+            if old_path != node.link_path:
+                delete_link_document_copy(page.project.source_dir, old_path)
         node.link_format = file_format
         node.canvas_id = ""
         node.fields = [
@@ -1106,15 +1195,7 @@ class GameDesignerApp(QMainWindow):
         if page.is_welcome:
             self._new_project()
             return
-        node = Node(
-            title="新节点",
-            x=x - 155,
-            y=y - 72,
-            fields=[
-                NodeField("内容信息", "长文本", ""),
-                NodeField("数据类型", "枚举", "普通"),
-            ],
-        )
+        node = default_tech_tree_node(x - 255, y - 165)
         page.canvas_data.add_node(node)
         page.canvas.rebuild()
         page.canvas.select_node(node.id)
@@ -1181,6 +1262,25 @@ class GameDesignerApp(QMainWindow):
         self._mark_dirty(page)
         self._open_link_document(page, node)
 
+    def _add_blueprint_group_at(self, x: float, y: float) -> None:
+        page = self._current_page()
+        if not page:
+            return
+        if page.is_welcome:
+            self._new_project()
+            return
+        group = BlueprintGroup(
+            title="蓝图组",
+            x=x,
+            y=y,
+            width=640,
+            height=260,
+        )
+        page.canvas_data.add_group(group)
+        page.canvas.rebuild()
+        page.canvas.select_group(group.id)
+        self._mark_dirty(page)
+
     def _add_node_from_template_at(self, x: float, y: float, template_id: str | None = None) -> None:
         page = self._current_page()
         if not page:
@@ -1213,6 +1313,8 @@ class GameDesignerApp(QMainWindow):
             return
         if page.selected_node_id:
             self._edit_node(page.selected_node_id)
+        elif page.canvas.selected_group_ids:
+            self._edit_group(next(iter(page.canvas.selected_group_ids)))
         elif page.selected_edge_id:
             self._edit_edge(page.selected_edge_id)
 
@@ -1268,6 +1370,27 @@ class GameDesignerApp(QMainWindow):
         page.canvas.select_edge(edge.id)
         self._mark_dirty(page)
 
+    def _edit_group(self, group_id: str) -> None:
+        page = self._current_page()
+        if not page or page.is_welcome:
+            return
+        group = page.canvas_data.find_group(group_id)
+        if not group:
+            return
+        title, ok = QInputDialog.getText(self, "重命名蓝图组", "名称", text=group.title)
+        if not ok:
+            return
+        title = title.strip()
+        if not title:
+            QMessageBox.warning(self, "名称不能为空", "请输入蓝图组名称。")
+            return
+        group.title = title
+        item = page.canvas.group_items.get(group.id)
+        if item:
+            item.update()
+        page.canvas.select_group(group.id)
+        self._mark_dirty(page)
+
     def _set_edge_style(self, edge_id: str, style: str) -> None:
         page = self._current_page()
         if not page or page.is_welcome:
@@ -1286,7 +1409,11 @@ class GameDesignerApp(QMainWindow):
         page = self._current_page()
         if not page or page.is_welcome:
             return
-        if page.selected_node_id:
+        if page.canvas.selected_node_ids:
+            self._delete_nodes_by_ids(set(page.canvas.selected_node_ids))
+        elif page.canvas.selected_group_ids:
+            self._delete_group_by_id(next(iter(page.canvas.selected_group_ids)))
+        elif page.selected_node_id:
             self._delete_node_by_id(page.selected_node_id)
         elif page.selected_edge_id:
             self._delete_edge_by_id(page.selected_edge_id)
@@ -1308,6 +1435,41 @@ class GameDesignerApp(QMainWindow):
             return
         self._delete_link_document_with_copy(page, node)
         page.canvas_data.delete_node(node.id)
+        page.canvas.rebuild()
+        page.canvas.clear_selection()
+        self._mark_dirty(page)
+
+    def _delete_nodes_by_ids(self, node_ids: set[str]) -> None:
+        page = self._current_page()
+        if not page or page.is_welcome or not node_ids:
+            return
+        existing = [node for node in page.canvas_data.nodes if node.id in node_ids]
+        if not existing:
+            return
+        message = f"确定删除选中的 {len(existing)} 个节点吗？"
+        if any(node.node_type == "超链接" and node.link_path for node in existing):
+            message = f"确定删除选中的 {len(existing)} 个节点及其中的超链接文件吗？"
+        answer = QMessageBox.question(self, "删除节点", message)
+        if answer != QMessageBox.Yes:
+            return
+        for node in existing:
+            self._delete_link_document_with_copy(page, node)
+        page.canvas_data.delete_nodes({node.id for node in existing})
+        page.canvas.rebuild()
+        page.canvas.clear_selection()
+        self._mark_dirty(page)
+
+    def _delete_group_by_id(self, group_id: str) -> None:
+        page = self._current_page()
+        if not page or page.is_welcome:
+            return
+        group = page.canvas_data.find_group(group_id)
+        if not group:
+            return
+        answer = QMessageBox.question(self, "删除蓝图组", f"确定删除蓝图组“{group.title}”吗？组内节点会保留。")
+        if answer != QMessageBox.Yes:
+            return
+        page.canvas_data.delete_group(group.id)
         page.canvas.rebuild()
         page.canvas.clear_selection()
         self._mark_dirty(page)
@@ -1461,6 +1623,11 @@ def _edge_style_name(style: str) -> str:
 
 def main() -> int:
     app = QApplication(sys.argv)
+    install_qt_translations(app)
+    splash = _startup_splash()
+    splash.show()
+    app.processEvents()
     window = GameDesignerApp()
     window.show()
+    splash.finish(window)
     return app.exec()

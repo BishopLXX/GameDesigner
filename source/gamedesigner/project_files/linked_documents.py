@@ -34,6 +34,23 @@ def write_link_document(project_path: str | Path, relative_path: str, content: s
     return path
 
 
+def rename_link_document(project_path: str | Path, relative_path: str, title: str) -> str:
+    source = resolve_link_document(project_path, relative_path)
+    extension = _normalized_format(source.suffix.lstrip(".") or Path(relative_path).suffix.lstrip("."))
+    folder = linked_documents_dir(project_path)
+    folder.mkdir(parents=True, exist_ok=True)
+    target = _unique_path(folder, _safe_filename(title), extension, current=source)
+    if source == target:
+        if not target.exists():
+            target.write_text(_default_content(title, extension), encoding="utf-8")
+        return f"{LINKED_DOCS_DIR}/{target.name}"
+    if source.exists():
+        source.rename(target)
+    else:
+        target.write_text(_default_content(title, extension), encoding="utf-8")
+    return f"{LINKED_DOCS_DIR}/{target.name}"
+
+
 def delete_link_document(project_path: str | Path, relative_path: str) -> None:
     path = resolve_link_document(project_path, relative_path)
     if path.exists() and path.is_file():
@@ -86,11 +103,15 @@ def _normalized_format(file_format: str) -> str:
     return text if text in SUPPORTED_LINK_FORMATS else "md"
 
 
-def _unique_path(folder: Path, base_name: str, extension: str) -> Path:
+def _unique_path(folder: Path, base_name: str, extension: str, current: Path | None = None) -> Path:
     path = folder / f"{base_name}.{extension}"
+    if current and path.resolve() == current.resolve():
+        return path
     index = 2
     while path.exists():
         path = folder / f"{base_name}_{index}.{extension}"
+        if current and path.resolve() == current.resolve():
+            return path
         index += 1
     return path
 

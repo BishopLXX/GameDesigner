@@ -118,6 +118,7 @@ class Node:
     canvas_id: str = ""
     link_path: str = ""
     link_format: str = "md"
+    group_id: str = ""
     order: int = 0
     x: float = 0.0
     y: float = 0.0
@@ -135,6 +136,7 @@ class Node:
             "canvas_id": self.canvas_id,
             "link_path": self.link_path if self.node_type == "超链接" else "",
             "link_format": self.link_format if self.link_format in {"md", "txt"} else "md",
+            "group_id": self.group_id,
             "order": max(0, int(self.order)),
             "x": self.x,
             "y": self.y,
@@ -160,6 +162,7 @@ class Node:
             canvas_id=str(raw.get("canvas_id") or ""),
             link_path=str(raw.get("link_path") or ""),
             link_format=_choice_or(raw.get("link_format"), ["md", "txt"], "md"),
+            group_id=str(raw.get("group_id") or ""),
             order=max(0, int(_float_or(raw.get("order"), 0.0))),
             x=_float_or(raw.get("x"), 0.0),
             y=_float_or(raw.get("y"), 0.0),
@@ -168,6 +171,40 @@ class Node:
             color=str(raw.get("color") or DEFAULT_NODE_COLOR),
             icon=str(raw.get("icon") or ""),
             fields=[NodeField.from_dict(item) for item in fields if isinstance(item, dict)],
+        )
+
+
+@dataclass
+class BlueprintGroup:
+    id: str = field(default_factory=lambda: new_id("group"))
+    title: str = "蓝图组"
+    x: float = 0.0
+    y: float = 0.0
+    width: float = 560.0
+    height: float = 260.0
+    color: str = "#486A96"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "title": self.title,
+            "x": self.x,
+            "y": self.y,
+            "width": self.width,
+            "height": self.height,
+            "color": self.color,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "BlueprintGroup":
+        return cls(
+            id=str(raw.get("id") or new_id("group")),
+            title=str(raw.get("title") or "蓝图组"),
+            x=_float_or(raw.get("x"), 0.0),
+            y=_float_or(raw.get("y"), 0.0),
+            width=max(180.0, _float_or(raw.get("width"), 560.0)),
+            height=max(120.0, _float_or(raw.get("height"), 260.0)),
+            color=str(raw.get("color") or "#486A96"),
         )
 
 
@@ -214,6 +251,7 @@ class CanvasData:
     parent_node_id: str = ""
     nodes: list[Node] = field(default_factory=list)
     edges: list[Edge] = field(default_factory=list)
+    groups: list[BlueprintGroup] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -221,6 +259,7 @@ class CanvasData:
             "name": self.name,
             "parent_canvas_id": self.parent_canvas_id,
             "parent_node_id": self.parent_node_id,
+            "groups": [group.to_dict() for group in self.groups],
             "nodes": [node.to_dict() for node in self.nodes],
             "edges": [edge.to_dict() for edge in self.valid_edges()],
         }
@@ -229,35 +268,49 @@ class CanvasData:
     def from_dict(cls, raw: dict[str, Any]) -> "CanvasData":
         nodes_raw = raw.get("nodes", [])
         edges_raw = raw.get("edges", [])
+        groups_raw = raw.get("groups", [])
         if not isinstance(nodes_raw, list):
             nodes_raw = []
         if not isinstance(edges_raw, list):
             edges_raw = []
+        if not isinstance(groups_raw, list):
+            groups_raw = []
         canvas = cls(
             id=str(raw.get("id") or new_id("canvas")),
             name=str(raw.get("name") or "画布"),
             parent_canvas_id=str(raw.get("parent_canvas_id") or ""),
             parent_node_id=str(raw.get("parent_node_id") or ""),
+            groups=[BlueprintGroup.from_dict(item) for item in groups_raw if isinstance(item, dict)],
             nodes=[Node.from_dict(item) for item in nodes_raw if isinstance(item, dict)],
             edges=[Edge.from_dict(item) for item in edges_raw if isinstance(item, dict)],
         )
         canvas.remove_broken_edges()
+        canvas.remove_broken_groups()
         canvas.normalize_node_order()
         return canvas
 
     def find_node(self, node_id: str) -> Node | None:
         return next((node for node in self.nodes if node.id == node_id), None)
 
+    def find_group(self, group_id: str) -> BlueprintGroup | None:
+        return next((group for group in self.groups if group.id == group_id), None)
+
     def valid_edges(self) -> list[Edge]:
-        node_ids = {node.id for node in self.nodes}
+        endpoint_ids = {node.id for node in self.nodes} | {group.id for group in self.groups}
         return [
             edge
             for edge in self.edges
-            if edge.source in node_ids and edge.target in node_ids and edge.source != edge.target
+            if edge.source in endpoint_ids and edge.target in endpoint_ids and edge.source != edge.target
         ]
 
     def remove_broken_edges(self) -> None:
         self.edges = self.valid_edges()
+
+    def remove_broken_groups(self) -> None:
+        group_ids = {group.id for group in self.groups}
+        for node in self.nodes:
+            if node.group_id not in group_ids:
+                node.group_id = ""
 
     def normalize_node_order(self) -> None:
         original_index = {node.id: index for index, node in enumerate(self.nodes)}
@@ -280,10 +333,15 @@ class CanvasData:
         self.nodes.append(node)
         return node
 
+    def add_group(self, group: BlueprintGroup) -> BlueprintGroup:
+        self.groups.append(group)
+        return group
+
     def add_edge(self, source: str, target: str) -> Edge | None:
         if source == target:
             return None
-        if not self.find_node(source) or not self.find_node(target):
+        endpoint_ids = {node.id for node in self.nodes} | {group.id for group in self.groups}
+        if source not in endpoint_ids or target not in endpoint_ids:
             return None
         for edge in self.edges:
             if edge.source == source and edge.target == target:
@@ -296,6 +354,18 @@ class CanvasData:
         self.nodes = [node for node in self.nodes if node.id != node_id]
         self.edges = [edge for edge in self.edges if edge.source != node_id and edge.target != node_id]
         self.normalize_node_order()
+
+    def delete_nodes(self, node_ids: set[str]) -> None:
+        self.nodes = [node for node in self.nodes if node.id not in node_ids]
+        self.edges = [edge for edge in self.edges if edge.source not in node_ids and edge.target not in node_ids]
+        self.normalize_node_order()
+
+    def delete_group(self, group_id: str) -> None:
+        self.groups = [group for group in self.groups if group.id != group_id]
+        self.edges = [edge for edge in self.edges if edge.source != group_id and edge.target != group_id]
+        for node in self.nodes:
+            if node.group_id == group_id:
+                node.group_id = ""
 
     def delete_edge(self, edge_id: str) -> None:
         self.edges = [edge for edge in self.edges if edge.id != edge_id]
@@ -423,6 +493,7 @@ class ProjectData:
             root.edges = self.edges
         for canvas in self.canvases:
             canvas.remove_broken_edges()
+            canvas.remove_broken_groups()
             for node in canvas.nodes:
                 if node.node_type != "画布":
                     node.canvas_id = ""
@@ -507,20 +578,59 @@ def default_project() -> ProjectData:
                 NodeField("数据类型", "枚举", "计划"),
             ],
         ),
-        Node(
-            title="科技树入口",
-            x=160,
-            y=70,
-            color=DEFAULT_NODE_COLOR,
-            icon="技",
-            fields=[
-                NodeField("内容信息", "长文本", "描述解锁条件、消耗和产出"),
-                NodeField("数据类型", "枚举", "科技树"),
-            ],
-        ),
+        default_tech_tree_node(160, 70),
     ]
     project.add_edge(project.nodes[0].id, project.nodes[1].id)
     return project
+
+
+def default_tech_tree_node(x: float = 0.0, y: float = 0.0) -> Node:
+    return Node(
+        title="节点名字",
+        x=x,
+        y=y,
+        width=510,
+        height=330,
+        color=DEFAULT_NODE_COLOR,
+        icon="N",
+        fields=default_tech_tree_fields(),
+    )
+
+
+def default_tech_tree_fields() -> list[NodeField]:
+    return [
+        _visual_field("节点名字", "文本", "节点名字", 20, 18, 320, 44, 13),
+        _visual_field("最大等级", "整数", "最大等级", 360, 18, 96, 44, 13),
+        _visual_field("解锁描述", "长文本", "解锁后获得效果的描述", 20, 72, 440, 94, 13),
+        _visual_field("效果数值", "文本", "0% -> 5%", 20, 178, 440, 44, 13),
+        _visual_field("消耗", "文本", "5000$", 20, 232, 440, 44, 13),
+    ]
+
+
+def _visual_field(
+    name: str,
+    data_type: str,
+    value: str,
+    x: float,
+    y: float,
+    width: float,
+    height: float,
+    font_size: int,
+) -> NodeField:
+    return NodeField(
+        name=name,
+        data_type=data_type,
+        value=value,
+        x=x,
+        y=y,
+        width=width,
+        height=height,
+        font_size=font_size,
+        text_color="#000000",
+        bg_color="#FFFFFF",
+        text_h_align="center",
+        text_v_align="center",
+    )
 
 
 def default_templates() -> list[NodeTemplate]:
@@ -535,14 +645,10 @@ def default_templates() -> list[NodeTemplate]:
             ],
         ),
         NodeTemplate(
-            name="数值节点",
+            name="科技树节点",
             color=DEFAULT_NODE_COLOR,
-            icon="数",
-            fields=[
-                NodeField("字段名", "文本", ""),
-                NodeField("数值", "数字", "0"),
-                NodeField("备注", "长文本", ""),
-            ],
+            icon="N",
+            fields=default_tech_tree_fields(),
         ),
         NodeTemplate(
             name="任务节点",

@@ -4,12 +4,13 @@ import unittest
 from pathlib import Path
 
 from gamedesigner.csv_io import export_all_canvas_csv, export_game_csv
-from gamedesigner.models import Node, NodeField, ProjectData
+from gamedesigner.models import BlueprintGroup, Node, NodeField, ProjectData, default_templates
 from gamedesigner.project_files.linked_documents import (
     create_link_document,
     delete_link_document,
     delete_link_document_copy,
     read_link_document,
+    rename_link_document,
     resolve_link_document,
     sync_link_document_copy,
     write_link_document,
@@ -45,7 +46,11 @@ class DataIoTests(unittest.TestCase):
                 ],
             )
             second = Node(title="B", x=100, y=120, fields=[NodeField("数值", "数字", "42")])
+            group = BlueprintGroup(title="战斗流程", x=0, y=0, width=600, height=240)
             project.nodes = [first, second]
+            project.ensure_canvas_structure()
+            project.root_canvas().groups.append(group)
+            first.group_id = group.id
             edge = project.add_edge(first.id, second.id)
             edge.style = "orthogonal"
 
@@ -69,6 +74,8 @@ class DataIoTests(unittest.TestCase):
             self.assertEqual(loaded.nodes[0].fields[1].export_props, ["x", "width"])
             self.assertEqual(loaded.nodes[0].fields[0].text_h_align, "center")
             self.assertEqual(loaded.nodes[0].fields[0].text_v_align, "bottom")
+            self.assertEqual(loaded.root_canvas().groups[0].title, "战斗流程")
+            self.assertEqual(loaded.nodes[0].group_id, loaded.root_canvas().groups[0].id)
             self.assertEqual(loaded.edges[0].source, first.id)
             self.assertEqual(loaded.edges[0].target, second.id)
             self.assertEqual(loaded.edges[0].style, "orthogonal")
@@ -174,6 +181,32 @@ class DataIoTests(unittest.TestCase):
         self.assertEqual([node.order for node in canvas.nodes], [1, 2])
         self.assertEqual(third.order, 2)
 
+    def test_blueprint_group_delete_ungroups_nodes(self) -> None:
+        project = ProjectData(name="蓝图组")
+        project.ensure_canvas_structure()
+        canvas = project.root_canvas()
+        group = canvas.add_group(BlueprintGroup(title="组"))
+        node = canvas.add_node(Node(title="节点", group_id=group.id))
+
+        canvas.delete_group(group.id)
+
+        self.assertEqual(canvas.groups, [])
+        self.assertEqual(node.group_id, "")
+
+    def test_blueprint_group_can_be_edge_endpoint(self) -> None:
+        project = ProjectData(name="蓝图组连线")
+        project.ensure_canvas_structure()
+        canvas = project.root_canvas()
+        group = canvas.add_group(BlueprintGroup(title="组"))
+        node = canvas.add_node(Node(title="节点"))
+
+        edge = canvas.add_edge(group.id, node.id)
+
+        self.assertIsNotNone(edge)
+        self.assertEqual(canvas.valid_edges()[0].source, group.id)
+        canvas.delete_group(group.id)
+        self.assertEqual(canvas.valid_edges(), [])
+
     def test_project_gdc_roundtrip_with_multiple_canvases(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             tmp_path = Path(folder)
@@ -213,13 +246,19 @@ class DataIoTests(unittest.TestCase):
 
             write_link_document(project_path, relative, "hello")
             self.assertEqual(read_link_document(project_path, relative), "hello")
-            copied = sync_link_document_copy(project_path, relative, source_dir)
-            self.assertEqual(copied, source_dir / relative)
-            self.assertEqual((source_dir / relative).read_text(encoding="utf-8"), "hello")
-            delete_link_document_copy(source_dir, relative)
-            self.assertFalse((source_dir / relative).exists())
-            delete_link_document(project_path, relative)
+            renamed = rename_link_document(project_path, relative, "重命名文档")
+            self.assertEqual(renamed, "linked_docs/重命名文档.md")
             self.assertFalse(resolved.exists())
+            self.assertEqual(read_link_document(project_path, renamed), "hello")
+            copied = sync_link_document_copy(project_path, relative, source_dir)
+            self.assertIsNone(copied)
+            copied = sync_link_document_copy(project_path, renamed, source_dir)
+            self.assertEqual(copied, source_dir / renamed)
+            self.assertEqual((source_dir / renamed).read_text(encoding="utf-8"), "hello")
+            delete_link_document_copy(source_dir, renamed)
+            self.assertFalse((source_dir / renamed).exists())
+            delete_link_document(project_path, renamed)
+            self.assertFalse(resolve_link_document(project_path, renamed).exists())
 
     def test_legacy_resource_path_image_field_migrates_to_image_type(self) -> None:
         field = NodeField.from_dict(
@@ -248,6 +287,23 @@ class DataIoTests(unittest.TestCase):
         self.assertEqual(field.data_type, "日期")
         self.assertEqual(field.image_path, "")
         self.assertEqual(field.export_props, ["x", "font_size"])
+
+    def test_default_tech_tree_template_uses_visual_cards(self) -> None:
+        template = next(item for item in default_templates() if item.name == "科技树节点")
+        node = template.create_node(0, 0)
+
+        self.assertEqual(template.icon, "N")
+        self.assertEqual(len(template.fields), 5)
+        self.assertEqual([field.value for field in template.fields], [
+            "节点名字",
+            "最大等级",
+            "解锁后获得效果的描述",
+            "0% -> 5%",
+            "5000$",
+        ])
+        self.assertTrue(all(field.has_visual_layout() for field in node.fields))
+        self.assertEqual(node.fields[0].text_h_align, "center")
+        self.assertEqual(node.fields[0].text_v_align, "center")
 
     def _csv_names(self, path: Path) -> list[str]:
         with path.open("r", encoding="utf-8-sig", newline="") as file:

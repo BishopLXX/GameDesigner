@@ -148,6 +148,21 @@ def stylesheet(name: str) -> str:
         color: {colors["text"]};
         border-color: {colors["accent"]};
     }}
+    QToolButton#colorPickButton, QToolButton#alignToolButton {{
+        background: {colors["panel_alt"]};
+        color: {colors["text"]};
+        border: 1px solid {colors["hairline"]};
+        border-radius: 8px;
+        padding: 0;
+    }}
+    QToolButton#colorPickButton:hover, QToolButton#alignToolButton:hover {{
+        background: {colors["control_hover"]};
+        border-color: {colors["accent"]};
+    }}
+    QToolButton#alignToolButton:checked {{
+        background: {colors["control"]};
+        border-color: {colors["blue"]};
+    }}
     QLineEdit, QTextEdit, QPlainTextEdit, QComboBox, QSpinBox, QDoubleSpinBox {{
         background: {colors["panel_alt"]};
         color: {colors["text"]};

@@ -29,6 +29,20 @@ if errorlevel 1 (
     exit /b 1
 )
 
+for /f "usebackq delims=" %%I in (`py -3.13 -c "from pathlib import Path; import PySide6; print(Path(PySide6.__file__).resolve().parent / 'translations')"`) do set "QT_TRANSLATIONS=%%I"
+if not exist "%QT_TRANSLATIONS%\qtbase_zh_CN.qm" (
+    echo.
+    echo Qt Chinese translation files were not found.
+    pause
+    exit /b 1
+)
+if not exist "%QT_TRANSLATIONS%\qt_zh_CN.qm" (
+    echo.
+    echo Qt Chinese translation files were not found.
+    pause
+    exit /b 1
+)
+
 tasklist /FI "IMAGENAME eq GameDesigner.exe" 2>nul | find /I "GameDesigner.exe" >nul
 if not errorlevel 1 (
     echo.
@@ -47,6 +61,8 @@ py -3.13 -m PyInstaller ^
   --name GameDesigner ^
   --icon icon.ico ^
   --add-data "icon.png;." ^
+  --add-data "%QT_TRANSLATIONS%\qtbase_zh_CN.qm;PySide6\translations" ^
+  --add-data "%QT_TRANSLATIONS%\qt_zh_CN.qm;PySide6\translations" ^
   --distpath release ^
   --workpath build ^
   source\main.py

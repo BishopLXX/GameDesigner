@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, Qt, Signal
 from PySide6.QtGui import (
     QAction,
+    QBrush,
     QColor,
     QCursor,
     QFont,
@@ -27,7 +28,7 @@ from PySide6.QtWidgets import (
     QMenu,
 )
 
-from .models import CanvasData, Edge, Node, NodeField, NodeTemplate, ProjectData
+from .models import BlueprintGroup, CanvasData, Edge, Node, NodeField, NodeTemplate, ProjectData
 from .qt_theme import palette
 
 
@@ -39,6 +40,9 @@ HEADER_HEIGHT = 52.0
 ROW_GAP = 7.0
 ROW_TOP = HEADER_HEIGHT + 6.0
 RESIZE_HANDLE = 20.0
+GROUP_MIN_WIDTH = 220.0
+GROUP_MIN_HEIGHT = 120.0
+GROUP_HEADER_HEIGHT = 34.0
 SNAP_UNIT = 20.0
 GRID_SNAP_THRESHOLD = 6.0
 ALIGN_SNAP_THRESHOLD = 10.0
@@ -85,6 +89,130 @@ class SnapGuide:
     value: float
     label: str
     kind: str
+
+
+class BlueprintGroupItem(QGraphicsObject):
+    def __init__(self, group: BlueprintGroup, view: "NodeGraphView") -> None:
+        super().__init__()
+        self.group = group
+        self.view = view
+        self._resizing = False
+        self._resize_origin = QPointF()
+        self._resize_size = (0.0, 0.0)
+        self._last_pos = QPointF(group.x, group.y)
+        self.setPos(group.x, group.y)
+        flags = QGraphicsItem.ItemIsSelectable
+        if self.view.can_move_nodes():
+            flags |= QGraphicsItem.ItemIsMovable | QGraphicsItem.ItemSendsGeometryChanges
+        self.setFlags(flags)
+        self.setAcceptHoverEvents(True)
+        self.setZValue(-1)
+
+    def boundingRect(self) -> QRectF:
+        return QRectF(0, 0, max(GROUP_MIN_WIDTH, self.group.width), max(GROUP_MIN_HEIGHT, self.group.height))
+
+    def shape(self) -> QPainterPath:
+        rect = self.boundingRect()
+        path = QPainterPath()
+        path.addRect(QRectF(0, 0, rect.width(), GROUP_HEADER_HEIGHT + 4))
+        path.addRect(QRectF(rect.right() - RESIZE_HANDLE, rect.bottom() - RESIZE_HANDLE, RESIZE_HANDLE, RESIZE_HANDLE))
+        return path
+
+    def paint(self, painter: QPainter, _option, _widget=None) -> None:  # type: ignore[override]
+        colors = palette(self.view.theme)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        rect = self.boundingRect()
+        base = self._display_color()
+        body = QColor(base)
+        body.setAlpha(92 if self.view.theme == "dark" else 48)
+        header = QColor(base.lighter(118 if self.view.theme == "dark" else 104))
+        header.setAlpha(236)
+        outline = QColor(colors["blue"] if self.isSelected() else base.darker(122).name())
+        outline.setAlpha(220 if self.isSelected() else 150)
+
+        path = QPainterPath()
+        path.addRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), 3, 3)
+        painter.fillPath(path, body)
+        painter.setPen(QPen(outline, 2.0 if self.isSelected() else 1.2))
+        painter.drawPath(path)
+        painter.fillRect(QRectF(0, 0, rect.width(), GROUP_HEADER_HEIGHT), header)
+        painter.setPen(QColor("#FFFFFF"))
+        painter.setFont(_font(12, True))
+        painter.drawText(QRectF(12, 4, rect.width() - 24, GROUP_HEADER_HEIGHT - 7), Qt.AlignLeft | Qt.AlignVCenter, self.group.title)
+        painter.setPen(QPen(QColor("#B7B7BD"), 1))
+        for offset in (6, 10, 14):
+            painter.drawLine(
+                QPointF(rect.right() - offset, rect.bottom() - 3),
+                QPointF(rect.right() - 3, rect.bottom() - offset),
+            )
+
+    def mouseDoubleClickEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.LeftButton:
+            self.view.groupEditRequested.emit(self.group.id)
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def hoverMoveEvent(self, event) -> None:  # type: ignore[override]
+        self.setCursor(Qt.SizeFDiagCursor if self._on_resize_handle(event.pos()) else Qt.OpenHandCursor)
+        super().hoverMoveEvent(event)
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.LeftButton:
+            if not self.isSelected():
+                self.view.select_group(self.group.id)
+            self._last_pos = self.pos()
+            if not self.view.read_only and self._on_resize_handle(event.pos()):
+                self._resizing = True
+                self._resize_origin = event.scenePos()
+                self._resize_size = (self.group.width, self.group.height)
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
+        if self._resizing:
+            delta = event.scenePos() - self._resize_origin
+            self.prepareGeometryChange()
+            self.group.width = max(GROUP_MIN_WIDTH, self._resize_size[0] + delta.x())
+            self.group.height = max(GROUP_MIN_HEIGHT, self._resize_size[1] + delta.y())
+            self.view.update_edges_for_endpoint(self.group.id)
+            self.update()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        changed = self._resizing or self.pos() != self._last_pos
+        self._resizing = False
+        self.setCursor(Qt.OpenHandCursor)
+        if changed:
+            self.view.refresh_group_membership()
+            self.view.projectChanged.emit()
+        super().mouseReleaseEvent(event)
+
+    def itemChange(self, change: QGraphicsItem.GraphicsItemChange, value):  # type: ignore[override]
+        if change == QGraphicsItem.ItemPositionHasChanged and not self.view.rebuilding:
+            new_pos = self.pos()
+            delta = new_pos - self._last_pos
+            self.group.x = new_pos.x()
+            self.group.y = new_pos.y()
+            if not self._resizing and (abs(delta.x()) > 0.001 or abs(delta.y()) > 0.001):
+                self.view.move_nodes_in_group(self.group.id, delta)
+            self.view.update_edges_for_endpoint(self.group.id)
+            self._last_pos = QPointF(new_pos)
+            self.view._update_scene_rect()
+        return super().itemChange(change, value)
+
+    def _on_resize_handle(self, pos: QPointF) -> bool:
+        rect = self.boundingRect()
+        return pos.x() >= rect.right() - RESIZE_HANDLE and pos.y() >= rect.bottom() - RESIZE_HANDLE
+
+    def _display_color(self) -> QColor:
+        raw = (self.group.color or "").strip().lower()
+        if raw in {"", "#3a3a3f"}:
+            return QColor("#5678A6" if self.view.theme == "dark" else "#486A96")
+        return _safe_color(self.group.color, "#486A96")
 
 
 class NodeItem(QGraphicsObject):
@@ -347,7 +475,10 @@ class NodeItem(QGraphicsObject):
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         if event.button() == Qt.LeftButton:
-            self.view.select_node(self.node.id)
+            if QApplication.keyboardModifiers() & Qt.ControlModifier:
+                self.view.toggle_node_selection(self.node.id)
+            elif not self.isSelected() or not self.view.has_multi_node_selection():
+                self.view.select_node(self.node.id)
             if self.view.read_only and not self.view.allow_node_drag:
                 self.setCursor(Qt.PointingHandCursor)
                 event.accept()
@@ -397,12 +528,18 @@ class NodeItem(QGraphicsObject):
         self.view.snap_guides.clear()
         self.view.viewport().update()
         if self._moved:
+            self.view.refresh_group_membership()
             self.view.projectChanged.emit()
         super().mouseReleaseEvent(event)
 
     def itemChange(self, change: QGraphicsItem.GraphicsItemChange, value):  # type: ignore[override]
         if change == QGraphicsItem.ItemPositionChange and self.scene() and not self.view.rebuilding:
             pos = value
+            if self.view._moving_group:
+                return pos
+            if self.view.has_multi_node_selection():
+                self.view.snap_guides.clear()
+                return pos
             if QApplication.keyboardModifiers() & Qt.ControlModifier:
                 self.view.snap_guides.clear()
                 return pos
@@ -423,13 +560,13 @@ class NodeItem(QGraphicsObject):
         if visual_fields:
             natural_w = max([field.x + field.width for field in visual_fields] + [NODE_DEFAULT_WIDTH]) + 34
             natural_h = HEADER_HEIGHT + max([field.y + field.height for field in visual_fields] + [120]) + 24
-            self.width = max(NODE_MIN_WIDTH, self.node.width, min(NODE_MAX_NATURAL_WIDTH, natural_w))
-            self.height = max(NODE_MIN_HEIGHT, self.node.height, natural_h)
+            self.width = max(NODE_MIN_WIDTH, self.node.width if self.node.width > 0 else min(NODE_MAX_NATURAL_WIDTH, natural_w))
+            self.height = max(NODE_MIN_HEIGHT, self.node.height if self.node.height > 0 else natural_h)
             return
         natural_width = self._natural_detail_width()
-        self.width = max(NODE_MIN_WIDTH, self.node.width, natural_width)
+        self.width = max(NODE_MIN_WIDTH, self.node.width if self.node.width > 0 else natural_width)
         natural_height = self._natural_detail_height(self.width)
-        self.height = max(NODE_MIN_HEIGHT, self.node.height, natural_height)
+        self.height = max(NODE_MIN_HEIGHT, self.node.height if self.node.height > 0 else natural_height)
 
     def _natural_detail_width(self) -> float:
         title = f"{self.node.icon}  {self.node.title}" if self.node.icon else self.node.title
@@ -483,7 +620,7 @@ class NodeItem(QGraphicsObject):
 
 
 class EdgeItem(QGraphicsPathItem):
-    def __init__(self, edge: Edge, source: NodeItem, target: NodeItem, view: "NodeGraphView") -> None:
+    def __init__(self, edge: Edge, source: QGraphicsItem, target: QGraphicsItem, view: "NodeGraphView") -> None:
         super().__init__()
         self.edge = edge
         self.source = source
@@ -638,6 +775,9 @@ class NodeGraphView(QGraphicsView):
     nodeFolderRequested = Signal(str)
     nodeEditRequested = Signal(str)
     nodeDeleteRequested = Signal(str)
+    nodesDeleteRequested = Signal(object)
+    groupDeleteRequested = Signal(str)
+    groupEditRequested = Signal(str)
     edgeEditRequested = Signal(str)
     edgeDeleteRequested = Signal(str)
     edgeStyleRequested = Signal(str, str)
@@ -645,6 +785,7 @@ class NodeGraphView(QGraphicsView):
     createNodeRequested = Signal(float, float)
     createCanvasNodeRequested = Signal(float, float)
     createLinkNodeRequested = Signal(float, float, str)
+    createGroupRequested = Signal(float, float)
     createTemplateNodeRequested = Signal(float, float, str)
     templateManagerRequested = Signal()
     openProjectRequested = Signal()
@@ -667,7 +808,10 @@ class NodeGraphView(QGraphicsView):
         self.scene_obj = QGraphicsScene(self)
         self.setScene(self.scene_obj)
         self.node_items: dict[str, NodeItem] = {}
+        self.group_items: dict[str, BlueprintGroupItem] = {}
         self.edge_items: dict[str, EdgeItem] = {}
+        self.selected_node_ids: set[str] = set()
+        self.selected_group_ids: set[str] = set()
         self.selected_node_id: str | None = None
         self.selected_edge_id: str | None = None
         self.connecting = False
@@ -678,6 +822,10 @@ class NodeGraphView(QGraphicsView):
         self.rebuilding = False
         self._panning = False
         self._space_panning = False
+        self._rubber_selecting = False
+        self._rubber_start = QPointF()
+        self._rubber_item: QGraphicsPathItem | None = None
+        self._moving_group = False
         self._pan_cursor_override = False
         self._last_pan = QPoint()
 
@@ -746,23 +894,17 @@ class NodeGraphView(QGraphicsView):
         cursor = QCursor(shape)
         self.setCursor(cursor)
         self.viewport().setCursor(cursor)
-        app = QApplication.instance()
-        if not app:
-            return
-        if self._pan_cursor_override:
-            QApplication.changeOverrideCursor(cursor)
-        else:
-            QApplication.setOverrideCursor(cursor)
-            self._pan_cursor_override = True
+        self._pan_cursor_override = True
 
     def _clear_pan_cursor_override(self) -> None:
         if not self._pan_cursor_override:
             return
-        QApplication.restoreOverrideCursor()
         self._pan_cursor_override = False
 
     def set_theme(self, theme: str) -> None:
         self.theme = theme
+        for item in self.group_items.values():
+            item.update()
         for item in self.node_items.values():
             item.update()
         for item in self.edge_items.values():
@@ -783,15 +925,25 @@ class NodeGraphView(QGraphicsView):
     def rebuild(self) -> None:
         self.rebuilding = True
         self.scene_obj.clear()
+        self.group_items.clear()
         self.node_items.clear()
         self.edge_items.clear()
+        groups = getattr(self.project, "groups", [])
+        self.selected_node_ids &= {node.id for node in self.project.nodes}
+        self.selected_group_ids &= {group.id for group in groups}
+        for group in groups:
+            item = BlueprintGroupItem(group, self)
+            self.scene_obj.addItem(item)
+            item.setSelected(group.id in self.selected_group_ids)
+            self.group_items[group.id] = item
         for node in self.project.nodes:
             item = NodeItem(node, self)
             self.scene_obj.addItem(item)
+            item.setSelected(node.id in self.selected_node_ids)
             self.node_items[node.id] = item
         for edge in self.project.valid_edges():
-            source = self.node_items.get(edge.source)
-            target = self.node_items.get(edge.target)
+            source = self._endpoint_item(edge.source)
+            target = self._endpoint_item(edge.target)
             if source and target:
                 edge_item = EdgeItem(edge, source, target, self)
                 self.scene_obj.addItem(edge_item)
@@ -801,9 +953,16 @@ class NodeGraphView(QGraphicsView):
 
     def _update_scene_rect(self) -> None:
         rect = QRectF(-SCENE_EXTENT, -SCENE_EXTENT, SCENE_EXTENT * 2, SCENE_EXTENT * 2)
+        for item in self.group_items.values():
+            rect = rect.united(item.sceneBoundingRect().adjusted(-SCENE_MARGIN, -SCENE_MARGIN, SCENE_MARGIN, SCENE_MARGIN))
         for item in self.node_items.values():
             rect = rect.united(item.sceneBoundingRect().adjusted(-SCENE_MARGIN, -SCENE_MARGIN, SCENE_MARGIN, SCENE_MARGIN))
         self.scene_obj.setSceneRect(rect)
+
+    def _endpoint_item(self, endpoint_id: str | None) -> QGraphicsItem | None:
+        if not endpoint_id:
+            return None
+        return self.node_items.get(endpoint_id) or self.group_items.get(endpoint_id)
 
     def center_world(self) -> QPointF:
         return self.mapToScene(self.viewport().rect().center())
@@ -818,9 +977,14 @@ class NodeGraphView(QGraphicsView):
             return
         if not source_id:
             return
+        if not self._endpoint_item(source_id):
+            return
         self.connecting = True
         self.connection_source = source_id
-        self.select_node(source_id)
+        if source_id in self.node_items:
+            self.select_node(source_id)
+        elif source_id in self.group_items:
+            self.select_group(source_id)
         self._refresh_interaction_cursor()
         self.viewport().update()
 
@@ -833,17 +997,64 @@ class NodeGraphView(QGraphicsView):
     def select_node(self, node_id: str | None) -> None:
         self.selected_node_id = node_id
         self.selected_edge_id = None
+        self.selected_node_ids = {node_id} if node_id else set()
+        self.selected_group_ids.clear()
         for item_id, item in self.node_items.items():
             item.setSelected(item_id == node_id)
+        for item in self.group_items.values():
+            item.setSelected(False)
         for item in self.edge_items.values():
             item.setSelected(False)
         self.selectionChanged.emit(node_id, None)
         self.viewport().update()
 
+    def select_nodes(self, node_ids: set[str]) -> None:
+        self.selected_node_ids = set(node_ids)
+        self.selected_node_id = next(iter(self.selected_node_ids), None)
+        self.selected_edge_id = None
+        self.selected_group_ids.clear()
+        for item_id, item in self.node_items.items():
+            item.setSelected(item_id in self.selected_node_ids)
+        for item in self.group_items.values():
+            item.setSelected(False)
+        for item in self.edge_items.values():
+            item.setSelected(False)
+        self.selectionChanged.emit(self.selected_node_id, None)
+        self.viewport().update()
+
+    def toggle_node_selection(self, node_id: str) -> None:
+        selected = set(self.selected_node_ids)
+        if node_id in selected:
+            selected.remove(node_id)
+        else:
+            selected.add(node_id)
+        self.select_nodes(selected)
+
+    def has_multi_node_selection(self) -> bool:
+        return len(self.selected_node_ids) > 1
+
+    def select_group(self, group_id: str | None) -> None:
+        self.selected_node_id = None
+        self.selected_edge_id = None
+        self.selected_node_ids.clear()
+        self.selected_group_ids = {group_id} if group_id else set()
+        for item in self.node_items.values():
+            item.setSelected(False)
+        for item_id, item in self.group_items.items():
+            item.setSelected(item_id == group_id)
+        for item in self.edge_items.values():
+            item.setSelected(False)
+        self.selectionChanged.emit(None, None)
+        self.viewport().update()
+
     def select_edge(self, edge_id: str | None) -> None:
         self.selected_node_id = None
         self.selected_edge_id = edge_id
+        self.selected_node_ids.clear()
+        self.selected_group_ids.clear()
         for item in self.node_items.values():
+            item.setSelected(False)
+        for item in self.group_items.values():
             item.setSelected(False)
         for item_id, item in self.edge_items.items():
             item.setSelected(item_id == edge_id)
@@ -853,7 +1064,11 @@ class NodeGraphView(QGraphicsView):
     def clear_selection(self) -> None:
         self.selected_node_id = None
         self.selected_edge_id = None
+        self.selected_node_ids.clear()
+        self.selected_group_ids.clear()
         for item in self.node_items.values():
+            item.setSelected(False)
+        for item in self.group_items.values():
             item.setSelected(False)
         for item in self.edge_items.values():
             item.setSelected(False)
@@ -861,10 +1076,55 @@ class NodeGraphView(QGraphicsView):
         self.viewport().update()
 
     def update_edges_for_node(self, node_id: str) -> None:
+        self.update_edges_for_endpoint(node_id)
+
+    def update_edges_for_endpoint(self, endpoint_id: str) -> None:
         for edge_item in self.edge_items.values():
-            if edge_item.edge.source == node_id or edge_item.edge.target == node_id:
+            if edge_item.edge.source == endpoint_id or edge_item.edge.target == endpoint_id:
                 edge_item.update_path()
         self._update_scene_rect()
+
+    def move_nodes_in_group(self, group_id: str, delta: QPointF) -> None:
+        self._moving_group = True
+        try:
+            for node in self.project.nodes:
+                if node.group_id != group_id:
+                    continue
+                item = self.node_items.get(node.id)
+                if not item:
+                    continue
+                item.setPos(item.pos() + delta)
+                node.x = item.pos().x()
+                node.y = item.pos().y()
+                self.update_edges_for_node(node.id)
+        finally:
+            self._moving_group = False
+
+    def refresh_group_membership(self) -> None:
+        if self.read_only:
+            return
+        changed = False
+        for node in self.project.nodes:
+            item = self.node_items.get(node.id)
+            if not item:
+                continue
+            new_group_id = self._containing_group_id(item.sceneBoundingRect().center())
+            if node.group_id != new_group_id:
+                node.group_id = new_group_id
+                changed = True
+        if changed:
+            self.viewport().update()
+
+    def _containing_group_id(self, point: QPointF) -> str:
+        best: tuple[float, str] | None = None
+        for group_id, item in self.group_items.items():
+            rect = item.sceneBoundingRect()
+            if not rect.contains(point):
+                continue
+            area = rect.width() * rect.height()
+            if best is None or area < best[0]:
+                best = (area, group_id)
+        return best[1] if best else ""
 
     def snap_position(self, moving: NodeItem, target: QPointF) -> QPointF:
         scale = max(0.001, self.transform().m11())
@@ -988,7 +1248,7 @@ class NodeGraphView(QGraphicsView):
                 painter.drawText(QPointF(rect.left() + 18, guide.value - 8), guide.label)
 
         if self.connecting and self.connection_source:
-            source = self.node_items.get(self.connection_source)
+            source = self._endpoint_item(self.connection_source)
             if source:
                 start = self._connection_start(source.sceneBoundingRect(), self.mouse_scene)
                 path = self._preview_path(start, self.mouse_scene)
@@ -1006,10 +1266,10 @@ class NodeGraphView(QGraphicsView):
         self.setFocus()
         self.mouse_scene = self.mapToScene(event.position().toPoint())
         if event.button() == Qt.LeftButton and self.connecting:
-            node = self._node_at(event.position().toPoint())
-            if node and self.connection_source and node.node.id != self.connection_source:
+            target_id = self._endpoint_id_at(event.position().toPoint(), include_group_body=True)
+            if target_id and self.connection_source and target_id != self.connection_source:
                 source = self.connection_source
-                target = node.node.id
+                target = target_id
                 self.cancel_connection()
                 self.edgeCreated.emit(source, target)
             event.accept()
@@ -1020,12 +1280,24 @@ class NodeGraphView(QGraphicsView):
             self._refresh_interaction_cursor()
             event.accept()
             return
+        if (
+            event.button() == Qt.LeftButton
+            and not self.read_only
+            and not self.itemAt(event.position().toPoint())
+        ):
+            self._start_rubber_selection(self.mouse_scene)
+            event.accept()
+            return
         super().mousePressEvent(event)
         if event.button() == Qt.LeftButton and not self.itemAt(event.position().toPoint()):
             self.clear_selection()
 
     def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
         self.mouse_scene = self.mapToScene(event.position().toPoint())
+        if self._rubber_selecting:
+            self._update_rubber_selection(self.mouse_scene)
+            event.accept()
+            return
         if self._panning:
             delta = event.position().toPoint() - self._last_pan
             self._last_pan = event.position().toPoint()
@@ -1035,9 +1307,15 @@ class NodeGraphView(QGraphicsView):
             return
         if self.connecting:
             self.viewport().update()
+        if not self.itemAt(event.position().toPoint()):
+            self._refresh_interaction_cursor()
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        if self._rubber_selecting:
+            self._finish_rubber_selection(self.mapToScene(event.position().toPoint()))
+            event.accept()
+            return
         if self._panning:
             self._panning = False
             self._refresh_interaction_cursor()
@@ -1046,6 +1324,15 @@ class NodeGraphView(QGraphicsView):
         super().mouseReleaseEvent(event)
 
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        if event.key() == Qt.Key_Delete and not self.read_only:
+            if self.selected_node_ids:
+                self.nodesDeleteRequested.emit(set(self.selected_node_ids))
+            elif self.selected_group_ids:
+                self.groupDeleteRequested.emit(next(iter(self.selected_group_ids)))
+            elif self.selected_edge_id:
+                self.edgeDeleteRequested.emit(self.selected_edge_id)
+            event.accept()
+            return
         if event.key() == Qt.Key_Space and not event.isAutoRepeat():
             self._space_panning = True
             self._refresh_interaction_cursor()
@@ -1065,14 +1352,56 @@ class NodeGraphView(QGraphicsView):
             return
         super().keyReleaseEvent(event)
 
+    def _start_rubber_selection(self, scene_pos: QPointF) -> None:
+        self.clear_selection()
+        self._rubber_selecting = True
+        self._rubber_start = scene_pos
+        path = QPainterPath()
+        path.addRect(QRectF(scene_pos, scene_pos))
+        self._rubber_item = QGraphicsPathItem(path)
+        color = QColor(palette(self.theme)["blue"])
+        fill = QColor(color)
+        fill.setAlpha(34)
+        self._rubber_item.setPen(QPen(color, 0, Qt.DashLine))
+        self._rubber_item.setBrush(QBrush(fill))
+        self._rubber_item.setZValue(1000)
+        self.scene_obj.addItem(self._rubber_item)
+
+    def _update_rubber_selection(self, scene_pos: QPointF) -> None:
+        if not self._rubber_item:
+            return
+        rect = QRectF(self._rubber_start, scene_pos).normalized()
+        path = QPainterPath()
+        path.addRect(rect)
+        self._rubber_item.setPath(path)
+
+    def _finish_rubber_selection(self, scene_pos: QPointF) -> None:
+        rect = QRectF(self._rubber_start, scene_pos).normalized()
+        if self._rubber_item:
+            self.scene_obj.removeItem(self._rubber_item)
+            self._rubber_item = None
+        self._rubber_selecting = False
+        if rect.width() < 4 and rect.height() < 4:
+            self.clear_selection()
+            return
+        selected = {
+            node_id
+            for node_id, item in self.node_items.items()
+            if rect.intersects(item.sceneBoundingRect())
+        }
+        self.select_nodes(selected)
+
     def contextMenuEvent(self, event) -> None:  # type: ignore[override]
         scene_pos = self.mapToScene(event.pos())
         node = self._node_at(event.pos())
         edge = None if node else self._edge_at(event.pos())
+        group = None if node or edge else (self._group_at(event.pos()) or self._group_body_at(event.pos()))
         if node:
             self.select_node(node.node.id)
         elif edge:
             self.select_edge(edge.edge.id)
+        elif group:
+            self.select_group(group.group.id)
 
         menu = QMenu(self)
         if self.read_only:
@@ -1147,9 +1476,23 @@ class NodeGraphView(QGraphicsView):
             elif action == delete_edge:
                 self.edgeDeleteRequested.emit(edge.edge.id)
             return
+        if group:
+            edit_group = menu.addAction("重命名蓝图组")
+            connect_group = menu.addAction("连接")
+            menu.addSeparator()
+            delete_group = menu.addAction("删除蓝图组")
+            action = menu.exec(event.globalPos())
+            if action == edit_group:
+                self.groupEditRequested.emit(group.group.id)
+            elif action == connect_group:
+                self.start_connection(group.group.id)
+            elif action == delete_group:
+                self.groupDeleteRequested.emit(group.group.id)
+            return
 
         create = menu.addAction("创建节点")
         create_canvas = menu.addAction("创建画布节点")
+        create_group = menu.addAction("创建蓝图组")
         link_menu = menu.addMenu("创建超链接")
         create_md = link_menu.addAction("Markdown (.md)")
         create_txt = link_menu.addAction("文本 (.txt)")
@@ -1174,6 +1517,8 @@ class NodeGraphView(QGraphicsView):
             self.createNodeRequested.emit(scene_pos.x(), scene_pos.y())
         elif action == create_canvas:
             self.createCanvasNodeRequested.emit(scene_pos.x(), scene_pos.y())
+        elif action == create_group:
+            self.createGroupRequested.emit(scene_pos.x(), scene_pos.y())
         elif action == create_md:
             self.createLinkNodeRequested.emit(scene_pos.x(), scene_pos.y(), "md")
         elif action == create_txt:
@@ -1197,6 +1542,36 @@ class NodeGraphView(QGraphicsView):
         for item in self.items(pos):
             if isinstance(item, EdgeItem):
                 return item
+        return None
+
+    def _group_at(self, pos: QPoint) -> BlueprintGroupItem | None:
+        for item in self.items(pos):
+            if isinstance(item, BlueprintGroupItem):
+                return item
+        return None
+
+    def _group_body_at(self, pos: QPoint) -> BlueprintGroupItem | None:
+        scene_pos = self.mapToScene(pos)
+        containing = [
+            (item.sceneBoundingRect().width() * item.sceneBoundingRect().height(), item)
+            for item in self.group_items.values()
+            if item.sceneBoundingRect().contains(scene_pos)
+        ]
+        if not containing:
+            return None
+        return min(containing, key=lambda item: item[0])[1]
+
+    def _endpoint_id_at(self, pos: QPoint, include_group_body: bool = False) -> str | None:
+        node = self._node_at(pos)
+        if node:
+            return node.node.id
+        group = self._group_at(pos)
+        if group:
+            return group.group.id
+        if include_group_body:
+            group_body = self._group_body_at(pos)
+            if group_body:
+                return group_body.group.id
         return None
 
     def _connection_start(self, rect: QRectF, target: QPointF) -> QPointF:
