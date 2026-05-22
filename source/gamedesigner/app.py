@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import ctypes
 from ctypes import wintypes
 import re
 import sys
 from pathlib import Path
 
 from PySide6.QtCore import QPoint, QSize, Qt
-from PySide6.QtGui import QAction, QCloseEvent, QCursor, QIcon, QKeySequence, QPixmap, QShortcut
+from PySide6.QtGui import QAction, QCloseEvent, QCursor, QFontMetrics, QIcon, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -26,14 +25,15 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from .csv_io import export_project_csv, import_project_csv
-from .models import Node, NodeField, NodeTemplate, ProjectData, default_project, new_id
+from .csv_io import export_game_csv
+from .models import Node, NodeField, ProjectData, default_project, new_id
 from .qt_canvas import NodeGraphView
 from .qt_dialogs import NodeEditorDialog, ProjectSettingsDialog, TemplateManagerDialog
 from .qt_fonts import configure_fonts
 from .qt_theme import stylesheet
 from .storage import (
     PROJECT_SUFFIX,
+    LEGACY_PROJECT_SUFFIX,
     default_project_path,
     load_project,
     load_settings,
@@ -45,6 +45,8 @@ from .storage import (
 WELCOME_PROJECT_NAME = "开始"
 WELCOME_NEW_NODE_ID = "welcome_new_project"
 WELCOME_GUIDE_NODE_ID = "welcome_guide"
+TAB_MIN_WIDTH = 86
+TAB_MAX_WIDTH = 340
 WM_NCHITTEST = 0x0084
 HTCAPTION = 2
 HTLEFT = 10
@@ -129,13 +131,6 @@ class CompactTitleBar(QWidget):
                 icon.setPixmap(pixmap.scaled(16, 16, Qt.KeepAspectRatio, Qt.SmoothTransformation))
         layout.addWidget(icon)
 
-        self.title_label = QLabel("GameDesigner", self)
-        self.title_label.setObjectName("titleText")
-        self.title_label.setAttribute(Qt.WA_TransparentForMouseEvents)
-        self.title_label.setMinimumWidth(128)
-        self.title_label.setMaximumWidth(260)
-        layout.addWidget(self.title_label)
-
         layout.addWidget(self._menu_button("文件", window.file_menu))
         layout.addWidget(self._menu_button("编辑", window.edit_menu))
         layout.addWidget(self._menu_button("视图", window.view_menu))
@@ -148,8 +143,7 @@ class CompactTitleBar(QWidget):
         layout.addWidget(self._window_button("×", window.close, close=True))
 
     def set_title(self, title: str) -> None:
-        self.title_label.setText(title)
-        self.title_label.setToolTip(title)
+        self.setToolTip(title)
 
     def _menu_button(self, text: str, menu: QMenu) -> QToolButton:
         button = QToolButton(self)
@@ -220,6 +214,22 @@ class CompactTitleBar(QWidget):
         super().mouseDoubleClickEvent(event)
 
 
+class AdaptiveTabBar(QTabBar):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setExpanding(False)
+        self.setUsesScrollButtons(True)
+        self.setElideMode(Qt.ElideRight)
+
+    def tabSizeHint(self, index: int) -> QSize:  # type: ignore[override]
+        size = super().tabSizeHint(index)
+        text_width = QFontMetrics(self.font()).horizontalAdvance(self.tabText(index))
+        target_width = max(TAB_MIN_WIDTH, min(TAB_MAX_WIDTH, text_width + 58))
+        size.setWidth(max(size.width(), target_width))
+        size.setHeight(max(size.height(), 30))
+        return size
+
+
 class GameDesignerApp(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -237,7 +247,8 @@ class GameDesignerApp(QMainWindow):
         self.setStyleSheet(stylesheet(self.theme))
 
         self.tabs = QTabWidget()
-        self.tabs.setTabsClosable(True)
+        self.tabs.setTabBar(AdaptiveTabBar(self.tabs))
+        self.tabs.setTabsClosable(False)
         self.tabs.setMovable(True)
         self.tabs.currentChanged.connect(lambda _index: self._on_current_tab_changed())
         self.tabs.tabCloseRequested.connect(self._close_tab)
@@ -267,7 +278,7 @@ class GameDesignerApp(QMainWindow):
         self.save_action.setShortcut(QKeySequence.Save)
         self.save_action.triggered.connect(lambda: self._save_project())
 
-        self.save_as_action = QAction("另存为...", self)
+        self.save_as_action = QAction("导出 GDC...", self)
         self.save_as_action.setShortcut(QKeySequence.SaveAs)
         self.save_as_action.triggered.connect(lambda: self._save_as_project())
 
@@ -278,13 +289,13 @@ class GameDesignerApp(QMainWindow):
         self.project_settings_action = QAction("项目设置...", self)
         self.project_settings_action.triggered.connect(self._edit_project_settings)
 
-        self.import_action = QAction("导入 CSV...", self)
+        self.import_action = QAction("导入 GDC...", self)
         self.import_action.setShortcut(QKeySequence("Ctrl+I"))
-        self.import_action.triggered.connect(self._import_csv)
+        self.import_action.triggered.connect(self._import_gdc)
 
-        self.export_action = QAction("导出 CSV...", self)
+        self.export_action = QAction("导出游戏 CSV...", self)
         self.export_action.setShortcut(QKeySequence("Ctrl+E"))
-        self.export_action.triggered.connect(self._export_csv)
+        self.export_action.triggered.connect(self._export_game_csv)
 
         self.add_node_action = QAction("新增节点", self)
         self.add_node_action.setShortcut(QKeySequence("N"))
@@ -414,8 +425,8 @@ class GameDesignerApp(QMainWindow):
         )
         self._wire_page(page)
         index = self.tabs.addTab(page, self._tab_title(page))
-        if is_welcome:
-            self.tabs.tabBar().setTabButton(index, QTabBar.RightSide, None)
+        if not is_welcome:
+            self._install_tab_close_button(page)
         self.tabs.setCurrentIndex(index)
         self._update_title()
         self._update_status()
@@ -428,7 +439,6 @@ class GameDesignerApp(QMainWindow):
         canvas.nodeActivated.connect(lambda node_id, page=page: self._activate_welcome_node(page, node_id))
         canvas.nodeEditRequested.connect(self._edit_node)
         canvas.nodeDeleteRequested.connect(self._delete_node_by_id)
-        canvas.nodeTemplateRequested.connect(self._create_template_from_node_id)
         canvas.edgeEditRequested.connect(self._edit_edge)
         canvas.edgeDeleteRequested.connect(self._delete_edge_by_id)
         canvas.edgeStyleRequested.connect(self._set_edge_style)
@@ -585,6 +595,31 @@ class GameDesignerApp(QMainWindow):
         index = self.tabs.indexOf(page)
         if index >= 0:
             self.tabs.setTabText(index, self._tab_title(page))
+            self.tabs.tabBar().updateGeometry()
+
+    def _install_tab_close_button(self, page: ProjectPage) -> None:
+        index = self.tabs.indexOf(page)
+        if index < 0:
+            return
+        holder = QWidget(self.tabs)
+        holder.setObjectName("tabCloseHolder")
+        layout = QHBoxLayout(holder)
+        layout.setContentsMargins(0, 0, 8, 0)
+        layout.setSpacing(0)
+        button = QToolButton(holder)
+        button.setObjectName("tabCloseButton")
+        button.setText("×")
+        button.setCursor(Qt.PointingHandCursor)
+        button.setToolTip("关闭画布")
+        button.setFixedSize(18, 18)
+        button.clicked.connect(lambda _checked=False, page=page: self._close_page(page))
+        layout.addWidget(button)
+        self.tabs.tabBar().setTabButton(index, QTabBar.RightSide, holder)
+
+    def _close_page(self, page: ProjectPage) -> None:
+        index = self.tabs.indexOf(page)
+        if index >= 0:
+            self._close_tab(index)
 
     def _on_current_tab_changed(self) -> None:
         self._update_title()
@@ -651,7 +686,7 @@ class GameDesignerApp(QMainWindow):
             self,
             "打开项目",
             self.settings.workspace_dir,
-            f"GameDesigner 项目 (*{PROJECT_SUFFIX});;JSON 文件 (*.json);;所有文件 (*.*)",
+            f"GameDesigner 工程 (*{PROJECT_SUFFIX});;旧版工程 (*{LEGACY_PROJECT_SUFFIX} *.json);;所有文件 (*.*)",
         )
         if not path:
             return
@@ -709,13 +744,13 @@ class GameDesignerApp(QMainWindow):
             return False
         path, _ = QFileDialog.getSaveFileName(
             self,
-            "项目另存为",
+            "导出 GDC 工程",
             str(Path(self.settings.workspace_dir) / f"{_safe_filename(page.project.name)}{PROJECT_SUFFIX}"),
-            f"GameDesigner 项目 (*{PROJECT_SUFFIX});;JSON 文件 (*.json)",
+            f"GameDesigner 工程 (*{PROJECT_SUFFIX})",
         )
         if not path:
             return False
-        page.path = Path(path)
+        page.path = _ensure_suffix(Path(path), PROJECT_SUFFIX)
         return self._save_project(page)
 
     def _edit_project_settings(self) -> None:
@@ -744,37 +779,40 @@ class GameDesignerApp(QMainWindow):
         save_settings(self.settings)
         self._mark_dirty(page)
 
-    def _export_csv(self) -> None:
+    def _export_game_csv(self) -> None:
         page = self._current_page()
         if not page or page.is_welcome:
             return
         self._ensure_project_dirs(page.project, page.path)
-        default = Path(page.project.output_dir or self.settings.export_dir) / _safe_filename(page.project.name)
-        path = QFileDialog.getExistingDirectory(self, "选择 CSV 导出目录", str(default.parent))
+        default = Path(page.project.output_dir or self.settings.export_dir) / f"{_safe_filename(page.project.name)}.csv"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出游戏 CSV",
+            str(default),
+            "CSV 文件 (*.csv)",
+        )
         if not path:
             return
         try:
-            export_folder = export_project_csv(page.project, path)
+            export_path = export_game_csv(page.project, _ensure_suffix(Path(path), ".csv"))
         except Exception as exc:  # noqa: BLE001 - surface IO errors.
             QMessageBox.critical(self, "导出失败", f"无法导出 CSV：\n{exc}")
             return
-        page.project.output_dir = str(export_folder)
-        self.settings.export_dir = str(export_folder.parent)
+        page.project.output_dir = str(export_path.parent)
+        self.settings.export_dir = str(export_path.parent)
         save_settings(self.settings)
-        self.status.showMessage(f"CSV 已导出到：{export_folder}", 5000)
+        self.status.showMessage(f"游戏 CSV 已导出：{export_path}", 5000)
 
-    def _import_csv(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "选择 CSV 目录", self.settings.workspace_dir)
+    def _import_gdc(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "导入 GDC 工程",
+            self.settings.workspace_dir,
+            f"GameDesigner 工程 (*{PROJECT_SUFFIX});;旧版工程 (*{LEGACY_PROJECT_SUFFIX} *.json);;所有文件 (*.*)",
+        )
         if not path:
             return
-        try:
-            project = import_project_csv(path)
-        except Exception as exc:  # noqa: BLE001 - surface IO errors.
-            QMessageBox.critical(self, "导入失败", f"无法导入 CSV：\n{exc}")
-            return
-        project.source_dir = str(Path(path))
-        project.output_dir = self.settings.export_dir
-        self._add_page(project, None, dirty=True)
+        self._open_project_path(Path(path))
 
     def _add_node(self) -> None:
         page = self._current_page()
@@ -849,7 +887,7 @@ class GameDesignerApp(QMainWindow):
         node = page.project.find_node(node_id)
         if not node:
             return
-        dialog = NodeEditorDialog(self, node, self.theme)
+        dialog = NodeEditorDialog(self, node, self.theme, page.project.templates)
         if dialog.exec() != NodeEditorDialog.Accepted or not dialog.result:
             return
         result = dialog.result
@@ -859,6 +897,9 @@ class GameDesignerApp(QMainWindow):
         node.width = result.width
         node.height = result.height
         node.fields = result.fields
+        if dialog.templates_changed and dialog.templates_result is not None:
+            page.project.templates = dialog.templates_result
+            page.refresh_active_template()
         page.canvas.rebuild()
         page.canvas.select_node(node.id)
         self._mark_dirty(page)
@@ -934,40 +975,6 @@ class GameDesignerApp(QMainWindow):
             return
         page.canvas.rebuild()
         page.canvas.select_edge(edge.id)
-        self._mark_dirty(page)
-
-    def _create_template_from_node_id(self, node_id: str) -> None:
-        page = self._current_page()
-        if not page or page.is_welcome:
-            return
-        node = page.project.find_node(node_id)
-        if not node:
-            return
-        template_id = new_id("template")
-        template_node = Node(
-            id=template_id,
-            title=f"{node.title} 模板",
-            x=node.x,
-            y=node.y,
-            width=node.width,
-            height=node.height,
-            color=node.color,
-            icon=node.icon,
-            fields=[NodeField.from_dict(field.to_dict()) for field in node.fields],
-        )
-        dialog = NodeEditorDialog(self, template_node, self.theme)
-        if dialog.exec() != NodeEditorDialog.Accepted or not dialog.result:
-            return
-        result = dialog.result
-        template = NodeTemplate(
-            id=template_id,
-            name=result.title,
-            color=result.color,
-            icon=result.icon,
-            fields=[NodeField.from_dict(field.to_dict()) for field in result.fields],
-        )
-        page.project.templates.append(template)
-        page.refresh_active_template()
         self._mark_dirty(page)
 
     def _manage_templates(self) -> None:
@@ -1075,10 +1082,16 @@ def _safe_filename(name: str) -> str:
     return cleaned or "project"
 
 
+def _ensure_suffix(path: Path, suffix: str) -> Path:
+    return path if path.suffix.lower() == suffix.lower() else path.with_suffix(suffix)
+
+
 def _project_name_from_path(path: Path) -> str:
     name = path.name
     if name.endswith(PROJECT_SUFFIX):
         name = name[: -len(PROJECT_SUFFIX)]
+    elif name.endswith(LEGACY_PROJECT_SUFFIX):
+        name = name[: -len(LEGACY_PROJECT_SUFFIX)]
     return name or path.stem
 
 

@@ -10,7 +10,8 @@ from .models import ProjectData, default_project
 
 
 APP_NAME = "GameDesigner"
-PROJECT_SUFFIX = ".gdesigner.json"
+PROJECT_SUFFIX = ".gdc"
+LEGACY_PROJECT_SUFFIX = ".gdesigner.json"
 
 
 @dataclass

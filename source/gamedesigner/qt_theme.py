@@ -62,7 +62,7 @@ def stylesheet(name: str) -> str:
         color: {colors["text_muted"]};
         border: 1px solid {colors["hairline"]};
         border-bottom: 0;
-        padding: 6px 13px;
+        padding: 6px 8px 6px 13px;
         margin-right: 2px;
         border-top-left-radius: 8px;
         border-top-right-radius: 8px;
@@ -71,6 +71,26 @@ def stylesheet(name: str) -> str:
         background: {colors["panel_alt"]};
         color: {colors["text"]};
         border-color: {colors["accent"]};
+    }}
+    QWidget#tabCloseHolder {{
+        background: transparent;
+        border: 0;
+        padding: 0;
+        margin: 0;
+    }}
+    QToolButton#tabCloseButton {{
+        background: transparent;
+        color: {colors["text"]};
+        border: 0;
+        border-radius: 7px;
+        padding: 0;
+        font-size: 11pt;
+        font-weight: 500;
+    }}
+    QToolButton#tabCloseButton:hover {{
+        background: {colors["control_hover"]};
+        color: {colors["text"]};
+        border: 0;
     }}
     QToolBar {{
         background: {colors["window"]};
@@ -96,6 +116,37 @@ def stylesheet(name: str) -> str:
     }}
     QPushButton#accentButton:hover, QToolButton#accentButton:hover {{
         background: {colors["accent_hover"]};
+    }}
+    QToolButton#compactToolButton {{
+        background: {colors["control"]};
+        color: {colors["text"]};
+        border: 1px solid {colors["hairline"]};
+        border-radius: 8px;
+        padding: 5px 9px;
+    }}
+    QToolButton#compactToolButton:hover {{
+        background: {colors["control_hover"]};
+        border-color: {colors["accent"]};
+    }}
+    QToolButton#compactToolButton::menu-indicator {{
+        image: none;
+        width: 0;
+    }}
+    QToolButton#exportPinButton {{
+        background: transparent;
+        color: {colors["text_muted"]};
+        border: 1px solid transparent;
+        border-radius: 7px;
+        padding: 0;
+    }}
+    QToolButton#exportPinButton:hover {{
+        background: {colors["control_hover"]};
+        border-color: {colors["hairline"]};
+    }}
+    QToolButton#exportPinButton:checked {{
+        background: {colors["control"]};
+        color: {colors["text"]};
+        border-color: {colors["accent"]};
     }}
     QLineEdit, QTextEdit, QPlainTextEdit, QComboBox, QSpinBox, QDoubleSpinBox {{
         background: {colors["panel_alt"]};
@@ -171,11 +222,6 @@ def stylesheet(name: str) -> str:
         background: transparent;
         border: 0;
         padding: 0;
-    }}
-    QLabel#titleText {{
-        color: {colors["text_muted"]};
-        background: transparent;
-        padding: 0 8px 0 2px;
     }}
     QToolButton#topMenuButton, QToolButton#topActionButton, QToolButton#windowButton, QToolButton#closeButton {{
         background: transparent;

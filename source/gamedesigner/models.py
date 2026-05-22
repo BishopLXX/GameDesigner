@@ -6,6 +6,19 @@ from uuid import uuid4
 
 
 SCHEMA_VERSION = 1
+FIELD_EXPORT_PROPS = [
+    "name",
+    "data_type",
+    "value",
+    "image_path",
+    "x",
+    "y",
+    "width",
+    "height",
+    "font_size",
+    "text_color",
+    "bg_color",
+]
 
 FIELD_TYPES = [
     "文本",
@@ -40,6 +53,7 @@ class NodeField:
     text_color: str = "#1D1D1F"
     bg_color: str = "#ffffff"
     image_path: str = ""
+    export_props: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -54,6 +68,7 @@ class NodeField:
             "text_color": self.text_color,
             "bg_color": self.bg_color,
             "image_path": self.image_path,
+            "export_props": [item for item in self.export_props if item in FIELD_EXPORT_PROPS],
         }
 
     @classmethod
@@ -64,6 +79,9 @@ class NodeField:
             data_type = "图片"
         if data_type not in FIELD_TYPES:
             data_type = "文本"
+        export_props = raw.get("export_props", [])
+        if not isinstance(export_props, list):
+            export_props = []
         return cls(
             name=str(raw.get("name", "字段")),
             data_type=data_type,
@@ -76,6 +94,7 @@ class NodeField:
             text_color=str(raw.get("text_color") or "#1D1D1F"),
             bg_color=str(raw.get("bg_color") or "#ffffff"),
             image_path=image_path,
+            export_props=[str(item) for item in export_props if str(item) in FIELD_EXPORT_PROPS],
         )
 
     def has_visual_layout(self) -> bool:
@@ -212,6 +231,7 @@ class ProjectData:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "file_format": "GameDesigner.GDC",
             "schema_version": SCHEMA_VERSION,
             "name": self.name,
             "source_dir": self.source_dir,

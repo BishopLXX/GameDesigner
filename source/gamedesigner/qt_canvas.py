@@ -591,7 +591,6 @@ class NodeGraphView(QGraphicsView):
     nodeActivated = Signal(str)
     nodeEditRequested = Signal(str)
     nodeDeleteRequested = Signal(str)
-    nodeTemplateRequested = Signal(str)
     edgeEditRequested = Signal(str)
     edgeDeleteRequested = Signal(str)
     edgeStyleRequested = Signal(str, str)
@@ -1030,7 +1029,6 @@ class NodeGraphView(QGraphicsView):
         if node:
             edit = menu.addAction("编辑节点")
             connect = menu.addAction("连接")
-            template = menu.addAction("由此节点创建模板")
             menu.addSeparator()
             delete = menu.addAction("删除节点")
             action = menu.exec(event.globalPos())
@@ -1038,8 +1036,6 @@ class NodeGraphView(QGraphicsView):
                 self.nodeEditRequested.emit(node.node.id)
             elif action == connect:
                 self.start_connection(node.node.id)
-            elif action == template:
-                self.nodeTemplateRequested.emit(node.node.id)
             elif action == delete:
                 self.nodeDeleteRequested.emit(node.node.id)
             return

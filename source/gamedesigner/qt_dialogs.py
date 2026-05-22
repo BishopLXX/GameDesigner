@@ -5,7 +5,6 @@ from pathlib import Path
 
 from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
-    QAction,
     QColor,
     QPainter,
     QPainterPath,
@@ -24,20 +23,22 @@ from PySide6.QtWidgets import (
     QGraphicsView,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
+    QMenu,
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
     QSplitter,
-    QToolBar,
+    QToolButton,
     QVBoxLayout,
     QWidget,
     QColorDialog,
 )
 
-from .models import DEFAULT_NODE_COLOR, FIELD_TYPES, Node, NodeField, NodeTemplate, new_id
+from .models import DEFAULT_NODE_COLOR, FIELD_EXPORT_PROPS, FIELD_TYPES, Node, NodeField, NodeTemplate, new_id
 from .qt_theme import palette
 
 
@@ -305,6 +306,8 @@ class FieldCanvas(QGraphicsView):
     fieldSelected = Signal(int)
     fieldActivated = Signal(int)
     fieldChanged = Signal()
+    cardAddRequested = Signal(str, float, float)
+    cardDeleteRequested = Signal(int)
 
     def __init__(self, fields: list[NodeField], theme: str) -> None:
         super().__init__()
@@ -411,6 +414,28 @@ class FieldCanvas(QGraphicsView):
             return
         super().mouseReleaseEvent(event)
 
+    def contextMenuEvent(self, event) -> None:  # type: ignore[override]
+        item = self._field_at(event.pos())
+        menu = QMenu(self)
+        if item:
+            self._select_item(item.index)
+            delete = menu.addAction("删除卡片")
+            action = menu.exec(event.globalPos())
+            if action == delete:
+                self.cardDeleteRequested.emit(item.index)
+            return
+
+        scene_pos = self.mapToScene(event.pos())
+        field_x = max(0.0, scene_pos.x())
+        field_y = max(0.0, scene_pos.y() - HEADER_HEIGHT)
+        add_text = menu.addAction("新增文字卡片")
+        add_image = menu.addAction("新增图片卡片")
+        action = menu.exec(event.globalPos())
+        if action == add_text:
+            self.cardAddRequested.emit("text", field_x, field_y)
+        elif action == add_image:
+            self.cardAddRequested.emit("image", field_x, field_y)
+
     def _select_item(self, index: int) -> None:
         self.selected_index = index
         for item in self.scene_obj.items():
@@ -431,7 +456,13 @@ class FieldCanvas(QGraphicsView):
 
 
 class NodeEditorDialog(QDialog):
-    def __init__(self, parent: QWidget | None, node: Node, theme: str = "dark") -> None:
+    def __init__(
+        self,
+        parent: QWidget | None,
+        node: Node,
+        theme: str = "dark",
+        templates: list[NodeTemplate] | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("编辑节点")
         self.setModal(True)
@@ -443,6 +474,9 @@ class NodeEditorDialog(QDialog):
         self._width = node.width
         self._height = node.height
         self.fields = [copy.deepcopy(field) for field in node.fields]
+        self.templates = [copy.deepcopy(template) for template in templates] if templates is not None else None
+        self.templates_result: list[NodeTemplate] | None = None
+        self.templates_changed = False
         self._ensure_visual_layout()
         self._updating = False
 
@@ -463,12 +497,15 @@ class NodeEditorDialog(QDialog):
         self.font_size = QLineEdit()
         self.text_color = QLineEdit()
         self.bg_color = QLineEdit()
+        self.pin_buttons: dict[str, QToolButton] = {}
 
         self.canvas = FieldCanvas(self.fields, theme)
         self.canvas.set_header(self.title_edit.text(), self.icon_edit.text(), self.color_edit.text())
         self.canvas.fieldSelected.connect(self._load_selected_props)
         self.canvas.fieldActivated.connect(self._focus_field_value)
         self.canvas.fieldChanged.connect(self._on_field_changed)
+        self.canvas.cardAddRequested.connect(self._add_card_at)
+        self.canvas.cardDeleteRequested.connect(self._delete_card_at)
 
         splitter = QSplitter()
         splitter.addWidget(self.canvas)
@@ -501,35 +538,69 @@ class NodeEditorDialog(QDialog):
         card_form.addRow("图标", self.icon_edit)
         card_form.addRow("颜色", self._color_row(self.color_edit, self._pick_node_color))
 
-        toolbar = QToolBar()
-        add_text = QAction("新增文字卡片", self)
-        add_text.triggered.connect(self._add_text_card)
-        add_image = QAction("新增图片卡片", self)
-        add_image.triggered.connect(self._add_image_card)
-        delete_card = QAction("删除选中卡片", self)
-        delete_card.triggered.connect(self._delete_selected_card)
-        toolbar.addAction(add_text)
-        toolbar.addAction(add_image)
-        toolbar.addAction(delete_card)
+        template_tools = self._template_tools()
 
         props = QGroupBox("选中卡片属性")
         props_form = QFormLayout(props)
-        props_form.addRow("字段", self.field_name)
-        props_form.addRow("类型", self.field_type)
-        props_form.addRow("内容", self.field_value)
-        props_form.addRow("图片", self._path_row(self.image_path, "选择图片", self._pick_image))
-        props_form.addRow("X", self.field_x)
-        props_form.addRow("Y", self.field_y)
-        props_form.addRow("宽", self.field_w)
-        props_form.addRow("高", self.field_h)
-        props_form.addRow("字号", self.font_size)
-        props_form.addRow("文字色", self._color_row(self.text_color, self._pick_text_color))
-        props_form.addRow("背景色", self._color_row(self.bg_color, self._pick_bg_color))
+        props_form.addRow("字段", self._pin_row("name", self.field_name))
+        props_form.addRow("类型", self._pin_row("data_type", self.field_type))
+        props_form.addRow("内容", self._pin_row("value", self.field_value))
+        props_form.addRow("图片", self._pin_row("image_path", self._path_row(self.image_path, "选择图片", self._pick_image)))
+        props_form.addRow("X", self._pin_row("x", self.field_x))
+        props_form.addRow("Y", self._pin_row("y", self.field_y))
+        props_form.addRow("宽", self._pin_row("width", self.field_w))
+        props_form.addRow("高", self._pin_row("height", self.field_h))
+        props_form.addRow("字号", self._pin_row("font_size", self.font_size))
+        props_form.addRow("文字色", self._pin_row("text_color", self._color_row(self.text_color, self._pick_text_color)))
+        props_form.addRow("背景色", self._pin_row("bg_color", self._color_row(self.bg_color, self._pick_bg_color)))
 
+        if template_tools:
+            layout.addWidget(template_tools)
         layout.addWidget(card_box)
-        layout.addWidget(toolbar)
         layout.addWidget(props, 1)
         return panel
+
+    def _template_tools(self) -> QWidget | None:
+        if self.templates is None:
+            return None
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        layout.addStretch(1)
+
+        import_button = QToolButton(row)
+        import_button.setObjectName("compactToolButton")
+        import_button.setText("导入模板")
+        import_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        import_button.setPopupMode(QToolButton.InstantPopup)
+        import_menu = QMenu(import_button)
+        self._populate_template_import_menu(import_menu)
+        import_button.setMenu(import_menu)
+        import_button.setEnabled(bool(self.templates))
+
+        save_button = QToolButton(row)
+        save_button.setObjectName("compactToolButton")
+        save_button.setText("保存模板")
+        save_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        save_button.clicked.connect(self._save_current_template)
+
+        layout.addWidget(import_button)
+        layout.addWidget(save_button)
+        self.import_template_button = import_button
+        self.import_template_menu = import_menu
+        return row
+
+    def _populate_template_import_menu(self, menu: QMenu) -> None:
+        menu.clear()
+        if not self.templates:
+            empty = menu.addAction("暂无模板")
+            empty.setEnabled(False)
+            return
+        for template in self.templates:
+            action = menu.addAction(template.name)
+            action.setData(template.id)
+            action.triggered.connect(lambda _checked=False, template_id=template.id: self._import_template(template_id))
 
     def _path_row(self, edit: QLineEdit, label: str, slot) -> QWidget:
         row = QWidget()
@@ -540,6 +611,23 @@ class NodeEditorDialog(QDialog):
         button.clicked.connect(slot)
         layout.addWidget(edit, 1)
         layout.addWidget(button)
+        return row
+
+    def _pin_row(self, prop: str, editor: QWidget) -> QWidget:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        layout.addWidget(editor, 1)
+        pin = QToolButton(row)
+        pin.setObjectName("exportPinButton")
+        pin.setText("📌")
+        pin.setCheckable(True)
+        pin.setToolTip("导出游戏 CSV 时包含此属性")
+        pin.setFixedSize(26, 26)
+        pin.toggled.connect(lambda checked, prop=prop: self._set_export_prop(prop, checked))
+        self.pin_buttons[prop] = pin
+        layout.addWidget(pin)
         return row
 
     def _color_row(self, edit: QLineEdit, slot) -> QWidget:
@@ -612,7 +700,8 @@ class NodeEditorDialog(QDialog):
                 widget.clear()
             self.field_value.setPlainText("")
             self._updating = False
-            self._update_image_controls()
+            self._update_type_controls()
+            self._update_pin_controls()
             return
         self.field_name.setText(field.name)
         self.field_type.setCurrentText(field.data_type if field.data_type in FIELD_TYPES else "文本")
@@ -626,17 +715,67 @@ class NodeEditorDialog(QDialog):
         self.text_color.setText(field.text_color)
         self.bg_color.setText(field.bg_color)
         self._updating = False
-        self._update_image_controls()
+        self._update_type_controls()
+        self._update_pin_controls()
 
     def _on_field_type_changed(self, _text: str) -> None:
+        if self.field_type.currentText() == "图片" and self.field_value.toPlainText():
+            self.field_value.blockSignals(True)
+            self.field_value.setPlainText("")
+            self.field_value.blockSignals(False)
         self._apply_props()
-        self._update_image_controls()
+        field = self._selected_field()
+        if field:
+            self._normalize_export_props_for_type(field)
+        self._update_type_controls()
+        self._update_pin_controls()
 
-    def _update_image_controls(self) -> None:
-        enabled = self._selected_field() is not None and self.field_type.currentText() == "图片"
-        self.image_path.setEnabled(enabled)
+    def _update_type_controls(self) -> None:
+        has_field = self._selected_field() is not None
+        is_image = has_field and self.field_type.currentText() == "图片"
+        self.field_value.setEnabled(has_field and not is_image)
+        self.image_path.setEnabled(is_image)
         if self.image_button:
-            self.image_button.setEnabled(enabled)
+            self.image_button.setEnabled(is_image)
+        value_pin = self.pin_buttons.get("value")
+        if value_pin:
+            value_pin.setEnabled(has_field and not is_image)
+        image_pin = self.pin_buttons.get("image_path")
+        if image_pin:
+            image_pin.setEnabled(is_image)
+
+    def _update_pin_controls(self) -> None:
+        field = self._selected_field()
+        for prop, button in self.pin_buttons.items():
+            button.blockSignals(True)
+            button.setChecked(bool(field and prop in field.export_props))
+            button.setEnabled(bool(field))
+            button.blockSignals(False)
+        self._update_type_controls()
+
+    def _set_export_prop(self, prop: str, checked: bool) -> None:
+        if self._updating or prop not in FIELD_EXPORT_PROPS:
+            return
+        field = self._selected_field()
+        if not field:
+            return
+        if (prop == "value" and field.data_type == "图片") or (prop == "image_path" and field.data_type != "图片"):
+            self._update_pin_controls()
+            return
+        props = [item for item in field.export_props if item in FIELD_EXPORT_PROPS]
+        if checked and prop not in props:
+            props.append(prop)
+        elif not checked:
+            props = [item for item in props if item != prop]
+        field.export_props = props
+        self.canvas.refresh(self.canvas.selected_index)
+
+    def _normalize_export_props_for_type(self, field: NodeField) -> None:
+        blocked = {"value"} if field.data_type == "图片" else {"image_path"}
+        field.export_props = [
+            prop for prop in field.export_props
+            if prop in FIELD_EXPORT_PROPS and prop not in blocked
+        ]
 
     def _apply_props(self) -> None:
         if self._updating:
@@ -646,7 +785,7 @@ class NodeEditorDialog(QDialog):
             return
         field.name = self.field_name.text().strip() or "字段"
         field.data_type = self.field_type.currentText() if self.field_type.currentText() in FIELD_TYPES else "文本"
-        field.value = self.field_value.toPlainText().strip()
+        field.value = "" if field.data_type == "图片" else self.field_value.toPlainText().strip()
         field.image_path = self.image_path.text().strip()
         field.x = self._float_text(self.field_x, field.x)
         field.y = self._float_text(self.field_y, field.y)
@@ -655,6 +794,7 @@ class NodeEditorDialog(QDialog):
         field.font_size = max(8, min(48, int(self._float_text(self.font_size, field.font_size))))
         field.text_color = self.text_color.text().strip() or "#1D1D1F"
         field.bg_color = self.bg_color.text().strip() or "#FFFFFF"
+        self._normalize_export_props_for_type(field)
         self.canvas.refresh(self.canvas.selected_index)
 
     def _on_field_changed(self) -> None:
@@ -665,13 +805,28 @@ class NodeEditorDialog(QDialog):
 
     def _focus_field_value(self, index: int) -> None:
         self._load_selected_props(index)
+        field = self._selected_field()
+        if field and field.data_type == "图片":
+            self.image_path.setFocus()
+            return
         self.field_value.setFocus()
         self.field_value.selectAll()
 
-    def _add_text_card(self) -> None:
+    def _add_card_at(self, kind: str, x: float, y: float) -> None:
+        if kind == "image":
+            self._add_image_card(QPointF(x, y))
+            return
+        self._add_text_card(QPointF(x, y))
+
+    def _next_card_position(self) -> QPointF:
+        return QPointF(24.0, max([item.y + item.height + 12 for item in self.fields] + [18]))
+
+    def _add_text_card(self, position: QPointF | None = None) -> None:
+        if not isinstance(position, QPointF):
+            position = self._next_card_position()
         field = NodeField(name="文字", data_type="长文本", value="双击右侧内容编辑文字")
-        field.x = 24
-        field.y = max([item.y + item.height + 12 for item in self.fields] + [18])
+        field.x = max(0.0, position.x())
+        field.y = max(0.0, position.y())
         field.width = 320
         field.height = 92
         field.font_size = 14
@@ -681,26 +836,85 @@ class NodeEditorDialog(QDialog):
         self.canvas.refresh(len(self.fields) - 1)
         self._load_selected_props(len(self.fields) - 1)
 
-    def _add_image_card(self) -> None:
+    def _add_image_card(self, position: QPointF | None = None, pick_image: bool = True) -> None:
+        if not isinstance(position, QPointF):
+            position = self._next_card_position()
         field = NodeField(name="图片", data_type="图片", value="")
-        field.x = 24
-        field.y = max([item.y + item.height + 12 for item in self.fields] + [18])
+        field.x = max(0.0, position.x())
+        field.y = max(0.0, position.y())
         field.width = 280
         field.height = 170
         field.bg_color = "#F6F6F8"
         self.fields.append(field)
         self.canvas.refresh(len(self.fields) - 1)
         self._load_selected_props(len(self.fields) - 1)
-        self._pick_image()
+        if pick_image:
+            self._pick_image()
 
-    def _delete_selected_card(self) -> None:
-        index = self.canvas.selected_index
-        if index is None or index < 0 or index >= len(self.fields):
+    def _delete_card_at(self, index: int) -> None:
+        if index < 0 or index >= len(self.fields):
             return
         del self.fields[index]
         next_index = min(index, len(self.fields) - 1) if self.fields else None
         self.canvas.refresh(next_index)
         self._load_selected_props(next_index if next_index is not None else -1)
+
+    def _delete_selected_card(self) -> None:
+        index = self.canvas.selected_index
+        if index is None or index < 0 or index >= len(self.fields):
+            return
+        self._delete_card_at(index)
+
+    def _import_template(self, template_id: str) -> None:
+        if self.templates is None:
+            return
+        template = next((item for item in self.templates if item.id == template_id), None)
+        if not template:
+            return
+        self.title_edit.setText(template.name)
+        self.icon_edit.setText(template.icon)
+        self.color_edit.setText(template.color or DEFAULT_NODE_COLOR)
+        self.fields = [NodeField.from_dict(field.to_dict()) for field in template.fields]
+        self._ensure_visual_layout()
+        self.canvas.fields = self.fields
+        self.canvas.refresh(0 if self.fields else None)
+        self._load_selected_props(self.canvas.selected_index if self.canvas.selected_index is not None else -1)
+
+    def _save_current_template(self) -> None:
+        if self.templates is None:
+            return
+        self._apply_props()
+        default_name = self.title_edit.text().strip() or "节点模板"
+        name, ok = QInputDialog.getText(self, "保存模板", "模板名称", text=default_name)
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            QMessageBox.warning(self, "模板名称不能为空", "请输入模板名称。")
+            return
+
+        template = NodeTemplate(
+            id=new_id("template"),
+            name=name,
+            color=self.color_edit.text().strip() or DEFAULT_NODE_COLOR,
+            icon=self.icon_edit.text().strip(),
+            fields=[NodeField.from_dict(field.to_dict()) for field in self.fields],
+        )
+        existing_index = next((index for index, item in enumerate(self.templates) if item.name == name), None)
+        if existing_index is not None:
+            answer = QMessageBox.question(self, "覆盖模板", f"模板“{name}”已存在，是否覆盖？")
+            if answer != QMessageBox.Yes:
+                return
+            template.id = self.templates[existing_index].id
+            self.templates[existing_index] = template
+        else:
+            self.templates.append(template)
+        self.templates_changed = True
+        self.templates_result = [copy.deepcopy(item) for item in self.templates]
+        if hasattr(self, "import_template_menu"):
+            self._populate_template_import_menu(self.import_template_menu)
+        if hasattr(self, "import_template_button"):
+            self.import_template_button.setEnabled(bool(self.templates))
 
     def _pick_node_color(self) -> None:
         self._pick_color(self.color_edit)
