@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 from dataclasses import dataclass
 
-from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, Qt, Signal
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
     QBrush,
@@ -50,6 +51,11 @@ ALIGN_PROXIMITY = 460.0
 SCENE_EXTENT = 500000.0
 SCENE_MARGIN = 20000.0
 WRAP_FLAGS = Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap | Qt.TextWrapAnywhere
+RIGHT_DRAG_MENU_THRESHOLD = 8
+IMAGE_SOURCE_CACHE_LIMIT = 96
+IMAGE_SCALED_CACHE_LIMIT = 192
+INTERACTION_PREVIEW_DELAY_MS = 140
+_MISSING_PIXMAP = object()
 
 
 def _safe_color(value: str, fallback: str) -> QColor:
@@ -227,7 +233,6 @@ class NodeItem(QGraphicsObject):
         self._resize_size = (0.0, 0.0)
         self._pressed_pos = QPointF()
         self._moved = False
-        self._image_refs: list[QPixmap] = []
         self._sync_size()
         self.setPos(node.x, node.y)
         flags = QGraphicsItem.ItemIsSelectable
@@ -267,7 +272,7 @@ class NodeItem(QGraphicsObject):
         else:
             self._paint_detail_mode(painter, colors, rect)
 
-        if self.isSelected() or self.view.hover_node_id == self.node.id:
+        if self.view.can_resize_nodes() and (self.isSelected() or self.view.hover_node_id == self.node.id):
             self._paint_resize_handle(painter, colors, rect)
 
     def _paint_order_badge(self, painter: QPainter, colors: dict[str, str], rect: QRectF) -> None:
@@ -393,16 +398,24 @@ class NodeItem(QGraphicsObject):
             painter.drawPath(path)
             is_image = field.data_type == "图片"
             if is_image and field.image_path:
-                pixmap = QPixmap(field.image_path)
-                if not pixmap.isNull():
-                    target = card.adjusted(8, 8, -8, -8)
-                    scaled = pixmap.scaled(
+                target = card.adjusted(8, 8, -8, -8)
+                if self.view.is_interaction_preview():
+                    pixmap = self.view._source_image_pixmap(field.image_path)
+                    if pixmap is not None:
+                        image_rect = self._fit_pixmap_rect(target, pixmap.width(), pixmap.height())
+                        painter.save()
+                        painter.setRenderHint(QPainter.SmoothPixmapTransform, False)
+                        painter.drawPixmap(image_rect.toRect(), pixmap, pixmap.rect())
+                        painter.restore()
+                else:
+                    pixmap = self.view._scaled_image_pixmap(
+                        field.image_path,
                         int(max(1, target.width())),
                         int(max(1, target.height())),
-                        Qt.KeepAspectRatio,
-                        Qt.SmoothTransformation,
                     )
-                    painter.drawPixmap(int(target.x()), int(target.y()), scaled)
+                    if pixmap is not None:
+                        image_rect = self._fit_pixmap_rect(target, pixmap.width(), pixmap.height())
+                        painter.drawPixmap(image_rect.toRect(), pixmap, pixmap.rect())
             elif is_image:
                 painter.setPen(QColor(colors["node_muted"]))
                 painter.setFont(_font(9))
@@ -458,8 +471,8 @@ class NodeItem(QGraphicsObject):
         return min_size
 
     def hoverMoveEvent(self, event) -> None:  # type: ignore[override]
-        if self.view.read_only:
-            self.setCursor(Qt.OpenHandCursor if self.view.allow_node_drag else Qt.PointingHandCursor)
+        if not self.view.can_resize_nodes():
+            self.setCursor(Qt.OpenHandCursor if self.view.can_move_nodes() else Qt.PointingHandCursor)
             super().hoverMoveEvent(event)
             return
         self.view.hover_node_id = self.node.id if self._on_resize_handle(event.pos()) else None
@@ -479,13 +492,13 @@ class NodeItem(QGraphicsObject):
                 self.view.toggle_node_selection(self.node.id)
             elif not self.isSelected() or not self.view.has_multi_node_selection():
                 self.view.select_node(self.node.id)
-            if self.view.read_only and not self.view.allow_node_drag:
+            if not self.view.can_move_nodes():
                 self.setCursor(Qt.PointingHandCursor)
                 event.accept()
                 return
             self._pressed_pos = event.scenePos()
             self._moved = False
-            if not self.view.read_only and self._on_resize_handle(event.pos()):
+            if self.view.can_resize_nodes() and self._on_resize_handle(event.pos()):
                 self._resizing = True
                 self._resize_origin = event.scenePos()
                 self._resize_size = (self.width, self.height)
@@ -496,6 +509,8 @@ class NodeItem(QGraphicsObject):
 
     def mouseDoubleClickEvent(self, event) -> None:  # type: ignore[override]
         if event.button() == Qt.LeftButton:
+            self.unsetCursor()
+            self.view.sync_interaction_cursor()
             self.view.nodeActivated.emit(self.node.id)
             event.accept()
             return
@@ -613,6 +628,19 @@ class NodeItem(QGraphicsObject):
             text,
         )
         return max(float(metrics.height()), float(rect.height()))
+
+    def _fit_pixmap_rect(self, target: QRectF, width: int, height: int) -> QRectF:
+        if width <= 0 or height <= 0 or target.width() <= 0 or target.height() <= 0:
+            return QRectF()
+        scale = min(target.width() / width, target.height() / height)
+        draw_width = max(1.0, width * scale)
+        draw_height = max(1.0, height * scale)
+        return QRectF(
+            target.x() + (target.width() - draw_width) / 2,
+            target.y() + (target.height() - draw_height) / 2,
+            draw_width,
+            draw_height,
+        )
 
     def _on_resize_handle(self, pos: QPointF) -> bool:
         rect = self.boundingRect()
@@ -828,6 +856,15 @@ class NodeGraphView(QGraphicsView):
         self._moving_group = False
         self._pan_cursor_override = False
         self._last_pan = QPoint()
+        self._right_press_pos = QPoint()
+        self._right_drag_pending = False
+        self._suppress_context_menu = False
+        self._interaction_preview = False
+        self._interaction_preview_timer = QTimer(self)
+        self._interaction_preview_timer.setSingleShot(True)
+        self._interaction_preview_timer.timeout.connect(self._end_interaction_preview)
+        self._source_pixmap_cache: OrderedDict[str, QPixmap | None] = OrderedDict()
+        self._scaled_pixmap_cache: OrderedDict[tuple[str, int, int], QPixmap | None] = OrderedDict()
 
         self.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing | QPainter.SmoothPixmapTransform)
         self.setViewportUpdateMode(QGraphicsView.FullViewportUpdate)
@@ -847,11 +884,16 @@ class NodeGraphView(QGraphicsView):
     def can_move_nodes(self) -> bool:
         return not self.read_only or self.allow_node_drag
 
+    def can_resize_nodes(self) -> bool:
+        return self.can_move_nodes()
+
     def eventFilter(self, _watched, event) -> bool:  # type: ignore[override]
         if event.type() in (QEvent.ApplicationDeactivate, QEvent.WindowDeactivate):
-            if self._space_panning or self._panning:
+            if self._space_panning or self._panning or self._right_drag_pending:
                 self._space_panning = False
                 self._panning = False
+                self._right_drag_pending = False
+                self._end_interaction_preview()
                 self._refresh_interaction_cursor()
             return False
         if event.type() not in (QEvent.KeyPress, QEvent.KeyRelease):
@@ -890,6 +932,11 @@ class NodeGraphView(QGraphicsView):
         self.setCursor(cursor)
         self.viewport().setCursor(cursor)
 
+    def sync_interaction_cursor(self) -> None:
+        self.hover_node_id = None
+        self._refresh_interaction_cursor()
+        self.viewport().update()
+
     def _set_pan_cursor(self, shape: Qt.CursorShape) -> None:
         cursor = QCursor(shape)
         self.setCursor(cursor)
@@ -914,6 +961,7 @@ class NodeGraphView(QGraphicsView):
     def set_project(self, project: ProjectData | CanvasData) -> None:
         self.project = project
         self.clear_selection()
+        self._clear_pixmap_caches()
         self.rebuild()
 
     def set_folder_action_node_ids(self, node_ids: set[str]) -> None:
@@ -950,6 +998,7 @@ class NodeGraphView(QGraphicsView):
                 self.edge_items[edge.id] = edge_item
         self.rebuilding = False
         self._update_scene_rect()
+        self._refresh_interaction_cursor()
 
     def _update_scene_rect(self) -> None:
         rect = QRectF(-SCENE_EXTENT, -SCENE_EXTENT, SCENE_EXTENT * 2, SCENE_EXTENT * 2)
@@ -971,6 +1020,64 @@ class NodeGraphView(QGraphicsView):
         self.resetTransform()
         self.centerOn(0, 0)
         self.viewport().update()
+
+    def is_interaction_preview(self) -> bool:
+        return self._interaction_preview
+
+    def _begin_interaction_preview(self) -> None:
+        self._interaction_preview_timer.start(INTERACTION_PREVIEW_DELAY_MS)
+        if self._interaction_preview:
+            return
+        self._interaction_preview = True
+        self.viewport().update()
+
+    def _end_interaction_preview(self) -> None:
+        self._interaction_preview_timer.stop()
+        if not self._interaction_preview:
+            return
+        self._interaction_preview = False
+        self.viewport().update()
+
+    def _clear_pixmap_caches(self) -> None:
+        self._source_pixmap_cache.clear()
+        self._scaled_pixmap_cache.clear()
+
+    def _load_source_pixmap(self, path: str) -> QPixmap | None:
+        pixmap = QPixmap(path)
+        if pixmap.isNull():
+            return None
+        return pixmap
+
+    def _source_image_pixmap(self, path: str) -> QPixmap | None:
+        cache_key = path.strip()
+        if not cache_key:
+            return None
+        cached = self._source_pixmap_cache.get(cache_key, _MISSING_PIXMAP)
+        if cached is not _MISSING_PIXMAP:
+            self._source_pixmap_cache.move_to_end(cache_key)
+            return cached
+        pixmap = self._load_source_pixmap(cache_key)
+        self._remember_pixmap(self._source_pixmap_cache, cache_key, pixmap, IMAGE_SOURCE_CACHE_LIMIT)
+        return pixmap
+
+    def _scaled_image_pixmap(self, path: str, width: int, height: int) -> QPixmap | None:
+        source = self._source_image_pixmap(path)
+        if source is None:
+            return None
+        cache_key = (path.strip(), max(1, width), max(1, height))
+        cached = self._scaled_pixmap_cache.get(cache_key, _MISSING_PIXMAP)
+        if cached is not _MISSING_PIXMAP:
+            self._scaled_pixmap_cache.move_to_end(cache_key)
+            return cached
+        pixmap = source.scaled(cache_key[1], cache_key[2], Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self._remember_pixmap(self._scaled_pixmap_cache, cache_key, pixmap, IMAGE_SCALED_CACHE_LIMIT)
+        return pixmap
+
+    def _remember_pixmap(self, cache: OrderedDict, key, pixmap, limit: int) -> None:
+        cache[key] = pixmap
+        cache.move_to_end(key)
+        while len(cache) > limit:
+            cache.popitem(last=False)
 
     def start_connection(self, source_id: str | None) -> None:
         if self.read_only:
@@ -1115,6 +1222,9 @@ class NodeGraphView(QGraphicsView):
         if changed:
             self.viewport().update()
 
+    def group_id_at_scene_pos(self, point: QPointF) -> str:
+        return self._containing_group_id(point)
+
     def _containing_group_id(self, point: QPointF) -> str:
         best: tuple[float, str] | None = None
         for group_id, item in self.group_items.items():
@@ -1256,6 +1366,7 @@ class NodeGraphView(QGraphicsView):
                 painter.drawPath(path)
 
     def wheelEvent(self, event) -> None:  # type: ignore[override]
+        self._begin_interaction_preview()
         factor = 1.12 if event.angleDelta().y() > 0 else 1 / 1.12
         current = self.transform().m11()
         target = max(0.18, min(2.8, current * factor))
@@ -1264,6 +1375,7 @@ class NodeGraphView(QGraphicsView):
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         self.setFocus()
+        self._suppress_context_menu = False
         self.mouse_scene = self.mapToScene(event.position().toPoint())
         if event.button() == Qt.LeftButton and self.connecting:
             target_id = self._endpoint_id_at(event.position().toPoint(), include_group_body=True)
@@ -1277,7 +1389,13 @@ class NodeGraphView(QGraphicsView):
         if event.button() == Qt.MiddleButton or (event.button() == Qt.LeftButton and self._space_panning):
             self._panning = True
             self._last_pan = event.position().toPoint()
+            self._begin_interaction_preview()
             self._refresh_interaction_cursor()
+            event.accept()
+            return
+        if event.button() == Qt.RightButton:
+            self._right_drag_pending = True
+            self._right_press_pos = event.position().toPoint()
             event.accept()
             return
         if (
@@ -1298,7 +1416,23 @@ class NodeGraphView(QGraphicsView):
             self._update_rubber_selection(self.mouse_scene)
             event.accept()
             return
+        if self._right_drag_pending:
+            current_pos = event.position().toPoint()
+            if not self._panning and (current_pos - self._right_press_pos).manhattanLength() > RIGHT_DRAG_MENU_THRESHOLD:
+                self._panning = True
+                self._last_pan = self._right_press_pos
+                self._begin_interaction_preview()
+                self._refresh_interaction_cursor()
+            if self._panning:
+                self._begin_interaction_preview()
+                delta = current_pos - self._last_pan
+                self._last_pan = current_pos
+                self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
+                self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
+            event.accept()
+            return
         if self._panning:
+            self._begin_interaction_preview()
             delta = event.position().toPoint() - self._last_pan
             self._last_pan = event.position().toPoint()
             self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
@@ -1314,6 +1448,21 @@ class NodeGraphView(QGraphicsView):
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
         if self._rubber_selecting:
             self._finish_rubber_selection(self.mapToScene(event.position().toPoint()))
+            event.accept()
+            return
+        if event.button() == Qt.RightButton and self._right_drag_pending:
+            self._right_drag_pending = False
+            release_pos = event.position().toPoint()
+            if self._panning:
+                self._panning = False
+                self._refresh_interaction_cursor()
+                event.accept()
+                return
+            if (release_pos - self._right_press_pos).manhattanLength() <= RIGHT_DRAG_MENU_THRESHOLD:
+                self._suppress_context_menu = True
+                self._show_context_menu(release_pos, event.globalPosition().toPoint())
+                event.accept()
+                return
             event.accept()
             return
         if self._panning:
@@ -1392,10 +1541,19 @@ class NodeGraphView(QGraphicsView):
         self.select_nodes(selected)
 
     def contextMenuEvent(self, event) -> None:  # type: ignore[override]
-        scene_pos = self.mapToScene(event.pos())
-        node = self._node_at(event.pos())
-        edge = None if node else self._edge_at(event.pos())
-        group = None if node or edge else (self._group_at(event.pos()) or self._group_body_at(event.pos()))
+        if self._suppress_context_menu:
+            self._suppress_context_menu = False
+            event.accept()
+            return
+        self._show_context_menu(event.pos(), event.globalPos())
+
+    def _show_context_menu(self, view_pos: QPoint, global_pos: QPoint) -> None:
+        scene_pos = self.mapToScene(view_pos)
+        node = self._node_at(view_pos)
+        edge = None if node else self._edge_at(view_pos)
+        group_header = None if node or edge else self._group_at(view_pos)
+        group_body = None if node or edge or group_header else self._group_body_at(view_pos)
+        group = group_header or group_body
         if node:
             self.select_node(node.node.id)
         elif edge:
@@ -1410,7 +1568,7 @@ class NodeGraphView(QGraphicsView):
                 open_folder_action = None
                 if node.node.id in self.folder_action_node_ids:
                     open_folder_action = menu.addAction("打开项目所在文件夹")
-                action = menu.exec(event.globalPos())
+                action = menu.exec(global_pos)
                 if action == open_action:
                     self.nodeActivated.emit(node.node.id)
                 elif open_folder_action and action == open_folder_action:
@@ -1420,7 +1578,7 @@ class NodeGraphView(QGraphicsView):
             open_project = menu.addAction("打开项目...")
             menu.addSeparator()
             reset = menu.addAction("重置视图")
-            action = menu.exec(event.globalPos())
+            action = menu.exec(global_pos)
             if action == create:
                 self.createNodeRequested.emit(scene_pos.x(), scene_pos.y())
             elif action == open_project:
@@ -1439,7 +1597,7 @@ class NodeGraphView(QGraphicsView):
             connect = menu.addAction("连接")
             menu.addSeparator()
             delete = menu.addAction("删除节点")
-            action = menu.exec(event.globalPos())
+            action = menu.exec(global_pos)
             if open_canvas and action == open_canvas:
                 self.nodeActivated.emit(node.node.id)
             elif open_link and action == open_link:
@@ -1464,7 +1622,7 @@ class NodeGraphView(QGraphicsView):
             orthogonal.setCheckable(True)
             orthogonal.setChecked(edge.edge.style == "orthogonal")
             delete_edge = menu.addAction("删除连线")
-            action = menu.exec(event.globalPos())
+            action = menu.exec(global_pos)
             if action == edit_edge:
                 self.edgeEditRequested.emit(edge.edge.id)
             elif action == curve:
@@ -1476,12 +1634,28 @@ class NodeGraphView(QGraphicsView):
             elif action == delete_edge:
                 self.edgeDeleteRequested.emit(edge.edge.id)
             return
+        if group_body:
+            create_menu, create_actions = self._build_create_menu(menu)
+            edit_group = menu.addAction("重命名蓝图组")
+            connect_group = menu.addAction("连接")
+            menu.addSeparator()
+            delete_group = menu.addAction("删除蓝图组")
+            action = menu.exec(global_pos)
+            if self._handle_create_action(action, create_actions, scene_pos):
+                return
+            if action == edit_group:
+                self.groupEditRequested.emit(group_body.group.id)
+            elif action == connect_group:
+                self.start_connection(group_body.group.id)
+            elif action == delete_group:
+                self.groupDeleteRequested.emit(group_body.group.id)
+            return
         if group:
             edit_group = menu.addAction("重命名蓝图组")
             connect_group = menu.addAction("连接")
             menu.addSeparator()
             delete_group = menu.addAction("删除蓝图组")
-            action = menu.exec(event.globalPos())
+            action = menu.exec(global_pos)
             if action == edit_group:
                 self.groupEditRequested.emit(group.group.id)
             elif action == connect_group:
@@ -1490,13 +1664,30 @@ class NodeGraphView(QGraphicsView):
                 self.groupDeleteRequested.emit(group.group.id)
             return
 
-        create = menu.addAction("创建节点")
-        create_canvas = menu.addAction("创建画布节点")
-        create_group = menu.addAction("创建蓝图组")
-        link_menu = menu.addMenu("创建超链接")
+        _, create_actions = self._build_create_menu(menu)
+        menu.addSeparator()
+        reset = menu.addAction("重置视图")
+        if self.connecting:
+            cancel = menu.addAction("取消连接模式")
+        else:
+            cancel = None
+        action = menu.exec(global_pos)
+        if self._handle_create_action(action, create_actions, scene_pos):
+            return
+        if action == reset:
+            self.reset_view()
+        elif cancel and action == cancel:
+            self.cancel_connection()
+
+    def _build_create_menu(self, menu: QMenu) -> tuple[QMenu, dict[str, object]]:
+        create_menu = menu.addMenu("创建")
+        create = create_menu.addAction("节点")
+        create_canvas = create_menu.addAction("画布节点")
+        create_group = create_menu.addAction("蓝图组")
+        link_menu = create_menu.addMenu("超链接")
         create_md = link_menu.addAction("Markdown (.md)")
         create_txt = link_menu.addAction("文本 (.txt)")
-        template_menu = menu.addMenu("按模板创建")
+        template_menu = create_menu.addMenu("按模板创建")
         if self.templates:
             for template in self.templates:
                 action = QAction(template.name, template_menu)
@@ -1505,32 +1696,36 @@ class NodeGraphView(QGraphicsView):
         else:
             empty = template_menu.addAction("暂无模板")
             empty.setEnabled(False)
-        template_manager = menu.addAction("节点模板...")
-        menu.addSeparator()
-        reset = menu.addAction("重置视图")
-        if self.connecting:
-            cancel = menu.addAction("取消连接模式")
-        else:
-            cancel = None
-        action = menu.exec(event.globalPos())
-        if action == create:
+        return create_menu, {
+            "create": create,
+            "create_canvas": create_canvas,
+            "create_group": create_group,
+            "create_md": create_md,
+            "create_txt": create_txt,
+            "template_menu": template_menu,
+        }
+
+    def _handle_create_action(self, action, create_actions: dict[str, object], scene_pos: QPointF) -> bool:
+        if action == create_actions["create"]:
             self.createNodeRequested.emit(scene_pos.x(), scene_pos.y())
-        elif action == create_canvas:
+            return True
+        if action == create_actions["create_canvas"]:
             self.createCanvasNodeRequested.emit(scene_pos.x(), scene_pos.y())
-        elif action == create_group:
+            return True
+        if action == create_actions["create_group"]:
             self.createGroupRequested.emit(scene_pos.x(), scene_pos.y())
-        elif action == create_md:
+            return True
+        if action == create_actions["create_md"]:
             self.createLinkNodeRequested.emit(scene_pos.x(), scene_pos.y(), "md")
-        elif action == create_txt:
+            return True
+        if action == create_actions["create_txt"]:
             self.createLinkNodeRequested.emit(scene_pos.x(), scene_pos.y(), "txt")
-        elif action == template_manager:
-            self.templateManagerRequested.emit()
-        elif action == reset:
-            self.reset_view()
-        elif cancel and action == cancel:
-            self.cancel_connection()
-        elif action and action.parent() is template_menu and action.data():
+            return True
+        template_menu = create_actions["template_menu"]
+        if action and action.parent() is template_menu and action.data():
             self.createTemplateNodeRequested.emit(scene_pos.x(), scene_pos.y(), str(action.data()))
+            return True
+        return False
 
     def _node_at(self, pos: QPoint) -> NodeItem | None:
         for item in self.items(pos):

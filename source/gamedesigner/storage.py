@@ -24,6 +24,8 @@ class AppSettings:
     last_project: str = ""
     theme: str = "dark"
     recent_projects: list[str] = field(default_factory=list)
+    welcome_layout: dict[str, dict[str, float]] = field(default_factory=dict)
+    welcome_recent_layouts: dict[str, dict[str, float]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -32,6 +34,8 @@ class AppSettings:
             "last_project": self.last_project,
             "theme": self.theme,
             "recent_projects": self.recent_projects,
+            "welcome_layout": self.welcome_layout,
+            "welcome_recent_layouts": self.welcome_recent_layouts,
         }
 
     @classmethod
@@ -45,6 +49,8 @@ class AppSettings:
             last_project=str(raw.get("last_project", "")),
             theme=str(raw.get("theme", "dark") or "dark"),
             recent_projects=[str(item) for item in recent if item],
+            welcome_layout=_coerce_layout_map(raw.get("welcome_layout")),
+            welcome_recent_layouts=_coerce_layout_map(raw.get("welcome_recent_layouts")),
         )
 
 
@@ -99,6 +105,28 @@ def _dedupe_existing(paths: list[str]) -> list[str]:
         seen.add(key)
         result.append(path)
     return result[:8]
+
+
+def _coerce_layout_map(raw: Any) -> dict[str, dict[str, float]]:
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, dict[str, float]] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str) or not isinstance(value, dict):
+            continue
+        layout = _coerce_layout(value)
+        if layout:
+            result[key] = layout
+    return result
+
+
+def _coerce_layout(raw: dict[str, Any]) -> dict[str, float]:
+    result: dict[str, float] = {}
+    for name in ("x", "y", "width", "height"):
+        value = raw.get(name)
+        if isinstance(value, int | float):
+            result[name] = float(value)
+    return result
 
 
 def save_settings(settings: AppSettings) -> None:

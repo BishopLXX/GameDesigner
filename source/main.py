@@ -1,4 +1,4 @@
-from gamedesigner.app import main
+from gamedesigner.startup import main
 
 
 if __name__ == "__main__":

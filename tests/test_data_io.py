@@ -236,6 +236,24 @@ class DataIoTests(unittest.TestCase):
             self.assertEqual(loaded_child.parent_node_id, loaded_link.id)
             self.assertEqual(loaded_child.nodes[0].title, "敌人配置")
 
+    def test_delete_canvas_tree_removes_descendants(self) -> None:
+        project = ProjectData(name="删画布树")
+        project.ensure_canvas_structure()
+        root = project.root_canvas()
+        root_link = root.add_node(Node(title="子画布", node_type="画布"))
+        child = project.add_canvas("子画布", parent_canvas_id=root.id, parent_node_id=root_link.id)
+        root_link.canvas_id = child.id
+        child_link = child.add_node(Node(title="孙画布", node_type="画布"))
+        grandchild = project.add_canvas("孙画布", parent_canvas_id=child.id, parent_node_id=child_link.id)
+        child_link.canvas_id = grandchild.id
+
+        deleted = project.delete_canvas_tree(child.id)
+
+        self.assertEqual(deleted, {child.id, grandchild.id})
+        self.assertEqual([canvas.id for canvas in project.canvases], [root.id])
+        self.assertEqual(root_link.canvas_id, "")
+        self.assertEqual(root_link.node_type, "普通")
+
     def test_link_document_files_live_in_project_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             tmp_path = Path(folder)

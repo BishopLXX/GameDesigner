@@ -21,6 +21,7 @@ py -3.13 -m PyInstaller `
   --noconfirm `
   --clean `
   --onefile `
+  --splash $IconPngPath `
   --windowed `
   --name GameDesigner `
   --icon $IconIcoPath `

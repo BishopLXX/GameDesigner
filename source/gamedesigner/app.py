@@ -1,24 +1,21 @@
 from __future__ import annotations
 
+import copy
 from ctypes import wintypes
 import re
 import sys
 from pathlib import Path
+from typing import Any, Callable
 
-from PySide6.QtCore import QPoint, QRectF, QSize, Qt, QUrl, Signal
+from PySide6.QtCore import QPoint, QPointF, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QAction,
-    QColor,
     QCloseEvent,
     QCursor,
     QDesktopServices,
-    QFont,
     QFontMetrics,
     QIcon,
     QKeySequence,
-    QPainter,
-    QPainterPath,
-    QPen,
     QPixmap,
     QShortcut,
 )
@@ -31,7 +28,6 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QSizePolicy,
-    QSplashScreen,
     QStatusBar,
     QTabBar,
     QTabWidget,
@@ -41,19 +37,10 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from .csv_io import export_all_canvas_csv
 from .models import BlueprintGroup, CanvasData, Node, NodeField, ProjectData, default_project, default_tech_tree_node, new_id
-from .project_files.linked_documents import (
-    create_link_document,
-    delete_link_document,
-    delete_link_document_copy,
-    rename_link_document,
-    sync_link_document_copy,
-)
+from .project_history import ProjectHistory, ProjectSnapshot
 from .qt_canvas import NodeGraphView
-from .qt_dialogs import NodeEditorDialog, ProjectSettingsDialog, TemplateManagerDialog
 from .qt_fonts import configure_fonts
-from .qt_i18n import install_qt_translations
 from .qt_theme import stylesheet
 from .storage import (
     PROJECT_SUFFIX,
@@ -64,12 +51,13 @@ from .storage import (
     save_project,
     save_settings,
 )
-from .ui.link_document_dialog import LinkDocumentDialog
 
 
 WELCOME_PROJECT_NAME = "开始"
 WELCOME_NEW_NODE_ID = "welcome_new_project"
 WELCOME_GUIDE_NODE_ID = "welcome_guide"
+WELCOME_NO_RECENT_NODE_ID = "welcome_no_recent"
+WELCOME_LAYOUT_NODE_IDS = {WELCOME_GUIDE_NODE_ID, WELCOME_NEW_NODE_ID, WELCOME_NO_RECENT_NODE_ID}
 TAB_MIN_WIDTH = 86
 TAB_MAX_WIDTH = 340
 WM_NCHITTEST = 0x0084
@@ -83,7 +71,6 @@ HTBOTTOM = 15
 HTBOTTOMLEFT = 16
 HTBOTTOMRIGHT = 17
 RESIZE_BORDER = 6
-STARTUP_SPLASH_SIZE = QSize(520, 190)
 
 
 def _app_icon_path() -> Path | None:
@@ -100,63 +87,6 @@ def _app_icon_path() -> Path | None:
         if candidate.exists():
             return candidate
     return None
-
-
-def _startup_splash() -> QSplashScreen:
-    pixmap = QPixmap(STARTUP_SPLASH_SIZE)
-    pixmap.fill(Qt.transparent)
-    painter = QPainter(pixmap)
-    painter.setRenderHint(QPainter.Antialiasing, True)
-
-    rect = QRectF(10, 10, STARTUP_SPLASH_SIZE.width() - 20, STARTUP_SPLASH_SIZE.height() - 20)
-    shadow = QPainterPath()
-    shadow.addRoundedRect(rect.adjusted(0, 8, 0, 8), 22, 22)
-    shadow_color = QColor("#000000")
-    shadow_color.setAlpha(46)
-    painter.fillPath(shadow, shadow_color)
-
-    panel = QPainterPath()
-    panel.addRoundedRect(rect, 22, 22)
-    painter.fillPath(panel, QColor("#15151B"))
-    painter.setPen(QPen(QColor("#2E2E38"), 1))
-    painter.drawPath(panel)
-
-    icon_rect = QRectF(38, 46, 56, 56)
-    icon_path = QPainterPath()
-    icon_path.addRoundedRect(icon_rect, 14, 14)
-    painter.fillPath(icon_path, QColor("#0A84FF"))
-    painter.setPen(QColor("#FFFFFF"))
-    icon_font = QFont()
-    icon_font.setPointSize(20)
-    icon_font.setBold(True)
-    painter.setFont(icon_font)
-    painter.drawText(icon_rect, Qt.AlignCenter, "GD")
-
-    title_font = QFont()
-    title_font.setPointSize(18)
-    title_font.setBold(True)
-    painter.setFont(title_font)
-    painter.setPen(QColor("#F5F5F7"))
-    painter.drawText(QRectF(118, 47, 350, 34), Qt.AlignLeft | Qt.AlignVCenter, "GameDesigner")
-
-    message_font = QFont()
-    message_font.setPointSize(10)
-    painter.setFont(message_font)
-    painter.setPen(QColor("#A1A1AA"))
-    painter.drawText(QRectF(120, 84, 350, 26), Qt.AlignLeft | Qt.AlignVCenter, "正在启动工程...")
-
-    bar_rect = QRectF(120, 126, 314, 5)
-    bar_bg = QPainterPath()
-    bar_bg.addRoundedRect(bar_rect, 2.5, 2.5)
-    painter.fillPath(bar_bg, QColor("#30303B"))
-    bar_fg = QPainterPath()
-    bar_fg.addRoundedRect(QRectF(bar_rect.x(), bar_rect.y(), 116, bar_rect.height()), 2.5, 2.5)
-    painter.fillPath(bar_fg, QColor("#0A84FF"))
-    painter.end()
-
-    splash = QSplashScreen(pixmap)
-    splash.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-    return splash
 
 
 class ProjectPage(QWidget):
@@ -364,12 +294,19 @@ class AdaptiveTabBar(QTabBar):
 
 
 class GameDesignerApp(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, startup_progress: Callable[[int, str], None] | None = None) -> None:
         super().__init__()
+        self._startup_progress = startup_progress
         self.setWindowFlag(Qt.FramelessWindowHint, True)
+        self._report_startup_progress(38, "读取本地设置...")
         self.settings = load_settings()
         self.theme = self.settings.theme if self.settings.theme in {"dark", "light"} else "dark"
         self._closing_app = False
+        self._restoring_history = False
+        self._project_histories: dict[int, ProjectHistory] = {}
+        self._copied_nodes: list[dict[str, Any]] = []
+        self._paste_serial = 0
+        self._report_startup_progress(48, "准备字体和主题...")
         configure_fonts()
         self.setWindowTitle("GameDesigner - 游戏设计师")
         self.icon_path = _app_icon_path()
@@ -391,12 +328,19 @@ class GameDesignerApp(QMainWindow):
         self.setStatusBar(self.status)
         self.status.hide()
 
+        self._report_startup_progress(62, "构建菜单与画布...")
         self._build_actions()
         self._build_menu()
         self._build_toolbar()
         self._bind_shortcuts()
+        self._report_startup_progress(82, "加载开始页...")
         self._load_start_project()
         self._update_title()
+        self._report_startup_progress(92, "整理启动状态...")
+
+    def _report_startup_progress(self, progress: int, message: str) -> None:
+        if self._startup_progress is not None:
+            self._startup_progress(progress, message)
 
     def _build_actions(self) -> None:
         self.new_action = QAction("新建项目", self)
@@ -448,6 +392,22 @@ class GameDesignerApp(QMainWindow):
         self.delete_action.setShortcut(QKeySequence.Delete)
         self.delete_action.triggered.connect(self._delete_selected)
 
+        self.copy_action = QAction("复制节点", self)
+        self.copy_action.setShortcut(QKeySequence.Copy)
+        self.copy_action.triggered.connect(self._copy_selected_nodes)
+
+        self.paste_action = QAction("粘贴节点", self)
+        self.paste_action.setShortcut(QKeySequence.Paste)
+        self.paste_action.triggered.connect(self._paste_nodes)
+
+        self.undo_action = QAction("撤销", self)
+        self.undo_action.setShortcut(QKeySequence.Undo)
+        self.undo_action.triggered.connect(self._undo)
+
+        self.redo_action = QAction("重做", self)
+        self.redo_action.setShortcuts([QKeySequence.Redo, QKeySequence("Ctrl+Y")])
+        self.redo_action.triggered.connect(self._redo)
+
         self.template_action = QAction("节点模板...", self)
         self.template_action.triggered.connect(self._manage_templates)
 
@@ -482,6 +442,12 @@ class GameDesignerApp(QMainWindow):
         self.file_menu.addAction(self.exit_action)
 
         self.edit_menu = QMenu("编辑", self)
+        self.edit_menu.addAction(self.undo_action)
+        self.edit_menu.addAction(self.redo_action)
+        self.edit_menu.addSeparator()
+        self.edit_menu.addAction(self.copy_action)
+        self.edit_menu.addAction(self.paste_action)
+        self.edit_menu.addSeparator()
         self.edit_menu.addAction(self.add_node_action)
         self.edit_menu.addAction(self.edit_action)
         self.edit_menu.addAction(self.delete_action)
@@ -560,12 +526,18 @@ class GameDesignerApp(QMainWindow):
         if not is_welcome:
             self._remove_welcome_pages()
         project.ensure_canvas_structure()
+        active_canvas = canvas_data or project.root_canvas()
+        history = self._project_history(project)
+        if history is None:
+            self._ensure_project_history(project, dirty, active_canvas.id)
+        else:
+            dirty = history.is_dirty()
         page = ProjectPage(
             project=project,
             path=path,
             dirty=dirty,
             theme=self.theme,
-            canvas_data=canvas_data,
+            canvas_data=active_canvas,
             source_canvas_id=source_canvas_id,
             is_welcome=is_welcome,
             welcome_actions=welcome_actions,
@@ -577,6 +549,7 @@ class GameDesignerApp(QMainWindow):
         self.tabs.setCurrentIndex(index)
         self._update_title()
         self._update_status()
+        QTimer.singleShot(0, self._sync_current_canvas_cursor)
         return page
 
     def _wire_page(self, page: ProjectPage) -> None:
@@ -625,15 +598,18 @@ class GameDesignerApp(QMainWindow):
             x=-600,
             y=-190,
             width=430,
-            height=326,
+            height=404,
             fields=[
-                NodeField("移动画布", "操作", "空格 + 鼠标左键拖动画布"),
+                NodeField("移动画布", "操作", "按住鼠标右键拖动画布，右键轻点打开菜单"),
                 NodeField("缩放画布", "操作", "鼠标滚轮放大缩小"),
                 NodeField("新建节点", "操作", "进入项目后，右键空白画布创建节点"),
                 NodeField("连接节点", "操作", "右键节点选择连接，再左键点击目标节点"),
+                NodeField("复制节点", "快捷键", "Ctrl+C 复制选中节点，Ctrl+V 粘贴到旁边"),
+                NodeField("回退步骤", "快捷键", "Ctrl+Z 撤销，Ctrl+Y 重做"),
                 NodeField("保存项目", "快捷键", "Ctrl+S 保存当前画布标签"),
             ],
         )
+        self._apply_saved_node_layout(guide, self.settings.welcome_layout.get(guide.id))
         create = Node(
             id=WELCOME_NEW_NODE_ID,
             title="新建项目",
@@ -647,13 +623,21 @@ class GameDesignerApp(QMainWindow):
                 NodeField("目录", "设置", "创建时设置项目源目录和输出目录"),
             ],
         )
+        self._apply_saved_node_layout(create, self.settings.welcome_layout.get(create.id))
         project.nodes.extend([guide, create])
         project.add_edge(guide.id, create.id)
 
         recent_x = 350
-        recent_paths = self._valid_recent_projects()
+        recent_paths = self._valid_recent_projects()[:5]
         if recent_paths:
-            for index, path in enumerate(recent_paths[:5]):
+            visible_layouts = [self._saved_recent_layout_for_path(path) for path in recent_paths]
+            saved_bottoms = [
+                float(layout.get("y", -190.0)) + float(layout.get("height", 156.0)) + 20.0
+                for layout in visible_layouts
+                if layout is not None
+            ]
+            next_recent_y = max([-190.0, *saved_bottoms])
+            for index, path in enumerate(recent_paths):
                 node_id = f"welcome_recent_{index}"
                 title = _project_name_from_path(path)
                 node = Node(
@@ -669,26 +653,83 @@ class GameDesignerApp(QMainWindow):
                         NodeField("路径", "文件", str(path)),
                     ],
                 )
+                layout = self._saved_recent_layout_for_path(path)
+                if layout is not None:
+                    self._apply_saved_node_layout(node, layout)
+                else:
+                    node.y = next_recent_y
+                    next_recent_y += node.height + 20
                 project.nodes.append(node)
                 project.add_edge(create.id, node.id)
                 actions[node_id] = str(path)
         else:
-            project.nodes.append(
-                Node(
-                    id="welcome_no_recent",
-                    title="最近项目",
-                    icon="近",
-                    x=recent_x,
-                    y=-150,
-                    width=350,
-                    height=166,
-                    fields=[
-                        NodeField("暂无记录", "状态", "打开或保存项目后，这里会出现最近项目节点"),
-                        NodeField("打开项目", "入口", "右键空白处或点击顶部“打开项目”"),
-                    ],
-                )
+            node = Node(
+                id=WELCOME_NO_RECENT_NODE_ID,
+                title="最近项目",
+                icon="近",
+                x=recent_x,
+                y=-150,
+                width=350,
+                height=166,
+                fields=[
+                    NodeField("暂无记录", "状态", "打开或保存项目后，这里会出现最近项目节点"),
+                    NodeField("打开项目", "入口", "右键空白处或点击顶部“打开项目”"),
+                ],
             )
+            self._apply_saved_node_layout(node, self.settings.welcome_layout.get(node.id))
+            project.nodes.append(node)
         return project, actions
+
+    def _saved_recent_layout_for_path(self, path: Path) -> dict[str, float] | None:
+        return self.settings.welcome_recent_layouts.get(self._welcome_recent_layout_key(path))
+
+    def _apply_saved_node_layout(self, node: Node, layout: dict[str, float] | None) -> None:
+        if not layout:
+            return
+        node.x = float(layout.get("x", node.x))
+        node.y = float(layout.get("y", node.y))
+        node.width = float(layout.get("width", node.width))
+        node.height = float(layout.get("height", node.height))
+
+    def _capture_node_layout(self, node: Node) -> dict[str, float]:
+        return {
+            "x": float(node.x),
+            "y": float(node.y),
+            "width": float(node.width),
+            "height": float(node.height),
+        }
+
+    def _welcome_recent_layout_key(self, path: str | Path) -> str:
+        return str(Path(path)).casefold()
+
+    def _save_welcome_page_layout(self, page: ProjectPage | None = None, show_status: bool = False) -> bool:
+        page = page or self._current_page()
+        if not page or not page.is_welcome:
+            return False
+        try:
+            fixed_layouts = dict(self.settings.welcome_layout)
+            recent_layouts = dict(self.settings.welcome_recent_layouts)
+            for node in page.project.nodes:
+                layout = self._capture_node_layout(node)
+                action = page.welcome_actions.get(node.id, "")
+                if action and action != "new":
+                    recent_layouts[self._welcome_recent_layout_key(action)] = layout
+                else:
+                    fixed_layouts[node.id] = layout
+            self.settings.welcome_layout = {
+                node_id: layout for node_id, layout in fixed_layouts.items() if node_id in WELCOME_LAYOUT_NODE_IDS
+            }
+            self.settings.welcome_recent_layouts = recent_layouts
+            save_settings(self.settings)
+        except Exception as exc:  # noqa: BLE001 - surface IO errors.
+            if show_status:
+                QMessageBox.critical(self, "保存失败", f"无法保存开始页布局：\n{exc}")
+            else:
+                self.status.showMessage("开始页布局保存失败", 3500)
+            return False
+        if show_status:
+            self.status.showMessage("已保存：开始页布局", 2500)
+        return True
 
     def _valid_recent_projects(self) -> list[Path]:
         candidates = []
@@ -770,7 +811,72 @@ class GameDesignerApp(QMainWindow):
                 pages.append(page)
         return pages
 
+    def _project_history(self, project: ProjectData) -> ProjectHistory | None:
+        return self._project_histories.get(id(project))
+
+    def _ensure_project_history(self, project: ProjectData, dirty: bool, canvas_id: str) -> ProjectHistory:
+        history = self._project_history(project)
+        if history is None:
+            history = ProjectHistory()
+            history.initialize(project, canvas_id=canvas_id, clean=not dirty)
+            self._project_histories[id(project)] = history
+        return history
+
+    def _record_project_snapshot(self, page: ProjectPage) -> None:
+        history = self._ensure_project_history(page.project, page.dirty, page.canvas_id)
+        history.record(page.project, canvas_id=page.canvas_id)
+
+    def _sync_project_dirty_state(self, project: ProjectData) -> None:
+        history = self._project_history(project)
+        dirty = history.is_dirty() if history is not None else any(page.dirty for page in self._project_pages(project))
+        for project_page in self._project_pages(project):
+            project_page.dirty = dirty
+            self._update_tab_title(project_page)
+        self._update_title()
+        self._update_status()
+
+    def _restore_project_snapshot(self, project: ProjectData, snapshot: ProjectSnapshot) -> None:
+        self._restoring_history = True
+        try:
+            restored = ProjectData.from_dict(copy.deepcopy(snapshot.project))
+            project.name = restored.name
+            project.source_dir = restored.source_dir
+            project.output_dir = restored.output_dir
+            project.copy_link_docs_to_source = restored.copy_link_docs_to_source
+            project.nodes = restored.nodes
+            project.edges = restored.edges
+            project.templates = restored.templates
+            project.root_canvas_id = restored.root_canvas_id
+            project.canvases = restored.canvases
+            project.ensure_canvas_structure()
+
+            target_canvas_id = snapshot.canvas_id or project.root_canvas_id
+            target_page: ProjectPage | None = None
+            for project_page in self._project_pages(project):
+                target_canvas = project.find_canvas(project_page.canvas_id) or project.root_canvas()
+                project_page.canvas_data = target_canvas
+                project_page.canvas_id = target_canvas.id
+                project_page.refresh_active_template()
+                project_page.refresh_canvas_nav()
+                project_page.canvas.set_templates(project.templates)
+                project_page.canvas.set_project(target_canvas)
+                project_page.canvas.clear_selection()
+                self._update_tab_title(project_page)
+                if project_page.canvas_id == target_canvas_id:
+                    target_page = project_page
+            if target_page is None:
+                target_page = self._open_canvas_page(project, self._project_pages(project)[0].path if self._project_pages(project) else None, target_canvas_id)
+            if target_page is not None:
+                index = self.tabs.indexOf(target_page)
+                if index >= 0:
+                    self.tabs.setCurrentIndex(index)
+        finally:
+            self._restoring_history = False
+
     def _project_dirty(self, project: ProjectData) -> bool:
+        history = self._project_history(project)
+        if history is not None:
+            return history.is_dirty()
         return any(page.dirty for page in self._project_pages(project))
 
     def _canvas_tab_name(self, page: ProjectPage) -> str:
@@ -817,6 +923,19 @@ class GameDesignerApp(QMainWindow):
     def _on_current_tab_changed(self) -> None:
         self._update_title()
         self._update_status()
+        QTimer.singleShot(0, self._sync_current_canvas_cursor)
+
+    def _sync_current_canvas_cursor(self) -> None:
+        page = self._current_page()
+        if not page:
+            return
+        self.unsetCursor()
+        self.tabs.unsetCursor()
+        page.unsetCursor()
+        page.canvas.hover_node_id = None
+        page.canvas.viewport().unsetCursor()
+        page.canvas.unsetCursor()
+        page.canvas.sync_interaction_cursor()
 
     def _update_title(self) -> None:
         page = self._current_page()
@@ -846,15 +965,19 @@ class GameDesignerApp(QMainWindow):
 
     def _mark_dirty(self, page: ProjectPage | None = None) -> None:
         page = page or self._current_page()
-        if not page or page.is_welcome:
+        if not page:
             return
-        for project_page in self._project_pages(page.project):
-            project_page.dirty = True
-            self._update_tab_title(project_page)
-        self._update_title()
-        self._update_status()
+        if page.is_welcome:
+            self._save_welcome_page_layout(page)
+            return
+        if self._restoring_history:
+            return
+        self._record_project_snapshot(page)
+        self._sync_project_dirty_state(page.project)
 
     def _new_project(self) -> None:
+        from .qt_dialogs import ProjectSettingsDialog
+
         dialog = ProjectSettingsDialog(
             self,
             "新建项目",
@@ -915,6 +1038,7 @@ class GameDesignerApp(QMainWindow):
             return
         finally:
             QApplication.restoreOverrideCursor()
+            QTimer.singleShot(0, self._sync_current_canvas_cursor)
 
     def _open_canvas_page(
         self,
@@ -950,12 +1074,12 @@ class GameDesignerApp(QMainWindow):
         return page
 
     def _open_canvas_from_node(self, page: ProjectPage, node: Node) -> None:
-        canvas = self._ensure_canvas_node_link(page, node)
+        canvas = self._ensure_canvas_node_link(page, node, mark_dirty=True)
         if not canvas:
             return
         self._open_canvas_page(page.project, page.path, canvas.id, source_canvas_id=page.canvas_id)
 
-    def _ensure_canvas_node_link(self, page: ProjectPage, node: Node) -> CanvasData | None:
+    def _ensure_canvas_node_link(self, page: ProjectPage, node: Node, mark_dirty: bool = False) -> CanvasData | None:
         if node.node_type != "画布":
             return None
         canvas = page.project.find_canvas(node.canvas_id) if node.canvas_id else None
@@ -968,7 +1092,8 @@ class GameDesignerApp(QMainWindow):
             node.canvas_id = canvas.id
             if not node.icon:
                 node.icon = "画"
-            self._mark_dirty(page)
+            if mark_dirty:
+                self._mark_dirty(page)
             return canvas
         canvas.name = node.title or canvas.name
         if canvas.id != page.project.root_canvas_id:
@@ -986,6 +1111,12 @@ class GameDesignerApp(QMainWindow):
         return page.path
 
     def _ensure_link_node_file(self, page: ProjectPage, node: Node) -> None:
+        from .project_files.linked_documents import (
+            create_link_document,
+            delete_link_document_copy,
+            rename_link_document,
+        )
+
         if node.node_type != "超链接":
             return
         project_path = self._ensure_project_path_for_files(page)
@@ -1007,6 +1138,8 @@ class GameDesignerApp(QMainWindow):
         self._sync_link_document_copy(page, node)
 
     def _sync_link_document_copy(self, page: ProjectPage, node: Node) -> None:
+        from .project_files.linked_documents import sync_link_document_copy
+
         if (
             not page.project.copy_link_docs_to_source
             or not page.path
@@ -1017,12 +1150,16 @@ class GameDesignerApp(QMainWindow):
         sync_link_document_copy(page.path, node.link_path, page.project.source_dir)
 
     def _sync_all_link_document_copies(self, project: ProjectData, project_path: Path) -> None:
+        from .project_files.linked_documents import sync_link_document_copy
+
         for canvas in project.canvases:
             for node in canvas.nodes:
                 if node.node_type == "超链接" and node.link_path:
                     sync_link_document_copy(project_path, node.link_path, project.source_dir)
 
     def _delete_link_document_with_copy(self, page: ProjectPage, node: Node) -> None:
+        from .project_files.linked_documents import delete_link_document, delete_link_document_copy
+
         if node.node_type != "超链接" or not node.link_path:
             return
         if page.path:
@@ -1030,6 +1167,9 @@ class GameDesignerApp(QMainWindow):
         delete_link_document_copy(page.project.source_dir, node.link_path)
 
     def _open_link_document(self, page: ProjectPage, node: Node) -> None:
+        from .project_files.linked_documents import delete_link_document_copy
+        from .ui.link_document_dialog import LinkDocumentDialog
+
         if node.node_type != "超链接":
             return
         try:
@@ -1075,8 +1215,10 @@ class GameDesignerApp(QMainWindow):
 
     def _save_project(self, page: ProjectPage | None = None) -> bool:
         page = page or self._current_page()
-        if not page or page.is_welcome:
+        if not page:
             return False
+        if page.is_welcome:
+            return self._save_welcome_page_layout(page, show_status=True)
         if not page.path:
             return self._save_as_project(page)
         try:
@@ -1091,11 +1233,11 @@ class GameDesignerApp(QMainWindow):
             return False
         self._sync_settings_from_project(page.project)
         self._remember_project(page.path)
+        history = self._ensure_project_history(page.project, dirty=False, canvas_id=page.canvas_id)
+        history.mark_clean()
         for project_page in self._project_pages(page.project):
             project_page.path = page.path
-            project_page.dirty = False
-            self._update_tab_title(project_page)
-        self._update_title()
+        self._sync_project_dirty_state(page.project)
         self.status.showMessage(f"已保存：{page.path}", 3500)
         return True
 
@@ -1115,6 +1257,8 @@ class GameDesignerApp(QMainWindow):
         return self._save_project(page)
 
     def _edit_project_settings(self) -> None:
+        from .qt_dialogs import ProjectSettingsDialog
+
         page = self._current_page()
         if not page or page.is_welcome:
             return
@@ -1145,6 +1289,8 @@ class GameDesignerApp(QMainWindow):
         self._mark_dirty(page)
 
     def _export_all_canvas_csv(self, sort_mode: str = "created") -> None:
+        from .csv_io import export_all_canvas_csv
+
         page = self._current_page()
         if not page or page.is_welcome:
             return
@@ -1196,6 +1342,7 @@ class GameDesignerApp(QMainWindow):
             self._new_project()
             return
         node = default_tech_tree_node(x - 255, y - 165)
+        node.group_id = page.canvas.group_id_at_scene_pos(QPointF(x, y))
         page.canvas_data.add_node(node)
         page.canvas.rebuild()
         page.canvas.select_node(node.id)
@@ -1224,6 +1371,7 @@ class GameDesignerApp(QMainWindow):
             parent_node_id=node.id,
         )
         node.canvas_id = canvas.id
+        node.group_id = page.canvas.group_id_at_scene_pos(QPointF(x, y))
         page.canvas_data.add_node(node)
         page.canvas.rebuild()
         page.canvas.select_node(node.id)
@@ -1231,6 +1379,8 @@ class GameDesignerApp(QMainWindow):
         self._open_canvas_page(page.project, page.path, canvas.id, source_canvas_id=page.canvas_id)
 
     def _add_link_node_at(self, x: float, y: float, file_format: str = "md") -> None:
+        from .project_files.linked_documents import create_link_document
+
         page = self._current_page()
         if not page:
             return
@@ -1256,6 +1406,7 @@ class GameDesignerApp(QMainWindow):
                 NodeField("文件", "资源路径", relative_path),
             ],
         )
+        node.group_id = page.canvas.group_id_at_scene_pos(QPointF(x, y))
         page.canvas_data.add_node(node)
         page.canvas.rebuild()
         page.canvas.select_node(node.id)
@@ -1299,10 +1450,94 @@ class GameDesignerApp(QMainWindow):
             return
         page.active_template_id = template.id
         node = template.create_node(x - 155, y - 72)
+        node.group_id = page.canvas.group_id_at_scene_pos(QPointF(x, y))
         page.canvas_data.add_node(node)
         page.canvas.rebuild()
         page.canvas.select_node(node.id)
         self._mark_dirty(page)
+
+    def _copy_selected_nodes(self) -> None:
+        page = self._current_page()
+        if not page or page.is_welcome:
+            return
+        selected_ids = list(page.canvas.selected_node_ids)
+        if not selected_ids and page.selected_node_id:
+            selected_ids = [page.selected_node_id]
+        nodes = [page.canvas_data.find_node(node_id) for node_id in selected_ids]
+        copied = [node.to_dict() for node in nodes if node is not None]
+        if not copied:
+            return
+        self._copied_nodes = copied
+        self._paste_serial = 0
+        self.status.showMessage(f"已复制 {len(copied)} 个节点", 2000)
+
+    def _paste_nodes(self) -> None:
+        page = self._current_page()
+        if not page or page.is_welcome or not self._copied_nodes:
+            return
+        offset = 40.0 * (self._paste_serial + 1)
+        new_nodes: list[Node] = []
+        for raw in self._copied_nodes:
+            node = self._clone_node_for_paste(raw, offset)
+            if node.node_type == "画布":
+                node.canvas_id = ""
+                self._ensure_canvas_node_link(page, node, mark_dirty=False)
+            elif node.node_type == "超链接":
+                node.link_path = ""
+                node.fields = [
+                    field for field in node.fields if not (field.name == "文件" and field.data_type == "资源路径")
+                ]
+                node.fields.append(NodeField("文件", "资源路径", ""))
+            else:
+                node.canvas_id = ""
+                node.link_path = ""
+            new_nodes.append(node)
+        for node in new_nodes:
+            page.canvas_data.add_node(node)
+        self._paste_serial += 1
+        page.canvas.rebuild()
+        page.canvas.select_nodes({node.id for node in new_nodes})
+        page.canvas.refresh_group_membership()
+        self._mark_dirty(page)
+
+    def _clone_node_for_paste(self, raw: dict[str, Any], offset: float) -> Node:
+        node = Node.from_dict(copy.deepcopy(raw))
+        node.id = new_id("node")
+        remapped_field_ids: dict[str, str] = {}
+        for field in node.fields:
+            remapped_field_ids[field.id] = new_id("field")
+            field.id = remapped_field_ids[field.id]
+        node.title_field_id = remapped_field_ids.get(node.title_field_id, "")
+        node.order = 0
+        node.x += offset
+        node.y += offset
+        return node
+
+    def _undo(self) -> None:
+        page = self._current_page()
+        if not page or page.is_welcome:
+            return
+        history = self._project_history(page.project)
+        if history is None:
+            return
+        snapshot = history.undo()
+        if snapshot is None:
+            return
+        self._restore_project_snapshot(page.project, snapshot)
+        self._sync_project_dirty_state(page.project)
+
+    def _redo(self) -> None:
+        page = self._current_page()
+        if not page or page.is_welcome:
+            return
+        history = self._project_history(page.project)
+        if history is None:
+            return
+        snapshot = history.redo()
+        if snapshot is None:
+            return
+        self._restore_project_snapshot(page.project, snapshot)
+        self._sync_project_dirty_state(page.project)
 
     def _edit_selected(self) -> None:
         page = self._current_page()
@@ -1319,6 +1554,8 @@ class GameDesignerApp(QMainWindow):
             self._edit_edge(page.selected_edge_id)
 
     def _edit_node(self, node_id: str) -> None:
+        from .qt_dialogs import NodeEditorDialog
+
         page = self._current_page()
         if not page:
             return
@@ -1420,6 +1657,78 @@ class GameDesignerApp(QMainWindow):
         elif page.selected_edge_id:
             self._delete_edge_by_id(page.selected_edge_id)
 
+    def _remove_canvas_pages(self, project: ProjectData, canvas_ids: set[str]) -> None:
+        for index in reversed(range(self.tabs.count())):
+            project_page = self.tabs.widget(index)
+            if (
+                isinstance(project_page, ProjectPage)
+                and not project_page.is_welcome
+                and project_page.project is project
+                and project_page.canvas_id in canvas_ids
+            ):
+                self.tabs.removeTab(index)
+                project_page.deleteLater()
+
+    def _delete_canvas_branch(self, page: ProjectPage, canvas_id: str) -> None:
+        deleted_ids = page.project.canvas_branch_ids(canvas_id)
+        if not deleted_ids:
+            return
+        for canvas in list(page.project.canvases):
+            if canvas.id not in deleted_ids:
+                continue
+            for node in list(canvas.nodes):
+                self._delete_link_document_with_copy(page, node)
+        self._remove_canvas_pages(page.project, deleted_ids)
+        page.project.delete_canvas_tree(canvas_id)
+
+    def _confirm_delete_nodes(self, page: ProjectPage, nodes: list[Node]) -> bool:
+        if not nodes:
+            return False
+        canvas_nodes = [node for node in nodes if node.node_type == "画布" and node.canvas_id]
+        link_nodes = [node for node in nodes if node.node_type == "超链接" and node.link_path]
+        box = QMessageBox(self)
+        box.setWindowTitle("删除节点")
+        box.setIcon(QMessageBox.Warning if canvas_nodes else QMessageBox.Question)
+
+        if len(nodes) == 1:
+            node = nodes[0]
+            if canvas_nodes:
+                branch_ids = page.project.canvas_branch_ids(node.canvas_id)
+                branch_count = max(1, len(branch_ids))
+                box.setText("您删除的是画布节点，确定要删除吗？")
+                box.setInformativeText(
+                    f"这会同时删除关联的 {branch_count} 个画布，以及其中包含的节点和连线。"
+                )
+            elif link_nodes:
+                box.setText(f"确定删除节点“{node.title}”吗？")
+                box.setInformativeText("关联的超链接文件也会一起删除。")
+            else:
+                box.setText(f"确定删除节点“{node.title}”吗？")
+        else:
+            if canvas_nodes:
+                canvas_branch_count = len({
+                    canvas_id
+                    for node in canvas_nodes
+                    for canvas_id in page.project.canvas_branch_ids(node.canvas_id)
+                })
+                box.setText("选中的节点中包含画布节点，确定要删除吗？")
+                box.setInformativeText(
+                    f"这会同时删除 {len(nodes)} 个选中节点，以及关联的 {canvas_branch_count} 个画布。"
+                )
+            elif link_nodes:
+                box.setText(f"确定删除选中的 {len(nodes)} 个节点吗？")
+                box.setInformativeText("其中的超链接文件也会一起删除。")
+            else:
+                box.setText(f"确定删除选中的 {len(nodes)} 个节点吗？")
+
+        delete_button = box.addButton("删除", QMessageBox.DestructiveRole)
+        delete_button.setStyleSheet("color: #FF453A;")
+        cancel_button = box.addButton("取消", QMessageBox.RejectRole)
+        box.setDefaultButton(delete_button)
+        box.setEscapeButton(cancel_button)
+        box.exec()
+        return box.clickedButton() == delete_button
+
     def _delete_node_by_id(self, node_id: str) -> None:
         page = self._current_page()
         if not page or page.is_welcome:
@@ -1427,15 +1736,11 @@ class GameDesignerApp(QMainWindow):
         node = page.canvas_data.find_node(node_id)
         if not node:
             return
-        message = (
-            f"确定删除节点“{node.title}”及其超链接文件吗？"
-            if node.node_type == "超链接" and node.link_path
-            else f"确定删除节点“{node.title}”吗？"
-        )
-        answer = QMessageBox.question(self, "删除节点", message)
-        if answer != QMessageBox.Yes:
+        if not self._confirm_delete_nodes(page, [node]):
             return
         self._delete_link_document_with_copy(page, node)
+        if node.node_type == "画布" and node.canvas_id:
+            self._delete_canvas_branch(page, node.canvas_id)
         page.canvas_data.delete_node(node.id)
         page.canvas.rebuild()
         page.canvas.clear_selection()
@@ -1448,14 +1753,12 @@ class GameDesignerApp(QMainWindow):
         existing = [node for node in page.canvas_data.nodes if node.id in node_ids]
         if not existing:
             return
-        message = f"确定删除选中的 {len(existing)} 个节点吗？"
-        if any(node.node_type == "超链接" and node.link_path for node in existing):
-            message = f"确定删除选中的 {len(existing)} 个节点及其中的超链接文件吗？"
-        answer = QMessageBox.question(self, "删除节点", message)
-        if answer != QMessageBox.Yes:
+        if not self._confirm_delete_nodes(page, existing):
             return
         for node in existing:
             self._delete_link_document_with_copy(page, node)
+            if node.node_type == "画布" and node.canvas_id:
+                self._delete_canvas_branch(page, node.canvas_id)
         page.canvas_data.delete_nodes({node.id for node in existing})
         page.canvas.rebuild()
         page.canvas.clear_selection()
@@ -1497,6 +1800,8 @@ class GameDesignerApp(QMainWindow):
         self._mark_dirty(page)
 
     def _manage_templates(self) -> None:
+        from .qt_dialogs import TemplateManagerDialog
+
         page = self._current_page()
         if not page or page.is_welcome:
             return
@@ -1621,15 +1926,3 @@ def _edge_style_name(style: str) -> str:
         "straight": "直线",
         "orthogonal": "折直",
     }.get(style, "曲线")
-
-
-def main() -> int:
-    app = QApplication(sys.argv)
-    install_qt_translations(app)
-    splash = _startup_splash()
-    splash.show()
-    app.processEvents()
-    window = GameDesignerApp()
-    window.show()
-    splash.finish(window)
-    return app.exec()

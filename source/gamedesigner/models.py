@@ -321,7 +321,7 @@ class CanvasData:
         ]
 
     def remove_broken_edges(self) -> None:
-        self.edges = self.valid_edges()
+        self.edges[:] = self.valid_edges()
 
     def remove_broken_groups(self) -> None:
         group_ids = {group.id for group in self.groups}
@@ -368,24 +368,24 @@ class CanvasData:
         return edge
 
     def delete_node(self, node_id: str) -> None:
-        self.nodes = [node for node in self.nodes if node.id != node_id]
-        self.edges = [edge for edge in self.edges if edge.source != node_id and edge.target != node_id]
+        self.nodes[:] = [node for node in self.nodes if node.id != node_id]
+        self.edges[:] = [edge for edge in self.edges if edge.source != node_id and edge.target != node_id]
         self.normalize_node_order()
 
     def delete_nodes(self, node_ids: set[str]) -> None:
-        self.nodes = [node for node in self.nodes if node.id not in node_ids]
-        self.edges = [edge for edge in self.edges if edge.source not in node_ids and edge.target not in node_ids]
+        self.nodes[:] = [node for node in self.nodes if node.id not in node_ids]
+        self.edges[:] = [edge for edge in self.edges if edge.source not in node_ids and edge.target not in node_ids]
         self.normalize_node_order()
 
     def delete_group(self, group_id: str) -> None:
-        self.groups = [group for group in self.groups if group.id != group_id]
-        self.edges = [edge for edge in self.edges if edge.source != group_id and edge.target != group_id]
+        self.groups[:] = [group for group in self.groups if group.id != group_id]
+        self.edges[:] = [edge for edge in self.edges if edge.source != group_id and edge.target != group_id]
         for node in self.nodes:
             if node.group_id == group_id:
                 node.group_id = ""
 
     def delete_edge(self, edge_id: str) -> None:
-        self.edges = [edge for edge in self.edges if edge.id != edge_id]
+        self.edges[:] = [edge for edge in self.edges if edge.id != edge_id]
 
 
 @dataclass
@@ -523,7 +523,7 @@ class ProjectData:
         if not self.root_canvas_id or not self.find_canvas(self.root_canvas_id):
             self.root_canvas_id = self.canvases[0].id
         root = self.find_canvas(self.root_canvas_id)
-        if root and self.nodes is not root.nodes and (self.nodes or self.edges):
+        if root and self.nodes is not root.nodes and not root.nodes and not root.edges and (self.nodes or self.edges):
             root.nodes = self.nodes
             root.edges = self.edges
         for canvas in self.canvases:
@@ -568,14 +568,38 @@ class ProjectData:
         return canvas
 
     def delete_canvas(self, canvas_id: str) -> None:
+        self.delete_canvas_tree(canvas_id)
+
+    def canvas_branch_ids(self, canvas_id: str) -> set[str]:
+        if not canvas_id or not self.find_canvas(canvas_id):
+            return set()
+        pending = [canvas_id]
+        result: set[str] = set()
+        while pending:
+            current = pending.pop()
+            if current in result:
+                continue
+            result.add(current)
+            pending.extend(
+                canvas.id
+                for canvas in self.canvases
+                if canvas.parent_canvas_id == current and canvas.id not in result
+            )
+        return result
+
+    def delete_canvas_tree(self, canvas_id: str) -> set[str]:
         if canvas_id == self.root_canvas_id:
-            return
-        self.canvases = [canvas for canvas in self.canvases if canvas.id != canvas_id]
+            return set()
+        deleted_ids = self.canvas_branch_ids(canvas_id)
+        if not deleted_ids:
+            return set()
+        self.canvases = [canvas for canvas in self.canvases if canvas.id not in deleted_ids]
         for canvas in self.canvases:
             for node in canvas.nodes:
-                if node.canvas_id == canvas_id:
+                if node.canvas_id in deleted_ids:
                     node.canvas_id = ""
                     node.node_type = "普通"
+        return deleted_ids
 
     def find_node(self, node_id: str) -> Node | None:
         return self.root_canvas().find_node(node_id)

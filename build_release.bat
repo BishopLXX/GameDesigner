@@ -57,6 +57,7 @@ py -3.13 -m PyInstaller ^
   --noconfirm ^
   --clean ^
   --onefile ^
+  --splash icon.png ^
   --windowed ^
   --name GameDesigner ^
   --icon icon.ico ^
