@@ -62,10 +62,10 @@ def stylesheet(name: str) -> str:
         color: {colors["text_muted"]};
         border: 1px solid {colors["hairline"]};
         border-bottom: 0;
-        padding: 9px 18px;
-        margin-right: 6px;
-        border-top-left-radius: 12px;
-        border-top-right-radius: 12px;
+        padding: 6px 13px;
+        margin-right: 2px;
+        border-top-left-radius: 8px;
+        border-top-right-radius: 8px;
     }}
     QTabBar::tab:selected {{
         background: {colors["panel_alt"]};
@@ -160,5 +160,49 @@ def stylesheet(name: str) -> str:
     QScrollBar::add-line, QScrollBar::sub-line {{
         width: 0;
         height: 0;
+    }}
+    QWidget#topBar {{
+        background: {colors["window"]};
+        border-bottom: 1px solid {colors["hairline"]};
+        min-height: 30px;
+        max-height: 30px;
+    }}
+    QLabel#appIcon {{
+        background: transparent;
+        border: 0;
+        padding: 0;
+    }}
+    QLabel#titleText {{
+        color: {colors["text_muted"]};
+        background: transparent;
+        padding: 0 8px 0 2px;
+    }}
+    QToolButton#topMenuButton, QToolButton#topActionButton, QToolButton#windowButton, QToolButton#closeButton {{
+        background: transparent;
+        color: {colors["text"]};
+        border: 0;
+        border-radius: 6px;
+        padding: 3px 8px;
+        min-height: 20px;
+    }}
+    QToolButton#topActionButton {{
+        color: {colors["text_muted"]};
+    }}
+    QToolButton#windowButton, QToolButton#closeButton {{
+        padding: 0;
+        color: {colors["text_muted"]};
+    }}
+    QToolButton#topMenuButton:hover, QToolButton#topActionButton:hover,
+    QToolButton#windowButton:hover, QToolButton#closeButton:hover {{
+        background: {colors["control_hover"]};
+        border: 0;
+    }}
+    QToolButton#topActionButton:checked {{
+        background: {colors["control"]};
+        color: {colors["text"]};
+    }}
+    QToolButton#topMenuButton::menu-indicator {{
+        image: none;
+        width: 0;
     }}
     """

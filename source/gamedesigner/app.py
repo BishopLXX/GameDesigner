@@ -1,20 +1,26 @@
 from __future__ import annotations
 
+import ctypes
+from ctypes import wintypes
 import re
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction, QCloseEvent, QKeySequence, QShortcut
+from PySide6.QtCore import QPoint, QSize, Qt
+from PySide6.QtGui import QAction, QCloseEvent, QCursor, QIcon, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
+    QHBoxLayout,
+    QLabel,
     QMainWindow,
+    QMenu,
     QMessageBox,
+    QSizePolicy,
     QStatusBar,
     QTabBar,
     QTabWidget,
-    QToolBar,
+    QToolButton,
     QInputDialog,
     QWidget,
     QVBoxLayout,
@@ -39,6 +45,33 @@ from .storage import (
 WELCOME_PROJECT_NAME = "开始"
 WELCOME_NEW_NODE_ID = "welcome_new_project"
 WELCOME_GUIDE_NODE_ID = "welcome_guide"
+WM_NCHITTEST = 0x0084
+HTCAPTION = 2
+HTLEFT = 10
+HTRIGHT = 11
+HTTOP = 12
+HTTOPLEFT = 13
+HTTOPRIGHT = 14
+HTBOTTOM = 15
+HTBOTTOMLEFT = 16
+HTBOTTOMRIGHT = 17
+RESIZE_BORDER = 6
+
+
+def _app_icon_path() -> Path | None:
+    candidates: list[Path] = []
+    frozen_dir = getattr(sys, "_MEIPASS", None)
+    if frozen_dir:
+        candidates.append(Path(frozen_dir) / "icon.png")
+    if getattr(sys, "frozen", False):
+        executable_dir = Path(sys.executable).resolve().parent
+        candidates.extend([executable_dir / "icon.png", executable_dir.parent / "icon.png"])
+    project_root = Path(__file__).resolve().parents[2]
+    candidates.append(project_root / "icon.png")
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
 
 
 class ProjectPage(QWidget):
@@ -63,7 +96,8 @@ class ProjectPage(QWidget):
         self.active_template_id: str | None = None
         self.canvas = NodeGraphView(self.project, self.theme, read_only=is_welcome)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 8, 10, 10)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
         layout.addWidget(self.canvas)
         self.refresh_active_template()
 
@@ -73,14 +107,131 @@ class ProjectPage(QWidget):
             self.active_template_id = ids[0] if ids else None
 
 
+class CompactTitleBar(QWidget):
+    def __init__(self, window: "GameDesignerApp", icon_path: Path | None) -> None:
+        super().__init__(window)
+        self.window = window
+        self._drag_offset: QPoint | None = None
+        self.setObjectName("topBar")
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(6, 2, 6, 2)
+        layout.setSpacing(2)
+
+        icon = QLabel(self)
+        icon.setObjectName("appIcon")
+        icon.setFixedSize(22, 22)
+        icon.setAlignment(Qt.AlignCenter)
+        icon.setAttribute(Qt.WA_TransparentForMouseEvents)
+        if icon_path:
+            pixmap = QPixmap(str(icon_path))
+            if not pixmap.isNull():
+                icon.setPixmap(pixmap.scaled(16, 16, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        layout.addWidget(icon)
+
+        self.title_label = QLabel("GameDesigner", self)
+        self.title_label.setObjectName("titleText")
+        self.title_label.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.title_label.setMinimumWidth(128)
+        self.title_label.setMaximumWidth(260)
+        layout.addWidget(self.title_label)
+
+        layout.addWidget(self._menu_button("文件", window.file_menu))
+        layout.addWidget(self._menu_button("编辑", window.edit_menu))
+        layout.addWidget(self._menu_button("视图", window.view_menu))
+        layout.addStretch(1)
+        layout.addWidget(self._action_button(window.reset_view_action, "重置"))
+        layout.addWidget(self._action_button(window.dark_mode_action, "夜间"))
+        layout.addSpacing(4)
+        layout.addWidget(self._window_button("-", window.showMinimized))
+        layout.addWidget(self._window_button("□", self._toggle_maximized))
+        layout.addWidget(self._window_button("×", window.close, close=True))
+
+    def set_title(self, title: str) -> None:
+        self.title_label.setText(title)
+        self.title_label.setToolTip(title)
+
+    def _menu_button(self, text: str, menu: QMenu) -> QToolButton:
+        button = QToolButton(self)
+        button.setObjectName("topMenuButton")
+        button.setText(text)
+        button.setMenu(menu)
+        button.setPopupMode(QToolButton.InstantPopup)
+        button.setAutoRaise(True)
+        button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        return button
+
+    def _action_button(self, action: QAction, text: str) -> QToolButton:
+        button = QToolButton(self)
+        button.setObjectName("topActionButton")
+        button.setText(text)
+        button.setToolTip(action.text())
+        button.setAutoRaise(True)
+        button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        button.setIconSize(QSize(14, 14))
+        button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        if action.isCheckable():
+            button.setCheckable(True)
+            button.setChecked(action.isChecked())
+            action.toggled.connect(button.setChecked)
+        button.clicked.connect(lambda _checked=False, action=action: action.trigger())
+        return button
+
+    def _window_button(self, text: str, callback, close: bool = False) -> QToolButton:
+        button = QToolButton(self)
+        button.setObjectName("closeButton" if close else "windowButton")
+        button.setText(text)
+        button.setAutoRaise(True)
+        button.setFixedSize(34, 24)
+        button.clicked.connect(lambda _checked=False, callback=callback: callback())
+        return button
+
+    def _toggle_maximized(self) -> None:
+        if self.window.isMaximized():
+            self.window.showNormal()
+        else:
+            self.window.showMaximized()
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.LeftButton:
+            self._drag_offset = event.globalPosition().toPoint() - self.window.frameGeometry().topLeft()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
+        if self._drag_offset is not None and event.buttons() & Qt.LeftButton:
+            if not self.window.isMaximized():
+                self.window.move(event.globalPosition().toPoint() - self._drag_offset)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        self._drag_offset = None
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.LeftButton:
+            self._toggle_maximized()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+
 class GameDesignerApp(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
+        self.setWindowFlag(Qt.FramelessWindowHint, True)
         self.settings = load_settings()
         self.theme = self.settings.theme if self.settings.theme in {"dark", "light"} else "dark"
         self._closing_app = False
         configure_fonts()
         self.setWindowTitle("GameDesigner - 游戏设计师")
+        self.icon_path = _app_icon_path()
+        if self.icon_path:
+            self.setWindowIcon(QIcon(str(self.icon_path)))
         self.resize(1360, 860)
         self.setMinimumSize(1020, 640)
         self.setStyleSheet(stylesheet(self.theme))
@@ -163,45 +314,79 @@ class GameDesignerApp(QMainWindow):
         self.exit_action.triggered.connect(self.close)
 
     def _build_menu(self) -> None:
-        menu = self.menuBar()
-        file_menu = menu.addMenu("文件")
-        file_menu.addAction(self.new_action)
-        file_menu.addAction(self.open_action)
-        file_menu.addSeparator()
-        file_menu.addAction(self.save_action)
-        file_menu.addAction(self.save_as_action)
-        file_menu.addAction(self.close_tab_action)
-        file_menu.addAction(self.project_settings_action)
-        file_menu.addSeparator()
-        file_menu.addAction(self.import_action)
-        file_menu.addAction(self.export_action)
-        file_menu.addSeparator()
-        file_menu.addAction(self.exit_action)
+        self.file_menu = QMenu("文件", self)
+        self.file_menu.addAction(self.new_action)
+        self.file_menu.addAction(self.open_action)
+        self.file_menu.addSeparator()
+        self.file_menu.addAction(self.save_action)
+        self.file_menu.addAction(self.save_as_action)
+        self.file_menu.addAction(self.close_tab_action)
+        self.file_menu.addAction(self.project_settings_action)
+        self.file_menu.addSeparator()
+        self.file_menu.addAction(self.import_action)
+        self.file_menu.addAction(self.export_action)
+        self.file_menu.addSeparator()
+        self.file_menu.addAction(self.exit_action)
 
-        edit_menu = menu.addMenu("编辑")
-        edit_menu.addAction(self.add_node_action)
-        edit_menu.addAction(self.edit_action)
-        edit_menu.addAction(self.delete_action)
-        edit_menu.addSeparator()
-        edit_menu.addAction(self.template_action)
+        self.edit_menu = QMenu("编辑", self)
+        self.edit_menu.addAction(self.add_node_action)
+        self.edit_menu.addAction(self.edit_action)
+        self.edit_menu.addAction(self.delete_action)
+        self.edit_menu.addSeparator()
+        self.edit_menu.addAction(self.template_action)
 
-        view_menu = menu.addMenu("视图")
-        view_menu.addAction(self.reset_view_action)
-        view_menu.addAction(self.dark_mode_action)
+        self.view_menu = QMenu("视图", self)
+        self.view_menu.addAction(self.reset_view_action)
+        self.view_menu.addAction(self.dark_mode_action)
 
     def _build_toolbar(self) -> None:
-        toolbar = QToolBar("主工具栏", self)
-        toolbar.setMovable(False)
-        self.addToolBar(Qt.TopToolBarArea, toolbar)
-        toolbar.addAction(self.new_action)
-        toolbar.addAction(self.open_action)
-        toolbar.addSeparator()
-        toolbar.addAction(self.reset_view_action)
-        toolbar.addAction(self.dark_mode_action)
+        self.titlebar = CompactTitleBar(self, self.icon_path)
+        self.setMenuWidget(self.titlebar)
 
     def _bind_shortcuts(self) -> None:
         escape = QShortcut(QKeySequence(Qt.Key_Escape), self)
         escape.activated.connect(self._cancel_connection)
+
+    def nativeEvent(self, event_type, message):  # type: ignore[override]
+        if sys.platform.startswith("win") and event_type == "windows_generic_MSG":
+            msg = wintypes.MSG.from_address(int(message))
+            if msg.message == WM_NCHITTEST:
+                hit = self._windows_hit_test(QCursor.pos())
+                if hit:
+                    return True, hit
+        return super().nativeEvent(event_type, message)
+
+    def _windows_hit_test(self, global_pos: QPoint) -> int | None:
+        if not self.isMaximized() and not self.isFullScreen():
+            rect = self.frameGeometry()
+            left = global_pos.x() <= rect.left() + RESIZE_BORDER
+            right = global_pos.x() >= rect.right() - RESIZE_BORDER
+            top = global_pos.y() <= rect.top() + RESIZE_BORDER
+            bottom = global_pos.y() >= rect.bottom() - RESIZE_BORDER
+            if top and left:
+                return HTTOPLEFT
+            if top and right:
+                return HTTOPRIGHT
+            if bottom and left:
+                return HTBOTTOMLEFT
+            if bottom and right:
+                return HTBOTTOMRIGHT
+            if left:
+                return HTLEFT
+            if right:
+                return HTRIGHT
+            if top:
+                return HTTOP
+            if bottom:
+                return HTBOTTOM
+
+        if hasattr(self, "titlebar"):
+            title_pos = self.titlebar.mapFromGlobal(global_pos)
+            if self.titlebar.rect().contains(title_pos):
+                child = self.titlebar.childAt(title_pos)
+                if not isinstance(child, QToolButton):
+                    return HTCAPTION
+        return None
 
     def _load_start_project(self) -> None:
         workspace = Path(self.settings.workspace_dir)
@@ -408,14 +593,19 @@ class GameDesignerApp(QMainWindow):
     def _update_title(self) -> None:
         page = self._current_page()
         if not page:
-            self.setWindowTitle("GameDesigner - 游戏设计师")
+            self._set_window_caption("GameDesigner - 游戏设计师")
             return
         if page.is_welcome:
-            self.setWindowTitle("GameDesigner - 开始")
+            self._set_window_caption("GameDesigner - 开始")
             return
         mark = "*" if page.dirty else ""
         path = f" - {page.path}" if page.path else ""
-        self.setWindowTitle(f"{mark}GameDesigner - {page.project.name}{path}")
+        self._set_window_caption(f"{mark}GameDesigner - {page.project.name}{path}")
+
+    def _set_window_caption(self, title: str) -> None:
+        self.setWindowTitle(title)
+        if hasattr(self, "titlebar"):
+            self.titlebar.set_title(title)
 
     def _update_status(self) -> None:
         self.status.clearMessage()

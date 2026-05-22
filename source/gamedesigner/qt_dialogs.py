@@ -214,7 +214,8 @@ class EditorFieldItem(QGraphicsObject):
         painter.setPen(QPen(QColor(colors["blue"] if self.isSelected() else "#DADAE0"), 2 if self.isSelected() else 1))
         painter.drawPath(path)
 
-        if self.field.image_path:
+        is_image = self.field.data_type == "图片"
+        if is_image and self.field.image_path:
             pixmap = QPixmap(self.field.image_path)
             if not pixmap.isNull():
                 target = QRectF(10, 10, max(10.0, rect.width() - 20), max(10.0, rect.height() - 20))
@@ -228,13 +229,17 @@ class EditorFieldItem(QGraphicsObject):
             else:
                 painter.setPen(QColor(colors["accent_dark"]))
                 painter.drawText(rect.adjusted(10, 10, -10, -10), Qt.AlignLeft | Qt.AlignTop, "图片无法读取")
+        elif is_image:
+            painter.setPen(QColor(colors["node_muted"]))
+            painter.drawText(rect.adjusted(10, 10, -10, -10), Qt.AlignCenter | Qt.TextWordWrap, "选择图片")
 
-        text = self.field.value or self.field.name
-        painter.setPen(QColor(self.field.text_color or colors["node_text"]))
-        font = painter.font()
-        font.setPointSize(max(8, min(48, self.field.font_size)))
-        painter.setFont(font)
-        painter.drawText(rect.adjusted(10, 9, -10, -9), Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignTop, text)
+        text = self.field.value if is_image else (self.field.value or self.field.name)
+        if text:
+            painter.setPen(QColor(self.field.text_color or colors["node_text"]))
+            font = painter.font()
+            font.setPointSize(max(8, min(48, self.field.font_size)))
+            painter.setFont(font)
+            painter.drawText(rect.adjusted(10, 9, -10, -9), Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignTop, text)
 
         if self.isSelected():
             painter.setPen(QPen(QColor(colors["blue"]), 1.4))
@@ -450,6 +455,7 @@ class NodeEditorDialog(QDialog):
         self.field_type.addItems(FIELD_TYPES)
         self.field_value = QPlainTextEdit()
         self.image_path = QLineEdit()
+        self.image_button: QPushButton | None = None
         self.field_x = QLineEdit()
         self.field_y = QLineEdit()
         self.field_w = QLineEdit()
@@ -530,6 +536,7 @@ class NodeEditorDialog(QDialog):
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
         button = QPushButton(label)
+        self.image_button = button
         button.clicked.connect(slot)
         layout.addWidget(edit, 1)
         layout.addWidget(button)
@@ -561,7 +568,7 @@ class NodeEditorDialog(QDialog):
             self.bg_color,
         ):
             widget.textChanged.connect(self._apply_props)
-        self.field_type.currentTextChanged.connect(lambda _text: self._apply_props())
+        self.field_type.currentTextChanged.connect(self._on_field_type_changed)
         self.field_value.textChanged.connect(self._apply_props)
 
     def _ensure_visual_layout(self) -> None:
@@ -605,6 +612,7 @@ class NodeEditorDialog(QDialog):
                 widget.clear()
             self.field_value.setPlainText("")
             self._updating = False
+            self._update_image_controls()
             return
         self.field_name.setText(field.name)
         self.field_type.setCurrentText(field.data_type if field.data_type in FIELD_TYPES else "文本")
@@ -618,6 +626,17 @@ class NodeEditorDialog(QDialog):
         self.text_color.setText(field.text_color)
         self.bg_color.setText(field.bg_color)
         self._updating = False
+        self._update_image_controls()
+
+    def _on_field_type_changed(self, _text: str) -> None:
+        self._apply_props()
+        self._update_image_controls()
+
+    def _update_image_controls(self) -> None:
+        enabled = self._selected_field() is not None and self.field_type.currentText() == "图片"
+        self.image_path.setEnabled(enabled)
+        if self.image_button:
+            self.image_button.setEnabled(enabled)
 
     def _apply_props(self) -> None:
         if self._updating:
@@ -663,7 +682,7 @@ class NodeEditorDialog(QDialog):
         self._load_selected_props(len(self.fields) - 1)
 
     def _add_image_card(self) -> None:
-        field = NodeField(name="图片", data_type="资源路径", value="图片")
+        field = NodeField(name="图片", data_type="图片", value="")
         field.x = 24
         field.y = max([item.y + item.height + 12 for item in self.fields] + [18])
         field.width = 280

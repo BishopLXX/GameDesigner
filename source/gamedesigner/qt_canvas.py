@@ -217,7 +217,8 @@ class NodeItem(QGraphicsObject):
             painter.fillPath(path, QColor(field.bg_color or "#FFFFFF"))
             painter.setPen(QPen(QColor("#DADAE0"), 1))
             painter.drawPath(path)
-            if field.image_path:
+            is_image = field.data_type == "图片"
+            if is_image and field.image_path:
                 pixmap = QPixmap(field.image_path)
                 if not pixmap.isNull():
                     target = card.adjusted(8, 8, -8, -8)
@@ -228,7 +229,13 @@ class NodeItem(QGraphicsObject):
                         Qt.SmoothTransformation,
                     )
                     painter.drawPixmap(int(target.x()), int(target.y()), scaled)
-            text = field.value or field.name
+            elif is_image:
+                painter.setPen(QColor(colors["node_muted"]))
+                painter.setFont(_font(9))
+                painter.drawText(card.adjusted(9, 8, -9, -8), Qt.AlignCenter | Qt.TextWordWrap, "选择图片")
+            text = field.value if is_image else (field.value or field.name)
+            if not text:
+                continue
             painter.setPen(QColor(field.text_color or colors["node_text"]))
             font = _font(max(8, min(48, int(field.font_size * min(scale_x, scale_y)))))
             painter.setFont(font)

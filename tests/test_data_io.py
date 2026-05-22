@@ -22,7 +22,10 @@ class DataIoTests(unittest.TestCase):
                 y=20,
                 width=360,
                 height=220,
-                fields=[NodeField("内容信息", "文本", "起点")],
+                fields=[
+                    NodeField("内容信息", "文本", "起点"),
+                    NodeField("立绘", "图片", "", image_path=str(tmp_path / "hero.png")),
+                ],
             )
             second = Node(title="B", x=100, y=120, fields=[NodeField("数值", "数字", "42")])
             project.nodes = [first, second]
@@ -39,6 +42,8 @@ class DataIoTests(unittest.TestCase):
             self.assertEqual([node.title for node in loaded.nodes], ["A", "B"])
             self.assertEqual(loaded.nodes[0].width, 360)
             self.assertEqual(loaded.nodes[0].height, 220)
+            self.assertEqual(loaded.nodes[0].fields[1].data_type, "图片")
+            self.assertEqual(loaded.nodes[0].fields[1].image_path, str(tmp_path / "hero.png"))
             self.assertEqual(loaded.edges[0].source, first.id)
             self.assertEqual(loaded.edges[0].target, second.id)
             self.assertEqual(loaded.edges[0].style, "orthogonal")
@@ -47,7 +52,15 @@ class DataIoTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             tmp_path = Path(folder)
             project = ProjectData(name="CSV测试")
-            first = Node(title="科技入口", width=330, height=180, fields=[NodeField("数据类型", "枚举", "科技树")])
+            first = Node(
+                title="科技入口",
+                width=330,
+                height=180,
+                fields=[
+                    NodeField("数据类型", "枚举", "科技树"),
+                    NodeField("图标", "图片", "", image_path=str(tmp_path / "icon.png")),
+                ],
+            )
             second = Node(title="天赋节点", fields=[NodeField("消耗", "整数", "3")])
             project.nodes = [first, second]
             edge = project.add_edge(first.id, second.id)
@@ -60,8 +73,23 @@ class DataIoTests(unittest.TestCase):
             self.assertEqual(loaded.nodes[0].width, 330)
             self.assertEqual(loaded.nodes[0].height, 180)
             self.assertEqual(loaded.nodes[0].fields[0].value, "科技树")
+            self.assertEqual(loaded.nodes[0].fields[1].data_type, "图片")
+            self.assertEqual(loaded.nodes[0].fields[1].image_path, str(tmp_path / "icon.png"))
             self.assertEqual(len(loaded.edges), 1)
             self.assertEqual(loaded.edges[0].style, "straight")
+
+    def test_legacy_resource_path_image_field_migrates_to_image_type(self) -> None:
+        field = NodeField.from_dict(
+            {
+                "name": "旧图片",
+                "data_type": "资源路径",
+                "value": "",
+                "image_path": "D:/assets/old.png",
+            }
+        )
+
+        self.assertEqual(field.data_type, "图片")
+        self.assertEqual(field.image_path, "D:/assets/old.png")
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ FIELD_TYPES = [
     "布尔",
     "枚举",
     "颜色",
+    "图片",
     "资源路径",
 ]
 
@@ -58,6 +59,9 @@ class NodeField:
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "NodeField":
         data_type = str(raw.get("data_type", "文本"))
+        image_path = str(raw.get("image_path") or "")
+        if data_type == "资源路径" and image_path:
+            data_type = "图片"
         if data_type not in FIELD_TYPES:
             data_type = "文本"
         return cls(
@@ -71,7 +75,7 @@ class NodeField:
             font_size=max(8, min(48, int(_float_or(raw.get("font_size"), 12)))),
             text_color=str(raw.get("text_color") or "#1D1D1F"),
             bg_color=str(raw.get("bg_color") or "#ffffff"),
-            image_path=str(raw.get("image_path") or ""),
+            image_path=image_path,
         )
 
     def has_visual_layout(self) -> bool:
