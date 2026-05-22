@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from gamedesigner.csv_io import export_all_canvas_csv, export_game_csv
-from gamedesigner.models import BlueprintGroup, Node, NodeField, ProjectData, default_templates
+from gamedesigner.models import BlueprintGroup, Node, NodeField, NodeTemplate, ProjectData, default_templates
 from gamedesigner.project_files.linked_documents import (
     create_link_document,
     delete_link_document,
@@ -34,6 +34,7 @@ class DataIoTests(unittest.TestCase):
                 y=20,
                 width=360,
                 height=220,
+                icon_from_title=True,
                 fields=[
                     NodeField("内容信息", "文本", "起点", text_h_align="center", text_v_align="bottom"),
                     NodeField(
@@ -45,6 +46,7 @@ class DataIoTests(unittest.TestCase):
                     ),
                 ],
             )
+            first.title_field_id = first.fields[0].id
             second = Node(title="B", x=100, y=120, fields=[NodeField("数值", "数字", "42")])
             group = BlueprintGroup(title="战斗流程", x=0, y=0, width=600, height=240)
             project.nodes = [first, second]
@@ -74,6 +76,8 @@ class DataIoTests(unittest.TestCase):
             self.assertEqual(loaded.nodes[0].fields[1].export_props, ["x", "width"])
             self.assertEqual(loaded.nodes[0].fields[0].text_h_align, "center")
             self.assertEqual(loaded.nodes[0].fields[0].text_v_align, "bottom")
+            self.assertTrue(loaded.nodes[0].icon_from_title)
+            self.assertEqual(loaded.nodes[0].title_field_id, loaded.nodes[0].fields[0].id)
             self.assertEqual(loaded.root_canvas().groups[0].title, "战斗流程")
             self.assertEqual(loaded.nodes[0].group_id, loaded.root_canvas().groups[0].id)
             self.assertEqual(loaded.edges[0].source, first.id)
@@ -293,6 +297,10 @@ class DataIoTests(unittest.TestCase):
         node = template.create_node(0, 0)
 
         self.assertEqual(template.icon, "N")
+        self.assertTrue(template.icon_from_title)
+        self.assertEqual(template.title_field_id, template.fields[0].id)
+        self.assertEqual(node.title_field_id, node.fields[0].id)
+        self.assertEqual(node.display_icon(), "节")
         self.assertEqual(len(template.fields), 5)
         self.assertEqual([field.value for field in template.fields], [
             "节点名字",
@@ -304,6 +312,25 @@ class DataIoTests(unittest.TestCase):
         self.assertTrue(all(field.has_visual_layout() for field in node.fields))
         self.assertEqual(node.fields[0].text_h_align, "center")
         self.assertEqual(node.fields[0].text_v_align, "center")
+
+    def test_template_preserves_title_and_icon_bindings(self) -> None:
+        field = NodeField("节点名", "文本", "启程")
+        template = NodeTemplate(
+            name="科技模板",
+            icon="N",
+            icon_from_title=True,
+            title_field_id=field.id,
+            fields=[field],
+        )
+
+        loaded = NodeTemplate.from_dict(template.to_dict())
+        node = loaded.create_node(10, 20)
+
+        self.assertTrue(loaded.icon_from_title)
+        self.assertEqual(loaded.title_field_id, loaded.fields[0].id)
+        self.assertEqual(node.title, "启程")
+        self.assertTrue(node.icon_from_title)
+        self.assertEqual(node.display_icon(), "启")
 
     def _csv_names(self, path: Path) -> list[str]:
         with path.open("r", encoding="utf-8-sig", newline="") as file:

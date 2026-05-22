@@ -288,14 +288,14 @@ class NodeItem(QGraphicsObject):
 
     def _paint_icon_mode(self, painter: QPainter, colors: dict[str, str], rect: QRectF, zoom: float) -> None:
         fallback = "画" if self.node.node_type == "画布" else "链" if self.node.node_type == "超链接" else self.node.title
-        text = (self.node.icon or fallback or "节").strip()[:8]
+        text = (self.node.display_icon() or fallback or "节").strip()[:8]
         painter.setPen(QColor(colors["accent"]))
         text_rect = rect.adjusted(12, 22, -12, -8)
         self._draw_adaptive_center_text(painter, text_rect, text, zoom, 20, 84)
 
     def _paint_compact_mode(self, painter: QPainter, colors: dict[str, str], rect: QRectF, zoom: float) -> None:
         fallback = "画" if self.node.node_type == "画布" else "链" if self.node.node_type == "超链接" else self.node.title[:1]
-        icon = (self.node.icon or fallback or "节").strip()[:2]
+        icon = (self.node.display_icon() or fallback or "节").strip()[:2]
         painter.setPen(QColor(colors["accent"]))
         icon_rect = QRectF(18, 28, 58, max(28, rect.height() - 42))
         icon_font_size = self._fit_font_size(icon, icon_rect, int(18 / max(zoom, 0.18)), 12, 52)
@@ -307,7 +307,7 @@ class NodeItem(QGraphicsObject):
         self._draw_adaptive_center_text(painter, title_rect, self.node.title, zoom, 13, 42)
 
     def _paint_detail_mode(self, painter: QPainter, colors: dict[str, str], rect: QRectF) -> None:
-        icon = self.node.icon or ("画" if self.node.node_type == "画布" else "链" if self.node.node_type == "超链接" else "")
+        icon = self.node.display_icon() or ("画" if self.node.node_type == "画布" else "链" if self.node.node_type == "超链接" else "")
         title = f"{icon}  {self.node.title}" if icon else self.node.title
         painter.setPen(QColor(colors["node_text"]))
         title_font = _font(12, True)

@@ -132,6 +132,24 @@ def stylesheet(name: str) -> str:
         image: none;
         width: 0;
     }}
+    QToolButton#bindingToolButton {{
+        background: {colors["panel_alt"]};
+        color: {colors["text_muted"]};
+        border: 1px solid {colors["hairline"]};
+        border-radius: 8px;
+        padding: 0;
+        font-weight: 600;
+    }}
+    QToolButton#bindingToolButton:hover {{
+        background: {colors["control_hover"]};
+        border-color: {colors["accent"]};
+        color: {colors["text"]};
+    }}
+    QToolButton#bindingToolButton:checked {{
+        background: {colors["blue_soft"]};
+        color: {colors["blue"]};
+        border-color: {colors["blue"]};
+    }}
     QToolButton#exportPinButton {{
         background: transparent;
         color: {colors["text_muted"]};

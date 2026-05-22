@@ -57,9 +57,11 @@ class NodeField:
     text_v_align: str = "top"
     image_path: str = ""
     export_props: list[str] = field(default_factory=list)
+    id: str = field(default_factory=lambda: new_id("field"))
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "id": self.id,
             "name": self.name,
             "data_type": self.data_type,
             "value": "" if self.data_type == "图片" else self.value,
@@ -90,6 +92,7 @@ class NodeField:
         if not isinstance(export_props, list):
             export_props = []
         return cls(
+            id=str(raw.get("id") or new_id("field")),
             name=str(raw.get("name", "字段")),
             data_type=data_type,
             value=str(raw.get("value", "")),
@@ -126,7 +129,14 @@ class Node:
     height: float = 0.0
     color: str = DEFAULT_NODE_COLOR
     icon: str = ""
+    icon_from_title: bool = False
+    title_field_id: str = ""
     fields: list[NodeField] = field(default_factory=list)
+
+    def display_icon(self) -> str:
+        if self.icon_from_title:
+            return (self.title.strip()[:1] or self.icon).strip()
+        return self.icon
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -144,6 +154,8 @@ class Node:
             "height": self.height,
             "color": self.color,
             "icon": self.icon,
+            "icon_from_title": self.icon_from_title,
+            "title_field_id": self.title_field_id,
             "fields": [item.to_dict() for item in self.fields],
         }
 
@@ -155,7 +167,7 @@ class Node:
         node_type = str(raw.get("node_type") or raw.get("type") or "普通")
         if node_type not in NODE_TYPES:
             node_type = "普通"
-        return cls(
+        node = cls(
             id=str(raw.get("id") or new_id("node")),
             title=str(raw.get("title", "新节点")),
             node_type=node_type,
@@ -170,8 +182,13 @@ class Node:
             height=max(0.0, _float_or(raw.get("height"), 0.0)),
             color=str(raw.get("color") or DEFAULT_NODE_COLOR),
             icon=str(raw.get("icon") or ""),
+            icon_from_title=bool(raw.get("icon_from_title", False)),
+            title_field_id=str(raw.get("title_field_id") or ""),
             fields=[NodeField.from_dict(item) for item in fields if isinstance(item, dict)],
         )
+        if node.title_field_id and not any(field.id == node.title_field_id for field in node.fields):
+            node.title_field_id = ""
+        return node
 
 
 @dataclass
@@ -377,16 +394,27 @@ class NodeTemplate:
     name: str = "节点模板"
     color: str = DEFAULT_NODE_COLOR
     icon: str = ""
+    icon_from_title: bool = False
+    title_field_id: str = ""
     fields: list[NodeField] = field(default_factory=list)
 
     def create_node(self, x: float, y: float) -> Node:
+        fields = [NodeField.from_dict(field.to_dict()) for field in self.fields]
+        title_field_id = self.title_field_id if any(item.id == self.title_field_id for item in fields) else ""
+        title = self.name
+        if title_field_id:
+            title_field = next((item for item in fields if item.id == title_field_id), None)
+            if title_field and title_field.value.strip():
+                title = title_field.value.strip()
         return Node(
-            title=self.name,
+            title=title,
             x=x,
             y=y,
             color=self.color,
             icon=self.icon,
-            fields=[NodeField.from_dict(field.to_dict()) for field in self.fields],
+            icon_from_title=self.icon_from_title,
+            title_field_id=title_field_id,
+            fields=fields,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -395,6 +423,8 @@ class NodeTemplate:
             "name": self.name,
             "color": self.color,
             "icon": self.icon,
+            "icon_from_title": self.icon_from_title,
+            "title_field_id": self.title_field_id,
             "fields": [item.to_dict() for item in self.fields],
         }
 
@@ -403,13 +433,18 @@ class NodeTemplate:
         fields = raw.get("fields", [])
         if not isinstance(fields, list):
             fields = []
-        return cls(
+        template = cls(
             id=str(raw.get("id") or new_id("template")),
             name=str(raw.get("name", "节点模板")),
             color=str(raw.get("color") or DEFAULT_NODE_COLOR),
             icon=str(raw.get("icon") or ""),
+            icon_from_title=bool(raw.get("icon_from_title", False)),
+            title_field_id=str(raw.get("title_field_id") or ""),
             fields=[NodeField.from_dict(item) for item in fields if isinstance(item, dict)],
         )
+        if template.title_field_id and not any(field.id == template.title_field_id for field in template.fields):
+            template.title_field_id = ""
+        return template
 
 
 @dataclass
@@ -585,6 +620,7 @@ def default_project() -> ProjectData:
 
 
 def default_tech_tree_node(x: float = 0.0, y: float = 0.0) -> Node:
+    fields = default_tech_tree_fields()
     return Node(
         title="节点名字",
         x=x,
@@ -593,7 +629,9 @@ def default_tech_tree_node(x: float = 0.0, y: float = 0.0) -> Node:
         height=330,
         color=DEFAULT_NODE_COLOR,
         icon="N",
-        fields=default_tech_tree_fields(),
+        icon_from_title=True,
+        title_field_id=fields[0].id,
+        fields=fields,
     )
 
 
@@ -634,6 +672,7 @@ def _visual_field(
 
 
 def default_templates() -> list[NodeTemplate]:
+    tech_fields = default_tech_tree_fields()
     return [
         NodeTemplate(
             name="设计节点",
@@ -648,7 +687,9 @@ def default_templates() -> list[NodeTemplate]:
             name="科技树节点",
             color=DEFAULT_NODE_COLOR,
             icon="N",
-            fields=default_tech_tree_fields(),
+            icon_from_title=True,
+            title_field_id=tech_fields[0].id,
+            fields=tech_fields,
         ),
         NodeTemplate(
             name="任务节点",

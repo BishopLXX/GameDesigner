@@ -606,6 +606,7 @@ class NodeEditorDialog(QDialog):
         self._link_format = node.link_format
         self._order = node.order
         self.fields = [copy.deepcopy(field) for field in node.fields]
+        self.title_field_id = node.title_field_id if any(field.id == node.title_field_id for field in self.fields) else ""
         self.templates = [copy.deepcopy(template) for template in templates] if templates is not None else None
         self.templates_result: list[NodeTemplate] | None = None
         self.templates_changed = False
@@ -618,6 +619,17 @@ class NodeEditorDialog(QDialog):
         self.node_type.setCurrentText(node.node_type if node.node_type in NODE_TYPES else "普通")
         self.icon_edit = QLineEdit(node.icon)
         self.color_edit = QLineEdit(node.color or DEFAULT_NODE_COLOR)
+        self.icon_from_title_button = QToolButton()
+        self.icon_from_title_button.setObjectName("bindingToolButton")
+        self.icon_from_title_button.setText("首")
+        self.icon_from_title_button.setCheckable(True)
+        self.icon_from_title_button.setChecked(node.icon_from_title)
+        self.icon_from_title_button.setToolTip("图标自动使用节点名称的第一个字")
+        self.title_from_content_button = QToolButton()
+        self.title_from_content_button.setObjectName("bindingToolButton")
+        self.title_from_content_button.setText("名称")
+        self.title_from_content_button.setCheckable(True)
+        self.title_from_content_button.setToolTip("节点名称自动使用当前卡片内容")
 
         self.field_name = QLineEdit()
         self.field_type = QComboBox()
@@ -642,7 +654,9 @@ class NodeEditorDialog(QDialog):
         self.pin_buttons: dict[str, QToolButton] = {}
 
         self.canvas = FieldCanvas(self.fields, theme)
-        self.canvas.set_header(self.title_edit.text(), self.icon_edit.text(), self.color_edit.text())
+        self._sync_title_from_field()
+        self._sync_icon_from_title()
+        self.canvas.set_header(self.title_edit.text(), self._display_icon(), self.color_edit.text())
         self.canvas.fieldSelected.connect(self._load_selected_props)
         self.canvas.fieldActivated.connect(self._focus_field_value)
         self.canvas.fieldContentEdited.connect(self._on_canvas_field_content_edited)
@@ -680,7 +694,7 @@ class NodeEditorDialog(QDialog):
         card_form = QFormLayout(card_box)
         card_form.addRow("名称", self.title_edit)
         card_form.addRow("类型", self.node_type)
-        card_form.addRow("图标", self.icon_edit)
+        card_form.addRow("图标", self._icon_binding_row())
         card_form.addRow("颜色", self._color_row(self.color_edit, self._pick_node_color))
 
         template_tools = self._template_tools()
@@ -694,7 +708,7 @@ class NodeEditorDialog(QDialog):
         self.image_row = self._path_row(self.image_path, "选择图片", self._pick_image)
         props_layout.addWidget(self._labeled_row("字段", self.field_name))
         props_layout.addWidget(self._labeled_row("类型", self.field_type))
-        self.content_row = self._labeled_row(self.content_label, self.field_value)
+        self.content_row = self._labeled_row(self.content_label, self._content_binding_row())
         self.image_picker_row = self._labeled_row(self.image_label, self.image_row)
         props_layout.addWidget(self.content_row)
         props_layout.addWidget(self.image_picker_row)
@@ -761,6 +775,26 @@ class NodeEditorDialog(QDialog):
         label_widget.setFixedWidth(38)
         layout.addWidget(label_widget)
         layout.addWidget(editor, 1)
+        return row
+
+    def _icon_binding_row(self) -> QWidget:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        self.icon_from_title_button.setFixedSize(38, 30)
+        layout.addWidget(self.icon_edit, 1)
+        layout.addWidget(self.icon_from_title_button)
+        return row
+
+    def _content_binding_row(self) -> QWidget:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        self.title_from_content_button.setFixedSize(48, 30)
+        layout.addWidget(self.field_value, 1)
+        layout.addWidget(self.title_from_content_button, 0, Qt.AlignTop)
         return row
 
     def _path_row(self, edit: QLineEdit, label: str, slot) -> QWidget:
@@ -961,9 +995,11 @@ class NodeEditorDialog(QDialog):
         return row
 
     def _connect_changes(self) -> None:
-        self.title_edit.textChanged.connect(lambda _text: self._update_canvas_header())
+        self.title_edit.textChanged.connect(lambda _text: self._on_title_changed())
         self.icon_edit.textChanged.connect(lambda _text: self._update_canvas_header())
         self.color_edit.textChanged.connect(lambda _text: self._update_canvas_header())
+        self.icon_from_title_button.toggled.connect(self._on_icon_from_title_toggled)
+        self.title_from_content_button.toggled.connect(self._on_title_from_content_toggled)
         for widget in (
             self.field_name,
             self.image_path,
@@ -993,7 +1029,66 @@ class NodeEditorDialog(QDialog):
             y = max(y + 92, field.y + field.height + 12)
 
     def _update_canvas_header(self) -> None:
-        self.canvas.set_header(self.title_edit.text(), self.icon_edit.text(), self.color_edit.text())
+        self.canvas.set_header(self.title_edit.text(), self._display_icon(), self.color_edit.text())
+
+    def _on_title_changed(self) -> None:
+        self._sync_icon_from_title()
+        self._update_canvas_header()
+
+    def _display_icon(self) -> str:
+        if self.icon_from_title_button.isChecked():
+            return self.title_edit.text().strip()[:1] or self.icon_edit.text().strip()
+        return self.icon_edit.text().strip()
+
+    def _sync_icon_from_title(self) -> None:
+        checked = self.icon_from_title_button.isChecked()
+        self.icon_edit.setEnabled(not checked)
+        if not checked:
+            return
+        icon = self.title_edit.text().strip()[:1]
+        self.icon_edit.blockSignals(True)
+        self.icon_edit.setText(icon)
+        self.icon_edit.blockSignals(False)
+
+    def _title_source_field(self) -> NodeField | None:
+        if not self.title_field_id:
+            return None
+        return next((field for field in self.fields if field.id == self.title_field_id), None)
+
+    def _sync_title_from_field(self) -> None:
+        field = self._title_source_field()
+        if not field or field.data_type == "图片":
+            return
+        title = (field.value or field.name).strip()
+        if not title:
+            return
+        self.title_edit.setText(title)
+
+    def _update_title_binding_controls(self) -> None:
+        field = self._selected_field()
+        can_bind = bool(field and field.data_type != "图片")
+        checked = bool(field and field.id == self.title_field_id)
+        self.title_from_content_button.blockSignals(True)
+        self.title_from_content_button.setChecked(checked)
+        self.title_from_content_button.setEnabled(can_bind)
+        self.title_from_content_button.blockSignals(False)
+        self.title_edit.setReadOnly(bool(self._title_source_field()))
+
+    def _on_icon_from_title_toggled(self, _checked: bool) -> None:
+        self._sync_icon_from_title()
+        self._update_canvas_header()
+
+    def _on_title_from_content_toggled(self, checked: bool) -> None:
+        if self._updating:
+            return
+        field = self._selected_field()
+        if checked and field and field.data_type != "图片":
+            self.title_field_id = field.id
+            self._sync_title_from_field()
+        elif field and field.id == self.title_field_id:
+            self.title_field_id = ""
+        self._update_title_binding_controls()
+        self._update_canvas_header()
 
     def _selected_field(self) -> NodeField | None:
         index = self.canvas.selected_index
@@ -1048,6 +1143,7 @@ class NodeEditorDialog(QDialog):
             self._updating = False
             self._update_type_controls()
             self._update_pin_controls()
+            self._update_title_binding_controls()
             return
         self.field_name.setText(field.name)
         self.field_type.setCurrentText(field.data_type if field.data_type in FIELD_TYPES else "文本")
@@ -1065,6 +1161,7 @@ class NodeEditorDialog(QDialog):
         self._updating = False
         self._update_type_controls()
         self._update_pin_controls()
+        self._update_title_binding_controls()
 
     def _on_field_type_changed(self, _text: str) -> None:
         is_image = self.field_type.currentText() == "图片"
@@ -1079,6 +1176,8 @@ class NodeEditorDialog(QDialog):
         self._apply_props()
         field = self._selected_field()
         if field:
+            if is_image and field.id == self.title_field_id:
+                self.title_field_id = ""
             self._normalize_export_props_for_type(field)
         self._update_type_controls()
         self._update_pin_controls()
@@ -1096,6 +1195,7 @@ class NodeEditorDialog(QDialog):
         self._set_alignment_enabled(has_field)
         if self.image_button:
             self.image_button.setEnabled(show_image)
+        self._update_title_binding_controls()
 
     def _update_pin_controls(self) -> None:
         field = self._selected_field()
@@ -1146,6 +1246,8 @@ class NodeEditorDialog(QDialog):
         field.text_h_align = self._alignment_value(self.h_align_buttons, "left")
         field.text_v_align = self._alignment_value(self.v_align_buttons, "top")
         self._normalize_export_props_for_type(field)
+        if field.id == self.title_field_id:
+            self._sync_title_from_field()
         self.canvas.refresh(self.canvas.selected_index)
 
     def _on_field_changed(self) -> None:
@@ -1163,6 +1265,8 @@ class NodeEditorDialog(QDialog):
         self.field_value.blockSignals(True)
         self.field_value.setPlainText(field.value)
         self.field_value.blockSignals(False)
+        if field.id == self.title_field_id:
+            self._sync_title_from_field()
 
     def _focus_field_value(self, index: int) -> None:
         self._load_selected_props(index)
@@ -1215,6 +1319,8 @@ class NodeEditorDialog(QDialog):
     def _delete_card_at(self, index: int) -> None:
         if index < 0 or index >= len(self.fields):
             return
+        if self.fields[index].id == self.title_field_id:
+            self.title_field_id = ""
         del self.fields[index]
         next_index = min(index, len(self.fields) - 1) if self.fields else None
         self.canvas.refresh(next_index)
@@ -1233,9 +1339,13 @@ class NodeEditorDialog(QDialog):
         if not template:
             return
         self.title_edit.setText(template.name)
+        self.icon_from_title_button.setChecked(template.icon_from_title)
         self.icon_edit.setText(template.icon)
         self.color_edit.setText(template.color or DEFAULT_NODE_COLOR)
         self.fields = [NodeField.from_dict(field.to_dict()) for field in template.fields]
+        self.title_field_id = template.title_field_id if any(field.id == template.title_field_id for field in self.fields) else ""
+        self._sync_title_from_field()
+        self._sync_icon_from_title()
         self._ensure_visual_layout()
         self.canvas.fields = self.fields
         self.canvas.refresh(0 if self.fields else None)
@@ -1259,6 +1369,8 @@ class NodeEditorDialog(QDialog):
             name=name,
             color=self.color_edit.text().strip() or DEFAULT_NODE_COLOR,
             icon=self.icon_edit.text().strip(),
+            icon_from_title=self.icon_from_title_button.isChecked(),
+            title_field_id=self.title_field_id,
             fields=[NodeField.from_dict(field.to_dict()) for field in self.fields],
         )
         existing_index = next((index for index, item in enumerate(self.templates) if item.name == name), None)
@@ -1327,6 +1439,8 @@ class NodeEditorDialog(QDialog):
             height=self._height,
             color=self.color_edit.text().strip() or DEFAULT_NODE_COLOR,
             icon=self.icon_edit.text().strip(),
+            icon_from_title=self.icon_from_title_button.isChecked(),
+            title_field_id=self.title_field_id,
             fields=[copy.deepcopy(field) for field in self.fields],
         )
         self.accept()
@@ -1428,6 +1542,8 @@ class TemplateManagerDialog(QDialog):
             title=template.name,
             color=template.color,
             icon=template.icon,
+            icon_from_title=template.icon_from_title,
+            title_field_id=template.title_field_id,
             fields=[NodeField.from_dict(field.to_dict()) for field in template.fields],
         )
 
@@ -1437,6 +1553,8 @@ class TemplateManagerDialog(QDialog):
             name=node.title,
             color=node.color,
             icon=node.icon,
+            icon_from_title=node.icon_from_title,
+            title_field_id=node.title_field_id,
             fields=[NodeField.from_dict(field.to_dict()) for field in node.fields],
         )
 

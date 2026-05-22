@@ -1335,6 +1335,8 @@ class GameDesignerApp(QMainWindow):
         node.width = result.width
         node.height = result.height
         node.fields = result.fields
+        node.icon_from_title = result.icon_from_title
+        node.title_field_id = result.title_field_id
         node.node_type = result.node_type
         node.canvas_id = result.canvas_id
         node.link_path = result.link_path
