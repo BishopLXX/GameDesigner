@@ -20,6 +20,15 @@ if errorlevel 1 (
     exit /b 1
 )
 
+echo [GameDesigner] Preparing Windows icon...
+py -3.13 source\make_icon.py icon.png icon.ico
+if errorlevel 1 (
+    echo.
+    echo Icon generation failed. Please make sure icon.png exists and is readable.
+    pause
+    exit /b 1
+)
+
 tasklist /FI "IMAGENAME eq GameDesigner.exe" 2>nul | find /I "GameDesigner.exe" >nul
 if not errorlevel 1 (
     echo.
@@ -36,6 +45,8 @@ py -3.13 -m PyInstaller ^
   --onefile ^
   --windowed ^
   --name GameDesigner ^
+  --icon icon.ico ^
+  --add-data "icon.png;." ^
   --distpath release ^
   --workpath build ^
   source\main.py

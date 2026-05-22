@@ -12,6 +12,9 @@ from .models import ProjectData, default_project
 APP_NAME = "GameDesigner"
 PROJECT_SUFFIX = ".gdc"
 LEGACY_PROJECT_SUFFIX = ".gdesigner.json"
+PROJECT_BUNDLE_SUFFIX = ".files"
+CANVASES_DIR = "canvases"
+TEMPLATES_FILE = "templates.json"
 
 
 @dataclass
@@ -111,15 +114,108 @@ def load_project(path: str | Path) -> ProjectData:
         raw = json.load(file)
     if not isinstance(raw, dict):
         return default_project()
+    raw = _hydrate_split_project(project_path, raw)
     return ProjectData.from_dict(raw)
 
 
 def save_project(project: ProjectData, path: str | Path) -> None:
     project_path = Path(path)
     project_path.parent.mkdir(parents=True, exist_ok=True)
+    project.ensure_canvas_structure()
+    bundle_dir = project_bundle_dir(project_path)
+    canvases_dir = bundle_dir / CANVASES_DIR
+    canvases_dir.mkdir(parents=True, exist_ok=True)
+    for canvas in project.canvases:
+        with (canvases_dir / f"{_safe_path_name(canvas.id)}.json").open("w", encoding="utf-8") as file:
+            json.dump(canvas.to_dict(), file, ensure_ascii=False, indent=2)
+    _remove_stale_canvas_files(canvases_dir, {f"{_safe_path_name(canvas.id)}.json" for canvas in project.canvases})
+    with (bundle_dir / TEMPLATES_FILE).open("w", encoding="utf-8") as file:
+        json.dump([template.to_dict() for template in project.templates], file, ensure_ascii=False, indent=2)
+    manifest = _project_manifest(project, project_path)
     with project_path.open("w", encoding="utf-8") as file:
-        json.dump(project.to_dict(), file, ensure_ascii=False, indent=2)
+        json.dump(manifest, file, ensure_ascii=False, indent=2)
 
 
 def default_project_path(workspace_dir: str | Path) -> Path:
     return Path(workspace_dir) / f"project{PROJECT_SUFFIX}"
+
+
+def project_bundle_dir(project_path: str | Path) -> Path:
+    path = Path(project_path)
+    return path.parent / f"{path.name}{PROJECT_BUNDLE_SUFFIX}"
+
+
+def _project_manifest(project: ProjectData, project_path: Path) -> dict[str, Any]:
+    bundle_dir = project_bundle_dir(project_path)
+    return {
+        "file_format": "GameDesigner.GDC",
+        "schema_version": 1,
+        "name": project.name,
+        "source_dir": project.source_dir,
+        "output_dir": project.output_dir,
+        "copy_link_docs_to_source": project.copy_link_docs_to_source,
+        "root_canvas_id": project.root_canvas_id,
+        "storage": {
+            "mode": "split_bundle",
+            "bundle": bundle_dir.name,
+            "canvases_dir": CANVASES_DIR,
+            "templates": TEMPLATES_FILE,
+        },
+        "canvas_refs": [
+            {
+                "id": canvas.id,
+                "name": canvas.name,
+                "path": f"{CANVASES_DIR}/{_safe_path_name(canvas.id)}.json",
+            }
+            for canvas in project.canvases
+        ],
+    }
+
+
+def _hydrate_split_project(project_path: Path, raw: dict[str, Any]) -> dict[str, Any]:
+    storage = raw.get("storage")
+    if not isinstance(storage, dict) or storage.get("mode") != "split_bundle":
+        return raw
+    bundle_name = str(storage.get("bundle") or f"{project_path.name}{PROJECT_BUNDLE_SUFFIX}")
+    bundle_dir = project_path.parent / bundle_name
+    canvases: list[dict[str, Any]] = []
+    refs = raw.get("canvas_refs", [])
+    if isinstance(refs, list):
+        for item in refs:
+            if not isinstance(item, dict):
+                continue
+            relative = str(item.get("path") or "")
+            if not relative:
+                continue
+            canvas_path = bundle_dir / relative
+            try:
+                with canvas_path.open("r", encoding="utf-8") as file:
+                    canvas_raw = json.load(file)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(canvas_raw, dict):
+                canvases.append(canvas_raw)
+    templates: list[dict[str, Any]] = []
+    templates_ref = str(storage.get("templates") or TEMPLATES_FILE)
+    try:
+        with (bundle_dir / templates_ref).open("r", encoding="utf-8") as file:
+            templates_raw = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        templates_raw = []
+    if isinstance(templates_raw, list):
+        templates = [item for item in templates_raw if isinstance(item, dict)]
+    hydrated = dict(raw)
+    hydrated["canvases"] = canvases
+    hydrated["templates"] = templates
+    return hydrated
+
+
+def _remove_stale_canvas_files(canvases_dir: Path, expected_names: set[str]) -> None:
+    for path in canvases_dir.glob("*.json"):
+        if path.name not in expected_names:
+            path.unlink(missing_ok=True)
+
+
+def _safe_path_name(name: str) -> str:
+    cleaned = "".join("_" if char in '\\/:*?"<>|' else char for char in name.strip())
+    return cleaned or "item"

@@ -251,4 +251,19 @@ def stylesheet(name: str) -> str:
         image: none;
         width: 0;
     }}
+    QWidget#canvasNav {{
+        background: {colors["panel"]};
+        border: 1px solid {colors["hairline"]};
+        border-radius: 10px;
+    }}
+    QToolButton#canvasNavButton {{
+        background: transparent;
+        color: {colors["text"]};
+        border: 0;
+        border-radius: 7px;
+        padding: 4px 9px;
+    }}
+    QToolButton#canvasNavButton:hover {{
+        background: {colors["control_hover"]};
+    }}
     """

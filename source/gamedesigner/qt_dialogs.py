@@ -12,6 +12,7 @@ from PySide6.QtGui import (
     QPixmap,
 )
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -38,7 +39,7 @@ from PySide6.QtWidgets import (
     QColorDialog,
 )
 
-from .models import DEFAULT_NODE_COLOR, FIELD_EXPORT_PROPS, FIELD_TYPES, Node, NodeField, NodeTemplate, new_id
+from .models import DEFAULT_NODE_COLOR, FIELD_EXPORT_PROPS, FIELD_TYPES, NODE_TYPES, Node, NodeField, NodeTemplate, new_id
 from .qt_theme import palette
 
 
@@ -51,6 +52,25 @@ def _safe_color(value: str, fallback: str) -> QColor:
     return color if color.isValid() else QColor(fallback)
 
 
+def _field_text_flags(field: NodeField) -> Qt.AlignmentFlag:
+    h_flags = {
+        "left": Qt.AlignLeft,
+        "center": Qt.AlignHCenter,
+        "right": Qt.AlignRight,
+    }
+    v_flags = {
+        "top": Qt.AlignTop,
+        "center": Qt.AlignVCenter,
+        "bottom": Qt.AlignBottom,
+    }
+    return (
+        Qt.TextWordWrap
+        | Qt.TextWrapAnywhere
+        | h_flags.get(field.text_h_align, Qt.AlignLeft)
+        | v_flags.get(field.text_v_align, Qt.AlignTop)
+    )
+
+
 class ProjectSettingsDialog(QDialog):
     def __init__(
         self,
@@ -59,15 +79,18 @@ class ProjectSettingsDialog(QDialog):
         project_name: str,
         source_dir: str,
         output_dir: str,
+        copy_link_docs_to_source: bool = False,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setModal(True)
-        self.result_data: dict[str, str] | None = None
+        self.result_data: dict[str, object] | None = None
 
         self.name_edit = QLineEdit(project_name)
         self.source_edit = QLineEdit(source_dir)
         self.output_edit = QLineEdit(output_dir)
+        self.link_copy_check = QCheckBox("超链接文件在输入目录保留复制本")
+        self.link_copy_check.setChecked(copy_link_docs_to_source)
 
         source_button = QPushButton("浏览")
         source_button.clicked.connect(self._pick_source)
@@ -79,6 +102,7 @@ class ProjectSettingsDialog(QDialog):
         form.addRow("项目名称", self.name_edit)
         form.addRow("项目源目录", self._path_row(self.source_edit, source_button))
         form.addRow("输出目录", self._path_row(self.output_edit, output_button))
+        form.addRow("", self.link_copy_check)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Ok).setText("确定")
@@ -91,7 +115,7 @@ class ProjectSettingsDialog(QDialog):
         layout.setSpacing(16)
         layout.addLayout(form)
         layout.addWidget(buttons)
-        self.resize(620, 180)
+        self.resize(620, 210)
 
     def _path_row(self, edit: QLineEdit, button: QPushButton) -> QWidget:
         row = QWidget()
@@ -132,7 +156,12 @@ class ProjectSettingsDialog(QDialog):
         if not output:
             QMessageBox.warning(self, "输出目录不能为空", "请选择输出目录。")
             return
-        self.result_data = {"name": name, "source_dir": source, "output_dir": output}
+        self.result_data = {
+            "name": name,
+            "source_dir": source,
+            "output_dir": output,
+            "copy_link_docs_to_source": self.link_copy_check.isChecked(),
+        }
         self.accept()
 
 
@@ -240,7 +269,7 @@ class EditorFieldItem(QGraphicsObject):
             font = painter.font()
             font.setPointSize(max(8, min(48, self.field.font_size)))
             painter.setFont(font)
-            painter.drawText(rect.adjusted(10, 9, -10, -9), Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignTop, text)
+            painter.drawText(rect.adjusted(10, 9, -10, -9), _field_text_flags(self.field), text)
 
         if self.isSelected():
             painter.setPen(QPen(QColor(colors["blue"]), 1.4))
@@ -473,6 +502,10 @@ class NodeEditorDialog(QDialog):
         self._y = node.y
         self._width = node.width
         self._height = node.height
+        self._canvas_id = node.canvas_id
+        self._link_path = node.link_path
+        self._link_format = node.link_format
+        self._order = node.order
         self.fields = [copy.deepcopy(field) for field in node.fields]
         self.templates = [copy.deepcopy(template) for template in templates] if templates is not None else None
         self.templates_result: list[NodeTemplate] | None = None
@@ -481,6 +514,9 @@ class NodeEditorDialog(QDialog):
         self._updating = False
 
         self.title_edit = QLineEdit(node.title)
+        self.node_type = QComboBox()
+        self.node_type.addItems(NODE_TYPES)
+        self.node_type.setCurrentText(node.node_type if node.node_type in NODE_TYPES else "普通")
         self.icon_edit = QLineEdit(node.icon)
         self.color_edit = QLineEdit(node.color or DEFAULT_NODE_COLOR)
 
@@ -488,6 +524,7 @@ class NodeEditorDialog(QDialog):
         self.field_type = QComboBox()
         self.field_type.addItems(FIELD_TYPES)
         self.field_value = QPlainTextEdit()
+        self.field_value.setFixedHeight(86)
         self.image_path = QLineEdit()
         self.image_button: QPushButton | None = None
         self.field_x = QLineEdit()
@@ -497,6 +534,14 @@ class NodeEditorDialog(QDialog):
         self.font_size = QLineEdit()
         self.text_color = QLineEdit()
         self.bg_color = QLineEdit()
+        self.h_align = QComboBox()
+        self.h_align.addItem("左", "left")
+        self.h_align.addItem("居中", "center")
+        self.h_align.addItem("右", "right")
+        self.v_align = QComboBox()
+        self.v_align.addItem("上", "top")
+        self.v_align.addItem("居中", "center")
+        self.v_align.addItem("下", "bottom")
         self.pin_buttons: dict[str, QToolButton] = {}
 
         self.canvas = FieldCanvas(self.fields, theme)
@@ -535,24 +580,30 @@ class NodeEditorDialog(QDialog):
         card_box = QGroupBox("节点卡牌")
         card_form = QFormLayout(card_box)
         card_form.addRow("名称", self.title_edit)
+        card_form.addRow("类型", self.node_type)
         card_form.addRow("图标", self.icon_edit)
         card_form.addRow("颜色", self._color_row(self.color_edit, self._pick_node_color))
 
         template_tools = self._template_tools()
 
         props = QGroupBox("选中卡片属性")
-        props_form = QFormLayout(props)
-        props_form.addRow("字段", self._pin_row("name", self.field_name))
-        props_form.addRow("类型", self._pin_row("data_type", self.field_type))
-        props_form.addRow("内容", self._pin_row("value", self.field_value))
-        props_form.addRow("图片", self._pin_row("image_path", self._path_row(self.image_path, "选择图片", self._pick_image)))
-        props_form.addRow("X", self._pin_row("x", self.field_x))
-        props_form.addRow("Y", self._pin_row("y", self.field_y))
-        props_form.addRow("宽", self._pin_row("width", self.field_w))
-        props_form.addRow("高", self._pin_row("height", self.field_h))
-        props_form.addRow("字号", self._pin_row("font_size", self.font_size))
-        props_form.addRow("文字色", self._pin_row("text_color", self._color_row(self.text_color, self._pick_text_color)))
-        props_form.addRow("背景色", self._pin_row("bg_color", self._color_row(self.bg_color, self._pick_bg_color)))
+        props_layout = QVBoxLayout(props)
+        props_layout.setContentsMargins(14, 16, 14, 12)
+        props_layout.setSpacing(7)
+        self.content_label = QLabel("内容")
+        self.image_label = QLabel("图片")
+        self.image_row = self._path_row(self.image_path, "选择图片", self._pick_image)
+        props_layout.addWidget(self._labeled_row("字段", self.field_name))
+        props_layout.addWidget(self._labeled_row("类型", self.field_type))
+        self.content_row = self._labeled_row(self.content_label, self.field_value)
+        self.image_picker_row = self._labeled_row(self.image_label, self.image_row)
+        props_layout.addWidget(self.content_row)
+        props_layout.addWidget(self.image_picker_row)
+        props_layout.addWidget(self._geometry_row())
+        props_layout.addWidget(self._font_row())
+        props_layout.addWidget(self._alignment_row())
+        props_layout.addWidget(self._background_row())
+        props_layout.addStretch(1)
 
         if template_tools:
             layout.addWidget(template_tools)
@@ -602,6 +653,17 @@ class NodeEditorDialog(QDialog):
             action.setData(template.id)
             action.triggered.connect(lambda _checked=False, template_id=template.id: self._import_template(template_id))
 
+    def _labeled_row(self, label: str | QLabel, editor: QWidget) -> QWidget:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        label_widget = label if isinstance(label, QLabel) else QLabel(label)
+        label_widget.setFixedWidth(38)
+        layout.addWidget(label_widget)
+        layout.addWidget(editor, 1)
+        return row
+
     def _path_row(self, edit: QLineEdit, label: str, slot) -> QWidget:
         row = QWidget()
         layout = QHBoxLayout(row)
@@ -613,21 +675,88 @@ class NodeEditorDialog(QDialog):
         layout.addWidget(button)
         return row
 
+    def _geometry_row(self) -> QWidget:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        for prop, label, editor in (
+            ("x", "X", self.field_x),
+            ("y", "Y", self.field_y),
+            ("width", "宽", self.field_w),
+            ("height", "高", self.field_h),
+        ):
+            layout.addWidget(self._compact_pin_input(prop, label, editor, 44))
+        return row
+
+    def _font_row(self) -> QWidget:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        layout.addWidget(self._compact_pin_input("font_size", "字号", self.font_size, 44))
+        layout.addWidget(self._compact_color_input("text_color", "字色", self.text_color, self._pick_text_color), 1)
+        return row
+
+    def _alignment_row(self) -> QWidget:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        layout.addWidget(QLabel("横向"))
+        layout.addWidget(self.h_align, 1)
+        layout.addWidget(QLabel("纵向"))
+        layout.addWidget(self.v_align, 1)
+        return row
+
+    def _background_row(self) -> QWidget:
+        return self._compact_color_input("bg_color", "背景色", self.bg_color, self._pick_bg_color)
+
+    def _compact_pin_input(self, prop: str, label: str, editor: QLineEdit, width: int) -> QWidget:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        name = QLabel(label)
+        editor.setAlignment(Qt.AlignCenter)
+        editor.setFixedWidth(width)
+        layout.addWidget(name)
+        layout.addWidget(editor)
+        layout.addWidget(self._pin_button(prop, 20))
+        return row
+
+    def _compact_color_input(self, prop: str, label: str, edit: QLineEdit, slot) -> QWidget:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        button = QPushButton("选")
+        button.setFixedWidth(32)
+        button.clicked.connect(slot)
+        layout.addWidget(QLabel(label))
+        layout.addWidget(edit, 1)
+        layout.addWidget(button)
+        layout.addWidget(self._pin_button(prop, 20))
+        return row
+
+    def _pin_button(self, prop: str, size: int = 26) -> QToolButton:
+        pin = QToolButton()
+        pin.setObjectName("exportPinButton")
+        pin.setText("📌")
+        pin.setCheckable(True)
+        pin.setToolTip("导出所有画布 CSV 时包含此属性")
+        pin.setFixedSize(size, size)
+        pin.toggled.connect(lambda checked, prop=prop: self._set_export_prop(prop, checked))
+        self.pin_buttons[prop] = pin
+        return pin
+
     def _pin_row(self, prop: str, editor: QWidget) -> QWidget:
         row = QWidget()
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
         layout.addWidget(editor, 1)
-        pin = QToolButton(row)
-        pin.setObjectName("exportPinButton")
-        pin.setText("📌")
-        pin.setCheckable(True)
-        pin.setToolTip("导出游戏 CSV 时包含此属性")
-        pin.setFixedSize(26, 26)
-        pin.toggled.connect(lambda checked, prop=prop: self._set_export_prop(prop, checked))
-        self.pin_buttons[prop] = pin
-        layout.addWidget(pin)
+        layout.addWidget(self._pin_button(prop))
         return row
 
     def _color_row(self, edit: QLineEdit, slot) -> QWidget:
@@ -657,6 +786,8 @@ class NodeEditorDialog(QDialog):
         ):
             widget.textChanged.connect(self._apply_props)
         self.field_type.currentTextChanged.connect(self._on_field_type_changed)
+        self.h_align.currentIndexChanged.connect(self._apply_props)
+        self.v_align.currentIndexChanged.connect(self._apply_props)
         self.field_value.textChanged.connect(self._apply_props)
 
     def _ensure_visual_layout(self) -> None:
@@ -681,6 +812,10 @@ class NodeEditorDialog(QDialog):
             return None
         return self.fields[index]
 
+    def _set_combo_data(self, combo: QComboBox, value: str) -> None:
+        index = combo.findData(value)
+        combo.setCurrentIndex(index if index >= 0 else 0)
+
     def _load_selected_props(self, index: int) -> None:
         self._updating = True
         self.canvas.selected_index = index if 0 <= index < len(self.fields) else None
@@ -699,6 +834,8 @@ class NodeEditorDialog(QDialog):
             ):
                 widget.clear()
             self.field_value.setPlainText("")
+            self._set_combo_data(self.h_align, "left")
+            self._set_combo_data(self.v_align, "top")
             self._updating = False
             self._update_type_controls()
             self._update_pin_controls()
@@ -714,15 +851,22 @@ class NodeEditorDialog(QDialog):
         self.font_size.setText(str(field.font_size))
         self.text_color.setText(field.text_color)
         self.bg_color.setText(field.bg_color)
+        self._set_combo_data(self.h_align, field.text_h_align)
+        self._set_combo_data(self.v_align, field.text_v_align)
         self._updating = False
         self._update_type_controls()
         self._update_pin_controls()
 
     def _on_field_type_changed(self, _text: str) -> None:
-        if self.field_type.currentText() == "图片" and self.field_value.toPlainText():
+        is_image = self.field_type.currentText() == "图片"
+        if is_image and self.field_value.toPlainText():
             self.field_value.blockSignals(True)
             self.field_value.setPlainText("")
             self.field_value.blockSignals(False)
+        if not is_image and self.image_path.text():
+            self.image_path.blockSignals(True)
+            self.image_path.clear()
+            self.image_path.blockSignals(False)
         self._apply_props()
         field = self._selected_field()
         if field:
@@ -733,16 +877,17 @@ class NodeEditorDialog(QDialog):
     def _update_type_controls(self) -> None:
         has_field = self._selected_field() is not None
         is_image = has_field and self.field_type.currentText() == "图片"
-        self.field_value.setEnabled(has_field and not is_image)
-        self.image_path.setEnabled(is_image)
+        show_content = has_field and not is_image
+        show_image = has_field and is_image
+        self.content_row.setVisible(show_content)
+        self.field_value.setVisible(show_content)
+        self.image_picker_row.setVisible(show_image)
+        self.field_value.setEnabled(show_content)
+        self.image_path.setEnabled(show_image)
+        self.h_align.setEnabled(has_field)
+        self.v_align.setEnabled(has_field)
         if self.image_button:
-            self.image_button.setEnabled(is_image)
-        value_pin = self.pin_buttons.get("value")
-        if value_pin:
-            value_pin.setEnabled(has_field and not is_image)
-        image_pin = self.pin_buttons.get("image_path")
-        if image_pin:
-            image_pin.setEnabled(is_image)
+            self.image_button.setEnabled(show_image)
 
     def _update_pin_controls(self) -> None:
         field = self._selected_field()
@@ -759,9 +904,6 @@ class NodeEditorDialog(QDialog):
         field = self._selected_field()
         if not field:
             return
-        if (prop == "value" and field.data_type == "图片") or (prop == "image_path" and field.data_type != "图片"):
-            self._update_pin_controls()
-            return
         props = [item for item in field.export_props if item in FIELD_EXPORT_PROPS]
         if checked and prop not in props:
             props.append(prop)
@@ -771,10 +913,9 @@ class NodeEditorDialog(QDialog):
         self.canvas.refresh(self.canvas.selected_index)
 
     def _normalize_export_props_for_type(self, field: NodeField) -> None:
-        blocked = {"value"} if field.data_type == "图片" else {"image_path"}
         field.export_props = [
             prop for prop in field.export_props
-            if prop in FIELD_EXPORT_PROPS and prop not in blocked
+            if prop in FIELD_EXPORT_PROPS
         ]
 
     def _apply_props(self) -> None:
@@ -786,7 +927,7 @@ class NodeEditorDialog(QDialog):
         field.name = self.field_name.text().strip() or "字段"
         field.data_type = self.field_type.currentText() if self.field_type.currentText() in FIELD_TYPES else "文本"
         field.value = "" if field.data_type == "图片" else self.field_value.toPlainText().strip()
-        field.image_path = self.image_path.text().strip()
+        field.image_path = self.image_path.text().strip() if field.data_type == "图片" else ""
         field.x = self._float_text(self.field_x, field.x)
         field.y = self._float_text(self.field_y, field.y)
         field.width = max(44.0, self._float_text(self.field_w, field.width))
@@ -794,6 +935,8 @@ class NodeEditorDialog(QDialog):
         field.font_size = max(8, min(48, int(self._float_text(self.font_size, field.font_size))))
         field.text_color = self.text_color.text().strip() or "#1D1D1F"
         field.bg_color = self.bg_color.text().strip() or "#FFFFFF"
+        field.text_h_align = str(self.h_align.currentData() or "left")
+        field.text_v_align = str(self.v_align.currentData() or "top")
         self._normalize_export_props_for_type(field)
         self.canvas.refresh(self.canvas.selected_index)
 
@@ -955,6 +1098,11 @@ class NodeEditorDialog(QDialog):
         self.result = Node(
             id=self._node_id,
             title=title,
+            node_type=self.node_type.currentText() if self.node_type.currentText() in NODE_TYPES else "普通",
+            canvas_id=self._canvas_id if self.node_type.currentText() == "画布" else "",
+            link_path=self._link_path if self.node_type.currentText() == "超链接" else "",
+            link_format=self._link_format if self._link_format in {"md", "txt"} else "md",
+            order=self._order,
             x=self._x,
             y=self._y,
             width=self._width,

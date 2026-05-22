@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
     QMenu,
 )
 
-from .models import Edge, Node, NodeField, ProjectData
+from .models import CanvasData, Edge, Node, NodeField, NodeTemplate, ProjectData
 from .qt_theme import palette
 
 
@@ -60,6 +60,25 @@ def _font(size: int, bold: bool = False) -> QFont:
     return font
 
 
+def _field_text_flags(field: NodeField) -> Qt.AlignmentFlag:
+    h_flags = {
+        "left": Qt.AlignLeft,
+        "center": Qt.AlignHCenter,
+        "right": Qt.AlignRight,
+    }
+    v_flags = {
+        "top": Qt.AlignTop,
+        "center": Qt.AlignVCenter,
+        "bottom": Qt.AlignBottom,
+    }
+    return (
+        Qt.TextWordWrap
+        | Qt.TextWrapAnywhere
+        | h_flags.get(field.text_h_align, Qt.AlignLeft)
+        | v_flags.get(field.text_v_align, Qt.AlignTop)
+    )
+
+
 @dataclass
 class SnapGuide:
     axis: str
@@ -84,7 +103,7 @@ class NodeItem(QGraphicsObject):
         self._sync_size()
         self.setPos(node.x, node.y)
         flags = QGraphicsItem.ItemIsSelectable
-        if not self.view.read_only:
+        if self.view.can_move_nodes():
             flags |= QGraphicsItem.ItemIsMovable | QGraphicsItem.ItemSendsGeometryChanges
         self.setFlags(flags)
         self.setAcceptHoverEvents(True)
@@ -111,6 +130,7 @@ class NodeItem(QGraphicsObject):
         painter.restore()
         painter.setPen(QPen(QColor(colors["node_header_line"]), 1))
         painter.drawLine(QPointF(12, 25), QPointF(rect.width() - 12, 25))
+        self._paint_order_badge(painter, colors, rect)
 
         if zoom < 0.36:
             self._paint_icon_mode(painter, colors, rect, zoom)
@@ -122,14 +142,32 @@ class NodeItem(QGraphicsObject):
         if self.isSelected() or self.view.hover_node_id == self.node.id:
             self._paint_resize_handle(painter, colors, rect)
 
+    def _paint_order_badge(self, painter: QPainter, colors: dict[str, str], rect: QRectF) -> None:
+        if self.node.order <= 0:
+            return
+        text = str(self.node.order)
+        metrics = QFontMetrics(_font(8, True))
+        width = max(22.0, metrics.horizontalAdvance(text) + 12.0)
+        badge = QRectF(rect.right() - width - 10, 4, width, 16)
+        path = QPainterPath()
+        path.addRoundedRect(badge, 8, 8)
+        painter.fillPath(path, QColor(colors["panel_alt"]))
+        painter.setPen(QPen(QColor(colors["hairline"]), 1))
+        painter.drawPath(path)
+        painter.setPen(QColor(colors["text_muted"]))
+        painter.setFont(_font(8, True))
+        painter.drawText(badge, Qt.AlignCenter, text)
+
     def _paint_icon_mode(self, painter: QPainter, colors: dict[str, str], rect: QRectF, zoom: float) -> None:
-        text = (self.node.icon or self.node.title or "节").strip()[:8]
+        fallback = "画" if self.node.node_type == "画布" else "链" if self.node.node_type == "超链接" else self.node.title
+        text = (self.node.icon or fallback or "节").strip()[:8]
         painter.setPen(QColor(colors["accent"]))
         text_rect = rect.adjusted(12, 22, -12, -8)
         self._draw_adaptive_center_text(painter, text_rect, text, zoom, 20, 84)
 
     def _paint_compact_mode(self, painter: QPainter, colors: dict[str, str], rect: QRectF, zoom: float) -> None:
-        icon = (self.node.icon or self.node.title[:1] or "节").strip()[:2]
+        fallback = "画" if self.node.node_type == "画布" else "链" if self.node.node_type == "超链接" else self.node.title[:1]
+        icon = (self.node.icon or fallback or "节").strip()[:2]
         painter.setPen(QColor(colors["accent"]))
         icon_rect = QRectF(18, 28, 58, max(28, rect.height() - 42))
         icon_font_size = self._fit_font_size(icon, icon_rect, int(18 / max(zoom, 0.18)), 12, 52)
@@ -141,14 +179,22 @@ class NodeItem(QGraphicsObject):
         self._draw_adaptive_center_text(painter, title_rect, self.node.title, zoom, 13, 42)
 
     def _paint_detail_mode(self, painter: QPainter, colors: dict[str, str], rect: QRectF) -> None:
-        title = f"{self.node.icon}  {self.node.title}" if self.node.icon else self.node.title
+        icon = self.node.icon or ("画" if self.node.node_type == "画布" else "链" if self.node.node_type == "超链接" else "")
+        title = f"{icon}  {self.node.title}" if icon else self.node.title
         painter.setPen(QColor(colors["node_text"]))
         title_font = _font(12, True)
         painter.setFont(title_font)
         painter.drawText(QRectF(18, 28, rect.width() - 92, 22), Qt.AlignLeft | Qt.AlignVCenter, title)
         painter.setPen(QColor(colors["node_muted"]))
         painter.setFont(_font(8))
-        painter.drawText(QRectF(rect.width() - 72, 30, 54, 18), Qt.AlignRight | Qt.AlignVCenter, f"{len(self.node.fields)} 项")
+        meta = (
+            "画布"
+            if self.node.node_type == "画布"
+            else self.node.link_format.upper()
+            if self.node.node_type == "超链接"
+            else f"{len(self.node.fields)} 项"
+        )
+        painter.drawText(QRectF(rect.width() - 72, 30, 54, 18), Qt.AlignRight | Qt.AlignVCenter, meta)
 
         if not self.node.fields:
             painter.setPen(QColor(colors["node_muted"]))
@@ -239,7 +285,7 @@ class NodeItem(QGraphicsObject):
             painter.setPen(QColor(field.text_color or colors["node_text"]))
             font = _font(max(8, min(48, int(field.font_size * min(scale_x, scale_y)))))
             painter.setFont(font)
-            painter.drawText(card.adjusted(9, 8, -9, -8), Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, text)
+            painter.drawText(card.adjusted(9, 8, -9, -8), _field_text_flags(field), text)
 
     def _paint_resize_handle(self, painter: QPainter, colors: dict[str, str], rect: QRectF) -> None:
         painter.setPen(QPen(QColor(colors["blue"]), 1.4))
@@ -285,7 +331,7 @@ class NodeItem(QGraphicsObject):
 
     def hoverMoveEvent(self, event) -> None:  # type: ignore[override]
         if self.view.read_only:
-            self.setCursor(Qt.PointingHandCursor)
+            self.setCursor(Qt.OpenHandCursor if self.view.allow_node_drag else Qt.PointingHandCursor)
             super().hoverMoveEvent(event)
             return
         self.view.hover_node_id = self.node.id if self._on_resize_handle(event.pos()) else None
@@ -302,13 +348,13 @@ class NodeItem(QGraphicsObject):
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         if event.button() == Qt.LeftButton:
             self.view.select_node(self.node.id)
-            if self.view.read_only:
+            if self.view.read_only and not self.view.allow_node_drag:
                 self.setCursor(Qt.PointingHandCursor)
                 event.accept()
                 return
             self._pressed_pos = event.scenePos()
             self._moved = False
-            if self._on_resize_handle(event.pos()):
+            if not self.view.read_only and self._on_resize_handle(event.pos()):
                 self._resizing = True
                 self._resize_origin = event.scenePos()
                 self._resize_size = (self.width, self.height)
@@ -589,6 +635,7 @@ class NodeGraphView(QGraphicsView):
     selectionChanged = Signal(object, object)
     projectChanged = Signal()
     nodeActivated = Signal(str)
+    nodeFolderRequested = Signal(str)
     nodeEditRequested = Signal(str)
     nodeDeleteRequested = Signal(str)
     edgeEditRequested = Signal(str)
@@ -596,15 +643,27 @@ class NodeGraphView(QGraphicsView):
     edgeStyleRequested = Signal(str, str)
     edgeCreated = Signal(str, str)
     createNodeRequested = Signal(float, float)
+    createCanvasNodeRequested = Signal(float, float)
+    createLinkNodeRequested = Signal(float, float, str)
     createTemplateNodeRequested = Signal(float, float, str)
     templateManagerRequested = Signal()
     openProjectRequested = Signal()
 
-    def __init__(self, project: ProjectData, theme: str = "dark", read_only: bool = False) -> None:
+    def __init__(
+        self,
+        project: ProjectData | CanvasData,
+        theme: str = "dark",
+        read_only: bool = False,
+        allow_node_drag: bool = False,
+        templates: list[NodeTemplate] | None = None,
+    ) -> None:
         super().__init__()
         self.project = project
+        self.templates = templates if templates is not None else getattr(project, "templates", [])
+        self.folder_action_node_ids: set[str] = set()
         self.theme = theme
         self.read_only = read_only
+        self.allow_node_drag = allow_node_drag
         self.scene_obj = QGraphicsScene(self)
         self.setScene(self.scene_obj)
         self.node_items: dict[str, NodeItem] = {}
@@ -636,6 +695,9 @@ class NodeGraphView(QGraphicsView):
         if app:
             app.installEventFilter(self)
         self.rebuild()
+
+    def can_move_nodes(self) -> bool:
+        return not self.read_only or self.allow_node_drag
 
     def eventFilter(self, _watched, event) -> bool:  # type: ignore[override]
         if event.type() in (QEvent.ApplicationDeactivate, QEvent.WindowDeactivate):
@@ -707,10 +769,16 @@ class NodeGraphView(QGraphicsView):
             item.update()
         self.viewport().update()
 
-    def set_project(self, project: ProjectData) -> None:
+    def set_project(self, project: ProjectData | CanvasData) -> None:
         self.project = project
         self.clear_selection()
         self.rebuild()
+
+    def set_folder_action_node_ids(self, node_ids: set[str]) -> None:
+        self.folder_action_node_ids = set(node_ids)
+
+    def set_templates(self, templates: list[NodeTemplate]) -> None:
+        self.templates = templates
 
     def rebuild(self) -> None:
         self.rebuilding = True
@@ -1010,9 +1078,14 @@ class NodeGraphView(QGraphicsView):
         if self.read_only:
             if node:
                 open_action = menu.addAction("打开")
+                open_folder_action = None
+                if node.node.id in self.folder_action_node_ids:
+                    open_folder_action = menu.addAction("打开项目所在文件夹")
                 action = menu.exec(event.globalPos())
                 if action == open_action:
                     self.nodeActivated.emit(node.node.id)
+                elif open_folder_action and action == open_folder_action:
+                    self.nodeFolderRequested.emit(node.node.id)
                 return
             create = menu.addAction("新建项目")
             open_project = menu.addAction("打开项目...")
@@ -1027,12 +1100,22 @@ class NodeGraphView(QGraphicsView):
                 self.reset_view()
             return
         if node:
+            open_canvas = None
+            open_link = None
+            if node.node.node_type == "画布":
+                open_canvas = menu.addAction("打开画布")
+            elif node.node.node_type == "超链接":
+                open_link = menu.addAction("打开文档")
             edit = menu.addAction("编辑节点")
             connect = menu.addAction("连接")
             menu.addSeparator()
             delete = menu.addAction("删除节点")
             action = menu.exec(event.globalPos())
-            if action == edit:
+            if open_canvas and action == open_canvas:
+                self.nodeActivated.emit(node.node.id)
+            elif open_link and action == open_link:
+                self.nodeActivated.emit(node.node.id)
+            elif action == edit:
                 self.nodeEditRequested.emit(node.node.id)
             elif action == connect:
                 self.start_connection(node.node.id)
@@ -1066,9 +1149,13 @@ class NodeGraphView(QGraphicsView):
             return
 
         create = menu.addAction("创建节点")
+        create_canvas = menu.addAction("创建画布节点")
+        link_menu = menu.addMenu("创建超链接")
+        create_md = link_menu.addAction("Markdown (.md)")
+        create_txt = link_menu.addAction("文本 (.txt)")
         template_menu = menu.addMenu("按模板创建")
-        if self.project.templates:
-            for template in self.project.templates:
+        if self.templates:
+            for template in self.templates:
                 action = QAction(template.name, template_menu)
                 action.setData(template.id)
                 template_menu.addAction(action)
@@ -1085,6 +1172,12 @@ class NodeGraphView(QGraphicsView):
         action = menu.exec(event.globalPos())
         if action == create:
             self.createNodeRequested.emit(scene_pos.x(), scene_pos.y())
+        elif action == create_canvas:
+            self.createCanvasNodeRequested.emit(scene_pos.x(), scene_pos.y())
+        elif action == create_md:
+            self.createLinkNodeRequested.emit(scene_pos.x(), scene_pos.y(), "md")
+        elif action == create_txt:
+            self.createLinkNodeRequested.emit(scene_pos.x(), scene_pos.y(), "txt")
         elif action == template_manager:
             self.templateManagerRequested.emit()
         elif action == reset:

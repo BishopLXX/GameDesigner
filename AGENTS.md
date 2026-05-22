@@ -17,3 +17,11 @@
 - Edge right-click exposes edge-specific actions only.
 - In the node editor, blank preview-area right-click adds sub-cards, and selected sub-card right-click exposes sub-card actions.
 - Keyboard shortcuts should remain available, but visible UI should stay compact.
+
+## Project Structure
+
+- Do not grow the project into one giant file. New features should be split into focused modules or subfolders by responsibility.
+- The `.gdc` file is a project manifest, not a dumping ground for every canvas, template, and document body.
+- Project-owned data that can grow large belongs in the adjacent `.gdc.files` folder, with clear subfolders such as `canvases/`, `linked_docs/`, and focused JSON/text files.
+- UI dialogs that are not core window orchestration should live outside `app.py`; prefer dedicated modules under `ui/`.
+- File and persistence helpers should live outside UI code; prefer dedicated modules under `project_files/` or storage-focused modules.

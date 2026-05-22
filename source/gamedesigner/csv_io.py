@@ -6,7 +6,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from .models import FIELD_EXPORT_PROPS, Node, NodeField, ProjectData
+from .models import FIELD_EXPORT_PROPS, CanvasData, Node, NodeField, ProjectData
+
+
+CSV_SORT_MODES = {"created", "x", "y"}
 
 
 BASE_COLUMNS = [
@@ -15,10 +18,6 @@ BASE_COLUMNS = [
 ]
 
 PROP_LABELS = {
-    "name": "字段",
-    "data_type": "类型",
-    "value": "内容",
-    "image_path": "图片",
     "x": "X",
     "y": "Y",
     "width": "宽",
@@ -29,10 +28,6 @@ PROP_LABELS = {
 }
 
 PROP_TYPES = {
-    "name": "文本",
-    "data_type": "文本",
-    "value": "文本",
-    "image_path": "资源路径",
     "x": "数字",
     "y": "数字",
     "width": "数字",
@@ -50,23 +45,55 @@ class Column:
     getter: Callable[[Node], str]
 
 
-def export_game_csv(project: ProjectData, target: str | Path) -> Path:
+def export_game_csv(
+    project: ProjectData,
+    target: str | Path,
+    canvas: CanvasData | None = None,
+    sort_mode: str = "created",
+) -> Path:
     path = Path(target)
     if path.suffix.lower() != ".csv":
         path = path / f"{_safe_filename(project.name)}.csv"
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    columns = _build_columns(project)
+    project.ensure_canvas_structure()
+    source_canvas = canvas or project.root_canvas()
+    return _write_canvas_csv(path, source_canvas, sort_mode)
+
+
+def export_all_canvas_csv(
+    project: ProjectData,
+    target: str | Path,
+    sort_mode: str = "created",
+) -> list[Path]:
+    project.ensure_canvas_structure()
+    folder = Path(target)
+    if folder.suffix.lower() == ".csv":
+        folder = folder.parent
+    folder.mkdir(parents=True, exist_ok=True)
+
+    used_names: dict[str, int] = {}
+    paths: list[Path] = []
+    for canvas in project.canvases:
+        path = folder / _canvas_csv_filename(project, canvas, used_names)
+        paths.append(_write_canvas_csv(path, canvas, sort_mode))
+    return paths
+
+
+def _write_canvas_csv(path: Path, source_canvas: CanvasData, sort_mode: str) -> Path:
+    source_canvas.normalize_node_order()
+    nodes = _sorted_nodes(source_canvas.nodes, sort_mode)
+    columns = _build_columns(nodes)
     with path.open("w", encoding="utf-8-sig", newline="") as file:
         writer = csv.writer(file)
         writer.writerow([column.header for column in columns])
         writer.writerow([column.data_type for column in columns])
-        for node in project.nodes:
+        for node in nodes:
             writer.writerow([column.getter(node) for column in columns])
     return path
 
 
-def _build_columns(project: ProjectData) -> list[Column]:
+def _build_columns(nodes: list[Node]) -> list[Column]:
     columns = [
         Column(header, data_type, getter)
         for header, data_type, getter in BASE_COLUMNS
@@ -74,7 +101,7 @@ def _build_columns(project: ProjectData) -> list[Column]:
 
     field_columns: dict[str, tuple[str, str]] = {}
     pinned_columns: dict[tuple[str, str], str] = {}
-    for node in project.nodes:
+    for node in nodes:
         for key, field in _field_keys(node):
             field_columns.setdefault(key, (field.name or "字段", field.data_type))
             for prop in field.export_props:
@@ -100,6 +127,15 @@ def _build_columns(project: ProjectData) -> list[Column]:
         )
 
     return columns
+
+
+def _sorted_nodes(nodes: list[Node], sort_mode: str) -> list[Node]:
+    mode = sort_mode if sort_mode in CSV_SORT_MODES else "created"
+    if mode == "x":
+        return sorted(nodes, key=lambda node: (node.x, node.y, node.order))
+    if mode == "y":
+        return sorted(nodes, key=lambda node: (node.y, node.x, node.order))
+    return sorted(nodes, key=lambda node: (node.order, node.x, node.y))
 
 
 def _field_keys(node: Node) -> list[tuple[str, NodeField]]:
@@ -131,14 +167,6 @@ def _field_value(field: NodeField | None) -> str:
 def _property_value(field: NodeField | None, prop: str) -> str:
     if not field:
         return ""
-    if prop == "name":
-        return field.name
-    if prop == "data_type":
-        return field.data_type
-    if prop == "value":
-        return _field_value(field)
-    if prop == "image_path":
-        return field.image_path
     if prop == "x":
         return _format_number(field.x)
     if prop == "y":
@@ -157,7 +185,7 @@ def _property_value(field: NodeField | None, prop: str) -> str:
 
 
 def _field_type_for_csv(data_type: str) -> str:
-    return "图片" if data_type == "图片" else data_type or "文本"
+    return data_type or "文本"
 
 
 def _unique_header(columns: list[Column], header: str) -> str:
@@ -172,6 +200,18 @@ def _unique_header(columns: list[Column], header: str) -> str:
 
 def _format_number(value: float) -> str:
     return str(int(value)) if float(value).is_integer() else f"{value:g}"
+
+
+def _canvas_csv_filename(
+    project: ProjectData,
+    canvas: CanvasData,
+    used_names: dict[str, int],
+) -> str:
+    base = f"{_safe_filename(project.name)}__{_safe_filename(canvas.name)}"
+    used_names[base] = used_names.get(base, 0) + 1
+    if used_names[base] > 1:
+        base = f"{base}_{used_names[base]}"
+    return f"{base}.csv"
 
 
 def _safe_filename(name: str) -> str:
