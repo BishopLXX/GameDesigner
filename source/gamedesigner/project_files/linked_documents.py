@@ -20,6 +20,40 @@ def create_link_document(project_path: str | Path, title: str, file_format: str)
     return f"{LINKED_DOCS_DIR}/{path.name}"
 
 
+def ensure_link_document(project_path: str | Path, relative_path: str, title: str, file_format: str) -> str:
+    if not relative_path:
+        return create_link_document(project_path, title, file_format)
+
+    path = resolve_link_document(project_path, relative_path)
+    extension = _normalized_format(path.suffix.lstrip(".") or Path(relative_path).suffix.lstrip(".") or file_format)
+    if not path.suffix:
+        path = path.with_suffix(f".{extension}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.write_text(_default_content(title, extension), encoding="utf-8")
+    return _relative_link_path(project_path, path)
+
+
+def import_link_document(project_path: str | Path, source_path: str | Path, title: str = "") -> str:
+    source = Path(source_path)
+    if not source.exists() or not source.is_file():
+        raise FileNotFoundError(source)
+
+    folder = linked_documents_dir(project_path)
+    folder.mkdir(parents=True, exist_ok=True)
+    try:
+        relative = source.resolve().relative_to(folder.resolve())
+        return f"{LINKED_DOCS_DIR}/{relative.as_posix()}"
+    except ValueError:
+        pass
+
+    extension = _normalized_format(source.suffix.lstrip("."))
+    base_name = _safe_filename(title) or _safe_filename(source.stem) or "link"
+    target = _unique_path(folder, base_name, extension)
+    shutil.copy2(source, target)
+    return f"{LINKED_DOCS_DIR}/{target.name}"
+
+
 def read_link_document(project_path: str | Path, relative_path: str) -> str:
     path = resolve_link_document(project_path, relative_path)
     if not path.exists():
@@ -119,3 +153,11 @@ def _unique_path(folder: Path, base_name: str, extension: str, current: Path | N
 def _safe_filename(name: str) -> str:
     cleaned = "".join("_" if char in '\\/:*?"<>|' else char for char in name.strip())
     return cleaned or "link"
+
+
+def _relative_link_path(project_path: str | Path, path: Path) -> str:
+    bundle_dir = project_bundle_dir(project_path)
+    try:
+        return path.relative_to(bundle_dir).as_posix()
+    except ValueError:
+        return str(path)

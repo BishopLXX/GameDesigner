@@ -9,6 +9,7 @@ from gamedesigner.project_files.linked_documents import (
     create_link_document,
     delete_link_document,
     delete_link_document_copy,
+    ensure_link_document,
     read_link_document,
     rename_link_document,
     resolve_link_document,
@@ -281,6 +282,22 @@ class DataIoTests(unittest.TestCase):
             self.assertFalse((source_dir / renamed).exists())
             delete_link_document(project_path, renamed)
             self.assertFalse(resolve_link_document(project_path, renamed).exists())
+
+    def test_ensure_link_document_keeps_existing_relative_path(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            tmp_path = Path(folder)
+            project_path = tmp_path / "links.gdc"
+
+            relative = create_link_document(project_path, "原始文档", "md")
+            resolved = resolve_link_document(project_path, relative)
+            resolved.write_text("content", encoding="utf-8")
+
+            ensured = ensure_link_document(project_path, relative, "新标题不会改名", "md")
+
+            self.assertEqual(ensured, relative)
+            self.assertTrue(resolved.exists())
+            self.assertEqual(resolved.read_text(encoding="utf-8"), "content")
+            self.assertFalse((resolved.parent / "新标题不会改名.md").exists())
 
     def test_legacy_resource_path_image_field_migrates_to_image_type(self) -> None:
         field = NodeField.from_dict(

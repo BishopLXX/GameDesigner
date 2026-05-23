@@ -772,7 +772,7 @@ class GameDesignerApp(QMainWindow):
             if node and node.node_type == "画布":
                 self._open_canvas_from_node(page, node)
                 return
-            if node and node.node_type == "超链接":
+            if node and node.node_type == "超文本":
                 self._open_link_document(page, node)
                 return
             self._edit_node(node_id)
@@ -1023,7 +1023,7 @@ class GameDesignerApp(QMainWindow):
                 and page.path
                 and page.path.resolve() == project_path.resolve()
             ):
-                self._open_canvas_page(page.project, page.path, page.project.root_canvas_id)
+                self._reload_project_pages(page.project, page.path)
                 return
         try:
             QApplication.setOverrideCursor(Qt.WaitCursor)
@@ -1039,6 +1039,57 @@ class GameDesignerApp(QMainWindow):
         finally:
             QApplication.restoreOverrideCursor()
             QTimer.singleShot(0, self._sync_current_canvas_cursor)
+
+    def _reload_project_pages(self, project: ProjectData, project_path: Path) -> None:
+        open_pages = self._project_pages(project)
+        current_page = self._current_page()
+        active_canvas_id = current_page.canvas_id if current_page in open_pages else project.root_canvas_id
+        open_canvas_ids = [page.canvas_id for page in open_pages] or [project.root_canvas_id]
+        source_canvas_by_id = {page.canvas_id: page.source_canvas_id for page in open_pages}
+        insert_index = self.tabs.indexOf(open_pages[0]) if open_pages else self.tabs.count()
+
+        for page in reversed(open_pages):
+            index = self.tabs.indexOf(page)
+            if index >= 0:
+                self.tabs.removeTab(index)
+            page.deleteLater()
+        self._project_histories.pop(id(project), None)
+
+        try:
+            project = load_project(project_path)
+            self._ensure_project_dirs(project, project_path)
+            self._sync_settings_from_project(project)
+            self._remember_project(project_path)
+        except Exception as exc:  # noqa: BLE001 - selected by user.
+            QMessageBox.critical(self, "打开失败", f"无法重新加载项目：\n{exc}")
+            return
+
+        self._ensure_project_history(project, False, project.root_canvas_id)
+        reopened: list[ProjectPage] = []
+        for canvas_id in open_canvas_ids:
+            canvas = project.find_canvas(canvas_id) or project.root_canvas()
+            page = ProjectPage(
+                project=project,
+                path=project_path,
+                dirty=False,
+                theme=self.theme,
+                canvas_data=canvas,
+                source_canvas_id=source_canvas_by_id.get(canvas_id, ""),
+            )
+            self._wire_page(page)
+            self.tabs.insertTab(insert_index, page, self._tab_title(page))
+            self._install_tab_close_button(page)
+            reopened.append(page)
+            insert_index += 1
+
+        target_canvas_id = active_canvas_id if project.find_canvas(active_canvas_id) else project.root_canvas_id
+        target_page = next((page for page in reopened if page.canvas_id == target_canvas_id), None)
+        if target_page is None and reopened:
+            target_page = reopened[0]
+        if target_page is not None:
+            self.tabs.setCurrentWidget(target_page)
+        self._update_title()
+        self._update_status()
 
     def _open_canvas_page(
         self,
@@ -1114,22 +1165,24 @@ class GameDesignerApp(QMainWindow):
         from .project_files.linked_documents import (
             create_link_document,
             delete_link_document_copy,
-            rename_link_document,
+            ensure_link_document,
         )
 
-        if node.node_type != "超链接":
+        if node.node_type != "超文本":
             return
         project_path = self._ensure_project_path_for_files(page)
         file_format = node.link_format if node.link_format in {"md", "txt"} else "md"
-        if not node.link_path:
+        existing_path = node.link_path or self._link_path_from_fields(node)
+        if not existing_path:
             node.link_path = create_link_document(project_path, node.title or "新文档", file_format)
         else:
             old_path = node.link_path
-            node.link_path = rename_link_document(project_path, node.link_path, node.title or "新文档")
-            if old_path != node.link_path:
+            node.link_path = ensure_link_document(project_path, existing_path, node.title or "新文档", file_format)
+            if old_path and old_path != node.link_path:
                 delete_link_document_copy(page.project.source_dir, old_path)
         node.link_format = file_format
         node.canvas_id = ""
+        self._normalize_link_node_title(node)
         node.fields = [
             field for field in node.fields
             if not (field.name == "文件" and field.data_type == "资源路径")
@@ -1137,13 +1190,27 @@ class GameDesignerApp(QMainWindow):
         node.fields.append(NodeField("文件", "资源路径", node.link_path))
         self._sync_link_document_copy(page, node)
 
+    def _link_path_from_fields(self, node: Node) -> str:
+        for field in node.fields:
+            if field.name == "文件" and field.data_type == "资源路径" and field.value.strip():
+                return field.value.strip()
+        return ""
+
+    def _normalize_link_node_title(self, node: Node) -> None:
+        if node.node_type != "超文本" or not node.link_path:
+            return
+        raw_title = node.title.strip()
+        normalized_path = node.link_path.replace("\\", "/")
+        if not raw_title or raw_title.replace("\\", "/") == normalized_path:
+            node.title = Path(node.link_path).stem or "新文档"
+
     def _sync_link_document_copy(self, page: ProjectPage, node: Node) -> None:
         from .project_files.linked_documents import sync_link_document_copy
 
         if (
             not page.project.copy_link_docs_to_source
             or not page.path
-            or node.node_type != "超链接"
+            or node.node_type != "超文本"
             or not node.link_path
         ):
             return
@@ -1154,13 +1221,30 @@ class GameDesignerApp(QMainWindow):
 
         for canvas in project.canvases:
             for node in canvas.nodes:
-                if node.node_type == "超链接" and node.link_path:
+                if node.node_type == "超文本" and node.link_path:
                     sync_link_document_copy(project_path, node.link_path, project.source_dir)
+
+    def _ensure_all_link_node_files(self, project: ProjectData, project_path: Path) -> None:
+        temp_page = ProjectPage(
+            project=project,
+            path=project_path,
+            dirty=False,
+            theme=self.theme,
+            canvas_data=project.root_canvas(),
+        )
+        for canvas in project.canvases:
+            for node in canvas.nodes:
+                if node.node_type != "超文本":
+                    continue
+                existing_path = node.link_path or self._link_path_from_fields(node)
+                if existing_path or node.fields or node.title.strip():
+                    self._ensure_link_node_file(temp_page, node)
+        temp_page.deleteLater()
 
     def _delete_link_document_with_copy(self, page: ProjectPage, node: Node) -> None:
         from .project_files.linked_documents import delete_link_document, delete_link_document_copy
 
-        if node.node_type != "超链接" or not node.link_path:
+        if node.node_type != "超文本" or not node.link_path:
             return
         if page.path:
             delete_link_document(page.path, node.link_path)
@@ -1170,20 +1254,33 @@ class GameDesignerApp(QMainWindow):
         from .project_files.linked_documents import delete_link_document_copy
         from .ui.link_document_dialog import LinkDocumentDialog
 
-        if node.node_type != "超链接":
+        if node.node_type != "超文本":
             return
-        try:
-            self._ensure_link_node_file(page, node)
-        except Exception as exc:  # noqa: BLE001 - surface IO errors.
-            QMessageBox.critical(self, "打开失败", f"无法准备超链接文件：\n{exc}")
-            return
-        dialog = LinkDocumentDialog(self, self._ensure_project_path_for_files(page), node.link_path, node.title)
+        dialog = LinkDocumentDialog(
+            self,
+            self._ensure_project_path_for_files(page),
+            node.link_path,
+            node.title,
+            node.link_format,
+        )
         result = dialog.exec()
         if dialog.saved:
+            old_path = node.link_path
+            node.link_path = dialog.relative_path
+            node.link_format = dialog.file_format
+            if old_path and old_path != node.link_path:
+                delete_link_document_copy(page.project.source_dir, old_path)
+            self._normalize_link_node_title(node)
+            node.fields = [
+                field for field in node.fields
+                if not (field.name == "文件" and field.data_type == "资源路径")
+            ]
+            node.fields.append(NodeField("文件", "资源路径", node.link_path))
             self._sync_link_document_copy(page, node)
-            self.status.showMessage(f"已保存超链接文件：{node.link_path}", 3000)
+            self.status.showMessage(f"已保存超文本文件：{node.link_path}", 3000)
         if dialog.deleted and result == LinkDocumentDialog.Accepted:
-            delete_link_document_copy(page.project.source_dir, node.link_path)
+            if node.link_path:
+                delete_link_document_copy(page.project.source_dir, node.link_path)
             page.canvas_data.delete_node(node.id)
             page.canvas.rebuild()
             page.canvas.clear_selection()
@@ -1225,6 +1322,7 @@ class GameDesignerApp(QMainWindow):
             self._ensure_project_dirs(page.project, page.path)
             Path(page.project.source_dir).mkdir(parents=True, exist_ok=True)
             Path(page.project.output_dir).mkdir(parents=True, exist_ok=True)
+            self._ensure_all_link_node_files(page.project, page.path)
             save_project(page.project, page.path)
             if page.project.copy_link_docs_to_source:
                 self._sync_all_link_document_copies(page.project, page.path)
@@ -1379,31 +1477,23 @@ class GameDesignerApp(QMainWindow):
         self._open_canvas_page(page.project, page.path, canvas.id, source_canvas_id=page.canvas_id)
 
     def _add_link_node_at(self, x: float, y: float, file_format: str = "md") -> None:
-        from .project_files.linked_documents import create_link_document
-
         page = self._current_page()
         if not page:
             return
         if page.is_welcome:
             self._new_project()
             return
-        project_path = self._ensure_project_path_for_files(page)
         title = "新文档"
-        try:
-            relative_path = create_link_document(project_path, title, file_format)
-        except Exception as exc:  # noqa: BLE001 - surface IO errors.
-            QMessageBox.critical(self, "创建失败", f"无法创建超链接文件：\n{exc}")
-            return
         node = Node(
             title=title,
-            node_type="超链接",
+            node_type="超文本",
             icon="链",
-            link_path=relative_path,
+            link_path="",
             link_format=file_format if file_format in {"md", "txt"} else "md",
             x=x - 155,
             y=y - 72,
             fields=[
-                NodeField("文件", "资源路径", relative_path),
+                NodeField("文件", "资源路径", ""),
             ],
         )
         node.group_id = page.canvas.group_id_at_scene_pos(QPointF(x, y))
@@ -1482,7 +1572,7 @@ class GameDesignerApp(QMainWindow):
             if node.node_type == "画布":
                 node.canvas_id = ""
                 self._ensure_canvas_node_link(page, node, mark_dirty=False)
-            elif node.node_type == "超链接":
+            elif node.node_type == "超文本":
                 node.link_path = ""
                 node.fields = [
                     field for field in node.fields if not (field.name == "文件" and field.data_type == "资源路径")
@@ -1562,7 +1652,7 @@ class GameDesignerApp(QMainWindow):
         node = page.canvas_data.find_node(node_id)
         if not node:
             return
-        dialog = NodeEditorDialog(self, node, self.theme, page.project.templates)
+        dialog = NodeEditorDialog(self, node, self.theme, page.project.templates, page.path)
         if dialog.exec() != NodeEditorDialog.Accepted or not dialog.result:
             return
         result = dialog.result
@@ -1580,11 +1670,12 @@ class GameDesignerApp(QMainWindow):
         node.link_format = result.link_format
         if node.node_type == "画布":
             self._ensure_canvas_node_link(page, node)
-        elif node.node_type == "超链接":
+        elif node.node_type == "超文本":
             try:
-                self._ensure_link_node_file(page, node)
+                if node.link_path:
+                    self._ensure_link_node_file(page, node)
             except Exception as exc:  # noqa: BLE001 - surface IO errors.
-                QMessageBox.critical(self, "创建失败", f"无法创建超链接文件：\n{exc}")
+                QMessageBox.critical(self, "创建失败", f"无法创建超文本文件：\n{exc}")
                 return
         if dialog.templates_changed and dialog.templates_result is not None:
             page.project.templates = dialog.templates_result
@@ -1685,7 +1776,7 @@ class GameDesignerApp(QMainWindow):
         if not nodes:
             return False
         canvas_nodes = [node for node in nodes if node.node_type == "画布" and node.canvas_id]
-        link_nodes = [node for node in nodes if node.node_type == "超链接" and node.link_path]
+        link_nodes = [node for node in nodes if node.node_type == "超文本" and node.link_path]
         box = QMessageBox(self)
         box.setWindowTitle("删除节点")
         box.setIcon(QMessageBox.Warning if canvas_nodes else QMessageBox.Question)
@@ -1701,7 +1792,7 @@ class GameDesignerApp(QMainWindow):
                 )
             elif link_nodes:
                 box.setText(f"确定删除节点“{node.title}”吗？")
-                box.setInformativeText("关联的超链接文件也会一起删除。")
+                box.setInformativeText("关联的超文本文件也会一起删除。")
             else:
                 box.setText(f"确定删除节点“{node.title}”吗？")
         else:
@@ -1717,7 +1808,7 @@ class GameDesignerApp(QMainWindow):
                 )
             elif link_nodes:
                 box.setText(f"确定删除选中的 {len(nodes)} 个节点吗？")
-                box.setInformativeText("其中的超链接文件也会一起删除。")
+                box.setInformativeText("其中的超文本文件也会一起删除。")
             else:
                 box.setText(f"确定删除选中的 {len(nodes)} 个节点吗？")
 

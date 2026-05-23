@@ -51,6 +51,22 @@ class _ViewMouseEvent:
         self.accepted = True
 
 
+class _ViewContextMenuEvent:
+    def __init__(self, pos: QPoint, global_pos: QPoint | None = None) -> None:
+        self._pos = pos
+        self._global_pos = global_pos or pos
+        self.accepted = False
+
+    def pos(self) -> QPoint:
+        return self._pos
+
+    def globalPos(self) -> QPoint:
+        return self._global_pos
+
+    def accept(self) -> None:
+        self.accepted = True
+
+
 class QtCanvasTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -117,6 +133,25 @@ class QtCanvasTests(unittest.TestCase):
         self.assertNotEqual(view.horizontalScrollBar().value(), start_horizontal)
         self.assertNotEqual(view.verticalScrollBar().value(), start_vertical)
         self.assertFalse(view._panning)
+        view.deleteLater()
+
+    def test_right_drag_release_suppresses_followup_context_menu_event(self) -> None:
+        view = NodeGraphView(ProjectData(nodes=[Node(title="Current")]))
+        view.resize(800, 600)
+        view.show()
+        self.app.processEvents()
+
+        with mock.patch.object(view, "_show_context_menu") as show_context_menu:
+            view.mousePressEvent(_ViewMouseEvent(Qt.RightButton, QPoint(220, 200)))
+            view.mouseMoveEvent(_ViewMouseEvent(Qt.NoButton, QPoint(252, 234)))
+            view.mouseReleaseEvent(_ViewMouseEvent(Qt.RightButton, QPoint(252, 234)))
+
+            event = _ViewContextMenuEvent(QPoint(252, 234))
+            view.contextMenuEvent(event)
+
+        show_context_menu.assert_not_called()
+        self.assertTrue(event.accepted)
+        self.assertFalse(view._suppress_context_menu)
         view.deleteLater()
 
     def test_source_image_cache_reuses_loaded_pixmap(self) -> None:

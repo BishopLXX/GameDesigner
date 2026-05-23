@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
 )
 
 from .models import DEFAULT_NODE_COLOR, FIELD_EXPORT_PROPS, FIELD_TYPES, NODE_TYPES, Node, NodeField, NodeTemplate, new_id
+from .project_files.linked_documents import import_link_document, read_link_document
 from .qt_theme import palette
 
 
@@ -92,7 +93,7 @@ class ProjectSettingsDialog(QDialog):
         self.name_edit = QLineEdit(project_name)
         self.source_edit = QLineEdit(source_dir)
         self.output_edit = QLineEdit(output_dir)
-        self.link_copy_check = QCheckBox("超链接文件在输入目录保留复制本")
+        self.link_copy_check = QCheckBox("超文本文件在输入目录保留复制本")
         self.link_copy_check.setChecked(copy_link_docs_to_source)
 
         source_button = QPushButton("浏览")
@@ -168,6 +169,27 @@ class ProjectSettingsDialog(QDialog):
         self.accept()
 
 
+def _display_field_text(field: NodeField, project_path: str | Path | None = None) -> str:
+    if field.data_type == "图片":
+        return field.value
+    if field.data_type != "资源路径":
+        return field.value or field.name
+    path_text = (field.value or "").strip()
+    if not path_text:
+        return field.name
+    suffix = Path(path_text).suffix.lower()
+    if suffix not in {".md", ".txt"}:
+        return path_text
+    if not project_path:
+        return path_text
+    try:
+        content = read_link_document(project_path, path_text) if path_text.startswith("linked_docs/") else Path(path_text).read_text(encoding="utf-8")
+    except OSError:
+        return path_text
+    content = content.strip()
+    return content or path_text
+
+
 class NodeFrameItem(QGraphicsItem):
     def __init__(
         self,
@@ -219,11 +241,12 @@ class EditorFieldItem(QGraphicsObject):
     clicked = Signal(int)
     activated = Signal(int)
 
-    def __init__(self, index: int, field: NodeField, theme: str) -> None:
+    def __init__(self, index: int, field: NodeField, theme: str, project_path: str | Path | None = None) -> None:
         super().__init__()
         self.index = index
         self.field = field
         self.theme = theme
+        self.project_path = Path(project_path) if project_path else None
         self._resizing = False
         self._press_pos = QPointF()
         self._origin_rect = QRectF()
@@ -267,7 +290,7 @@ class EditorFieldItem(QGraphicsObject):
             painter.setPen(QColor(colors["node_muted"]))
             painter.drawText(rect.adjusted(10, 10, -10, -10), Qt.AlignCenter | Qt.TextWordWrap, "选择图片")
 
-        text = self.field.value if is_image else (self.field.value or self.field.name)
+        text = _display_field_text(self.field, self.project_path)
         if text:
             painter.setPen(QColor(self.field.text_color or colors["node_text"]))
             font = painter.font()
@@ -363,10 +386,11 @@ class FieldCanvas(QGraphicsView):
     cardAddRequested = Signal(str, float, float)
     cardDeleteRequested = Signal(int)
 
-    def __init__(self, fields: list[NodeField], theme: str) -> None:
+    def __init__(self, fields: list[NodeField], theme: str, project_path: str | Path | None = None) -> None:
         super().__init__()
         self.fields = fields
         self.theme = theme
+        self.project_path = Path(project_path) if project_path else None
         self.title = ""
         self.icon = ""
         self.node_color = "#FFFFFF"
@@ -398,6 +422,10 @@ class FieldCanvas(QGraphicsView):
         self.theme = theme
         self.refresh(self.selected_index)
 
+    def set_project_path(self, project_path: str | Path | None) -> None:
+        self.project_path = Path(project_path) if project_path else None
+        self.refresh(self.selected_index)
+
     def drawBackground(self, painter: QPainter, rect: QRectF) -> None:  # type: ignore[override]
         colors = palette(self.theme)
         painter.fillRect(rect, QColor(colors["canvas"]))
@@ -422,7 +450,7 @@ class FieldCanvas(QGraphicsView):
         frame = NodeFrameItem(self.title, self.icon, width, height, self.theme, self.node_color)
         self.scene_obj.addItem(frame)
         for index, field in enumerate(self.fields):
-            item = EditorFieldItem(index, field, self.theme)
+            item = EditorFieldItem(index, field, self.theme, self.project_path)
             item.clicked.connect(self._select_item)
             item.activated.connect(self._activate_item)
             item.changed.connect(self.fieldChanged.emit)
@@ -590,11 +618,13 @@ class NodeEditorDialog(QDialog):
         node: Node,
         theme: str = "dark",
         templates: list[NodeTemplate] | None = None,
+        project_path: str | Path | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("编辑节点")
         self.setModal(True)
         self.theme = theme
+        self.project_path = Path(project_path) if project_path else None
         self.result: Node | None = None
         self._node_id = node.id
         self._x = node.x
@@ -616,7 +646,7 @@ class NodeEditorDialog(QDialog):
         self.title_edit = QLineEdit(node.title)
         self.node_type = QComboBox()
         self.node_type.addItems(NODE_TYPES)
-        self.node_type.setCurrentText(node.node_type if node.node_type in NODE_TYPES else "普通")
+        self.node_type.setCurrentText("超文本" if node.node_type == "超链接" else (node.node_type if node.node_type in NODE_TYPES else "普通"))
         self.icon_edit = QLineEdit(node.icon)
         self.color_edit = QLineEdit(node.color or DEFAULT_NODE_COLOR)
         self.icon_from_title_button = QToolButton()
@@ -638,6 +668,7 @@ class NodeEditorDialog(QDialog):
         self.field_value.setFixedHeight(86)
         self.image_path = QLineEdit()
         self.image_button: QPushButton | None = None
+        self.file_load_button: QPushButton | None = None
         self.field_x = QLineEdit()
         self.field_y = QLineEdit()
         self.field_w = QLineEdit()
@@ -653,7 +684,7 @@ class NodeEditorDialog(QDialog):
         self.v_align_buttons: dict[str, QToolButton] = {}
         self.pin_buttons: dict[str, QToolButton] = {}
 
-        self.canvas = FieldCanvas(self.fields, theme)
+        self.canvas = FieldCanvas(self.fields, theme, self.project_path)
         self._sync_title_from_field()
         self._sync_icon_from_title()
         self.canvas.set_header(self.title_edit.text(), self._display_icon(), self.color_edit.text())
@@ -706,6 +737,7 @@ class NodeEditorDialog(QDialog):
         self.content_label = QLabel("内容")
         self.image_label = QLabel("图片")
         self.image_row = self._path_row(self.image_path, "选择图片", self._pick_image)
+        self.file_row = self._path_row(self.field_value, "加载", self._load_field_file, button_attr="file_load_button")
         props_layout.addWidget(self._labeled_row("字段", self.field_name))
         props_layout.addWidget(self._labeled_row("类型", self.field_type))
         self.content_row = self._labeled_row(self.content_label, self._content_binding_row())
@@ -793,16 +825,22 @@ class NodeEditorDialog(QDialog):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
         self.title_from_content_button.setFixedSize(48, 30)
-        layout.addWidget(self.field_value, 1)
+        content_stack = QWidget()
+        content_stack_layout = QVBoxLayout(content_stack)
+        content_stack_layout.setContentsMargins(0, 0, 0, 0)
+        content_stack_layout.setSpacing(6)
+        content_stack_layout.addWidget(self.field_value, 1)
+        content_stack_layout.addWidget(self.file_row)
+        layout.addWidget(content_stack, 1)
         layout.addWidget(self.title_from_content_button, 0, Qt.AlignTop)
         return row
 
-    def _path_row(self, edit: QLineEdit, label: str, slot) -> QWidget:
+    def _path_row(self, edit: QWidget, label: str, slot, button_attr: str = "image_button") -> QWidget:
         row = QWidget()
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
         button = QPushButton(label)
-        self.image_button = button
+        setattr(self, button_attr, button)
         button.clicked.connect(slot)
         layout.addWidget(edit, 1)
         layout.addWidget(button)
@@ -1057,7 +1095,7 @@ class NodeEditorDialog(QDialog):
 
     def _sync_title_from_field(self) -> None:
         field = self._title_source_field()
-        if not field or field.data_type == "图片":
+        if not field or field.data_type in {"图片", "资源路径"}:
             return
         title = (field.value or field.name).strip()
         if not title:
@@ -1066,7 +1104,7 @@ class NodeEditorDialog(QDialog):
 
     def _update_title_binding_controls(self) -> None:
         field = self._selected_field()
-        can_bind = bool(field and field.data_type != "图片")
+        can_bind = bool(field and field.data_type not in {"图片", "资源路径"})
         checked = bool(field and field.id == self.title_field_id)
         self.title_from_content_button.blockSignals(True)
         self.title_from_content_button.setChecked(checked)
@@ -1082,7 +1120,7 @@ class NodeEditorDialog(QDialog):
         if self._updating:
             return
         field = self._selected_field()
-        if checked and field and field.data_type != "图片":
+        if checked and field and field.data_type not in {"图片", "资源路径"}:
             self.title_field_id = field.id
             self._sync_title_from_field()
         elif field and field.id == self.title_field_id:
@@ -1185,6 +1223,7 @@ class NodeEditorDialog(QDialog):
     def _update_type_controls(self) -> None:
         has_field = self._selected_field() is not None
         is_image = has_field and self.field_type.currentText() == "图片"
+        is_resource = has_field and self.field_type.currentText() == "资源路径"
         show_content = has_field and not is_image
         show_image = has_field and is_image
         self.content_row.setVisible(show_content)
@@ -1195,6 +1234,11 @@ class NodeEditorDialog(QDialog):
         self._set_alignment_enabled(has_field)
         if self.image_button:
             self.image_button.setEnabled(show_image)
+        if self.file_load_button:
+            self.file_load_button.setVisible(show_content)
+            self.file_load_button.setEnabled(show_content and self.field_type.currentText() in {"文本", "长文本", "资源路径"})
+            self.file_load_button.setText("加载")
+        self.content_label.setText("资源内容" if is_resource else "内容")
         self._update_title_binding_controls()
 
     def _update_pin_controls(self) -> None:
@@ -1413,6 +1457,44 @@ class NodeEditorDialog(QDialog):
         if path:
             self.image_path.setText(path)
 
+    def _load_field_file(self) -> None:
+        field = self._selected_field()
+        if not field:
+            return
+        field_type = self.field_type.currentText()
+        filters = "文档 (*.md *.txt);;所有文件 (*.*)" if field_type == "资源路径" else "文本文件 (*.txt *.md);;所有文件 (*.*)"
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "加载文件",
+            str(self.project_path.parent) if self.project_path else str(Path.home()),
+            filters,
+        )
+        if not path:
+            return
+        source = Path(path)
+        try:
+            if field_type == "资源路径":
+                if not self.project_path:
+                    raise ValueError("当前节点还没有工程路径，无法导入超文本文件。")
+                relative = import_link_document(self.project_path, source, self.title_edit.text().strip() or source.stem)
+                content = read_link_document(self.project_path, relative)
+                self.field_value.setPlainText(relative)
+                field.value = relative
+                if self.node_type.currentText() == "超文本":
+                    self._link_path = relative
+                    self._link_format = Path(relative).suffix.lstrip(".").lower() or "md"
+            else:
+                content = source.read_text(encoding="utf-8")
+                self.field_value.setPlainText(content)
+                field.value = content
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "加载失败", f"无法读取文件：\n{exc}")
+            return
+
+        self.canvas.refresh(self.canvas.selected_index)
+        if field.id == self.title_field_id:
+            self._sync_title_from_field()
+
     def _float_text(self, edit: QLineEdit, fallback: float) -> float:
         try:
             return float(edit.text())
@@ -1430,7 +1512,7 @@ class NodeEditorDialog(QDialog):
             title=title,
             node_type=self.node_type.currentText() if self.node_type.currentText() in NODE_TYPES else "普通",
             canvas_id=self._canvas_id if self.node_type.currentText() == "画布" else "",
-            link_path=self._link_path if self.node_type.currentText() == "超链接" else "",
+            link_path=self._link_path if self.node_type.currentText() == "超文本" else "",
             link_format=self._link_format if self._link_format in {"md", "txt"} else "md",
             order=self._order,
             x=self._x,

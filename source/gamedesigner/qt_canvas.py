@@ -1455,6 +1455,7 @@ class NodeGraphView(QGraphicsView):
             release_pos = event.position().toPoint()
             if self._panning:
                 self._panning = False
+                self._suppress_context_menu = True
                 self._refresh_interaction_cursor()
                 event.accept()
                 return
@@ -1463,6 +1464,7 @@ class NodeGraphView(QGraphicsView):
                 self._show_context_menu(release_pos, event.globalPosition().toPoint())
                 event.accept()
                 return
+            self._suppress_context_menu = True
             event.accept()
             return
         if self._panning:

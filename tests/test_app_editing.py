@@ -10,7 +10,8 @@ from PySide6.QtWidgets import QApplication
 
 from gamedesigner.app import GameDesignerApp
 from gamedesigner.models import BlueprintGroup, Node, NodeField, ProjectData
-from gamedesigner.storage import AppSettings, save_settings
+from gamedesigner.storage import AppSettings, load_project, save_project, save_settings
+from gamedesigner.ui.link_document_dialog import LinkDocumentDialog
 
 
 class AppEditingTests(unittest.TestCase):
@@ -195,6 +196,115 @@ class AppEditingTests(unittest.TestCase):
                 self.assertEqual(reopened_recent.width, 420)
                 self.assertEqual(reopened_recent.height, 220)
                 reopened.deleteLater()
+
+    def test_reopen_same_project_path_reloads_from_disk(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "ReloadProject.gdc"
+            project = ProjectData(name="重载测试")
+            project.ensure_canvas_structure()
+            project.root_canvas().add_node(Node(title="旧标题"))
+            save_project(project, project_path)
+
+            window = GameDesignerApp()
+            window._open_project_path(project_path)
+            page = window._current_page()
+            self.assertIsNotNone(page)
+            self.assertEqual(page.project.root_canvas().nodes[0].title, "旧标题")
+
+            disk_project = load_project(project_path)
+            disk_project.root_canvas().nodes[0].title = "磁盘新标题"
+            save_project(disk_project, project_path)
+
+            window._open_project_path(project_path)
+            reloaded_page = window._current_page()
+            self.assertIsNotNone(reloaded_page)
+            self.assertEqual(reloaded_page.project.root_canvas().nodes[0].title, "磁盘新标题")
+            window.deleteLater()
+
+    def test_existing_link_document_is_not_renamed_when_reopened(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            tmp_path = Path(folder)
+            project_path = tmp_path / "LinkProject.gdc"
+            project = ProjectData(
+                name="超文本测试",
+                source_dir=str(tmp_path / "source"),
+                output_dir=str(tmp_path / "out"),
+            )
+            project.ensure_canvas_structure()
+            link_node = project.root_canvas().add_node(
+                Node(
+                    title="linked_docs/新文档.md",
+                    node_type="超文本",
+                    link_path="linked_docs/新文档.md",
+                    link_format="md",
+                    fields=[NodeField("文件", "资源路径", "linked_docs/新文档.md")],
+                )
+            )
+            save_project(project, project_path)
+            linked_dir = project_path.parent / f"{project_path.name}.files" / "linked_docs"
+            linked_dir.mkdir(parents=True, exist_ok=True)
+            original = linked_dir / "新文档.md"
+            original.write_text("# 新文档\n", encoding="utf-8")
+
+            window = GameDesignerApp()
+            window._open_project_path(project_path)
+            page = window._current_page()
+            self.assertIsNotNone(page)
+            node = page.project.root_canvas().find_node(link_node.id)
+            self.assertIsNotNone(node)
+
+            window._ensure_link_node_file(page, node)
+
+            self.assertTrue(original.exists())
+            self.assertFalse((linked_dir / "linked_docs_新文档.md.md").exists())
+            self.assertEqual(node.link_path, "linked_docs/新文档.md")
+            self.assertEqual(node.title, "新文档")
+            window.deleteLater()
+
+    def test_add_link_node_does_not_create_file_until_project_save(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            tmp_path = Path(folder)
+            window = GameDesignerApp()
+            project = ProjectData(
+                name="延迟创建测试",
+                source_dir=str(tmp_path / "source"),
+                output_dir=str(tmp_path / "out"),
+            )
+            project.ensure_canvas_structure()
+            page = window._add_page(project, tmp_path / "DelayedCreate.gdc", dirty=False, canvas_data=project.root_canvas())
+            window.tabs.setCurrentWidget(page)
+
+            with mock.patch.object(window, "_open_link_document", autospec=True, return_value=None):
+                window._add_link_node_at(200, 160)
+
+            bundle_link_dir = tmp_path / "DelayedCreate.gdc.files" / "linked_docs"
+            self.assertFalse(bundle_link_dir.exists())
+
+            node = project.root_canvas().nodes[-1]
+            self.assertEqual(node.node_type, "超文本")
+            self.assertEqual(node.link_path, "")
+
+            self.assertTrue(window._save_project(page))
+            self.assertTrue(bundle_link_dir.exists())
+            self.assertTrue((bundle_link_dir / "新文档.md").exists())
+            window.deleteLater()
+
+    def test_link_document_dialog_markdown_preview_and_delayed_create(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "PreviewProject.gdc"
+            dialog = LinkDocumentDialog(None, project_path, "", "预览文档", "md")
+
+            self.assertEqual(dialog.path_label.text(), "未创建文档，保存后生成工程内文件")
+            dialog.editor.setPlainText("# 标题\n\n**加粗**")
+            self.app.processEvents()
+            self.assertIn("标题", dialog.preview.toPlainText())
+            self.assertIn("加粗", dialog.preview.toPlainText())
+
+            dialog._save()
+            self.assertTrue(dialog.saved)
+            self.assertEqual(dialog.relative_path, "linked_docs/预览文档.md")
+            self.assertTrue((project_path.parent / f"{project_path.name}.files" / "linked_docs" / "预览文档.md").exists())
+            dialog.deleteLater()
 
 
 if __name__ == "__main__":

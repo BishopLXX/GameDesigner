@@ -30,7 +30,7 @@ FIELD_TYPES = [
     "资源路径",
 ]
 
-NODE_TYPES = ["普通", "画布", "超链接"]
+NODE_TYPES = ["普通", "画布", "超文本"]
 TEXT_H_ALIGNMENTS = ["left", "center", "right"]
 TEXT_V_ALIGNMENTS = ["top", "center", "bottom"]
 DEFAULT_NODE_COLOR = "#ffffff"
@@ -133,18 +133,22 @@ class Node:
     title_field_id: str = ""
     fields: list[NodeField] = field(default_factory=list)
 
+    def normalized_node_type(self) -> str:
+        return "超文本" if self.node_type == "超链接" else self.node_type
+
     def display_icon(self) -> str:
         if self.icon_from_title:
             return (self.title.strip()[:1] or self.icon).strip()
         return self.icon
 
     def to_dict(self) -> dict[str, Any]:
+        node_type = self.normalized_node_type()
         return {
             "id": self.id,
             "title": self.title,
-            "node_type": self.node_type if self.node_type in NODE_TYPES else "普通",
+            "node_type": node_type if node_type in NODE_TYPES else "普通",
             "canvas_id": self.canvas_id,
-            "link_path": self.link_path if self.node_type == "超链接" else "",
+            "link_path": self.link_path if node_type == "超文本" else "",
             "link_format": self.link_format if self.link_format in {"md", "txt"} else "md",
             "group_id": self.group_id,
             "order": max(0, int(self.order)),
@@ -165,6 +169,8 @@ class Node:
         if not isinstance(fields, list):
             fields = []
         node_type = str(raw.get("node_type") or raw.get("type") or "普通")
+        if node_type == "超链接":
+            node_type = "超文本"
         if node_type not in NODE_TYPES:
             node_type = "普通"
         node = cls(
@@ -532,7 +538,7 @@ class ProjectData:
             for node in canvas.nodes:
                 if node.node_type != "画布":
                     node.canvas_id = ""
-                if node.node_type != "超链接":
+                if node.node_type != "超文本":
                     node.link_path = ""
             canvas.normalize_node_order()
         root = self.root_canvas()
