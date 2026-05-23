@@ -304,6 +304,66 @@ class QtCanvasTests(unittest.TestCase):
         self.assertGreater(image.pixelColor(36, 84).alpha(), 0)
         view.deleteLater()
 
+    def test_visual_node_default_size_matches_editor_preview_size(self) -> None:
+        canvas = CanvasData(name="主画布")
+        node = canvas.add_node(
+            Node(
+                title="紧凑布局",
+                fields=[
+                    NodeField(
+                        name="名称",
+                        value="攻击模块",
+                        x=1,
+                        y=0,
+                        width=185,
+                        height=40,
+                    )
+                ],
+            )
+        )
+
+        view = NodeGraphView(canvas)
+        item = view.node_items[node.id]
+
+        self.assertEqual(item.width, 430.0)
+        self.assertEqual(item.height, 300.0)
+        view.deleteLater()
+
+    def test_visual_fields_use_exact_editor_coordinates_on_canvas(self) -> None:
+        canvas = CanvasData(name="主画布")
+        node = canvas.add_node(
+            Node(
+                title="紧凑布局",
+                width=430,
+                height=300,
+                fields=[
+                    NodeField(
+                        name="名称",
+                        value="",
+                        x=1,
+                        y=0,
+                        width=185,
+                        height=40,
+                        bg_color="#FF0000",
+                    )
+                ],
+            )
+        )
+        view = NodeGraphView(canvas)
+        item = view.node_items[node.id]
+        image = QImage(int(item.width), int(item.height), QImage.Format_ARGB32_Premultiplied)
+        image.fill(Qt.transparent)
+        painter = QPainter(image)
+        item.paint(painter, None)
+        painter.end()
+
+        raw_left_pixel = image.pixelColor(8, 72)
+        self.assertGreater(raw_left_pixel.red(), 220)
+        self.assertLess(raw_left_pixel.green(), 80)
+        self.assertLess(raw_left_pixel.blue(), 80)
+        self.assertGreater(raw_left_pixel.alpha(), 200)
+        view.deleteLater()
+
     def test_blueprint_group_snaps_to_grid(self) -> None:
         canvas = CanvasData(name="主画布")
         group = canvas.add_group(BlueprintGroup(title="蓝图组", x=83, y=118, width=320, height=220))

@@ -59,6 +59,7 @@ from .models import (
     ProjectData,
     new_id,
 )
+from .node_visuals import VISUAL_NODE_HEADER_HEIGHT, VISUAL_NODE_MIN_HEIGHT, VISUAL_NODE_MIN_WIDTH, visual_node_size
 from .project_files.linked_documents import import_link_document, read_link_document
 from .qt_theme import palette
 from .storage import project_bundle_dir
@@ -66,7 +67,7 @@ from .ui.image_paint_dialog import ImagePaintDialog
 from .window_layouts import restore_window_layout, save_window_layout
 
 
-HEADER_HEIGHT = 52.0
+HEADER_HEIGHT = VISUAL_NODE_HEADER_HEIGHT
 FIELD_HANDLE = 16.0
 
 
@@ -540,8 +541,8 @@ class NodeFrameItem(QGraphicsObject):
         if self._resizing:
             delta = event.scenePos() - self._press_pos
             self.prepareGeometryChange()
-            self.width = max(220.0, self._origin_size[0] + delta.x())
-            self.height = max(140.0, self._origin_size[1] + delta.y())
+            self.width = max(VISUAL_NODE_MIN_WIDTH, self._origin_size[0] + delta.x())
+            self.height = max(VISUAL_NODE_MIN_HEIGHT, self._origin_size[1] + delta.y())
             self.resized.emit(self.width, self.height)
             self.update()
             event.accept()
@@ -786,8 +787,8 @@ class FieldCanvas(QGraphicsView):
         self.scene_obj.setSceneRect(QRectF(-80, -80, width + 160, height + 160))
 
     def _on_frame_resized(self, width: float, height: float) -> None:
-        self.node_width = max(220.0, float(width))
-        self.node_height = max(140.0, float(height))
+        self.node_width = max(VISUAL_NODE_MIN_WIDTH, float(width))
+        self.node_height = max(VISUAL_NODE_MIN_HEIGHT, float(height))
         self.scene_obj.setSceneRect(QRectF(-80, -80, self.node_width + 160, self.node_height + 160))
         self.nodeSizeChanged.emit(self.node_width, self.node_height)
 
@@ -939,11 +940,7 @@ class FieldCanvas(QGraphicsView):
         return None
 
     def _card_size(self) -> tuple[float, float]:
-        natural_width = max([field.x + field.width + 24 for field in self.fields] + [430])
-        natural_height = max([HEADER_HEIGHT + field.y + field.height + 24 for field in self.fields] + [300])
-        if self.node_width > 0 and self.node_height > 0:
-            return max(220.0, self.node_width), max(140.0, self.node_height)
-        return max(430.0, natural_width), max(300.0, natural_height)
+        return visual_node_size(self.fields, self.node_width, self.node_height)
 
 
 class NodeEditorDialog(QDialog):

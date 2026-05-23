@@ -41,6 +41,12 @@ from .data_canvas import (
 )
 from .image_rendering import draw_field_pixmap
 from .models import BlueprintGroup, CanvasData, Edge, Node, NodeField, NodeTemplate, ProjectData
+from .node_visuals import (
+    VISUAL_NODE_HEADER_HEIGHT,
+    VISUAL_NODE_MIN_HEIGHT,
+    VISUAL_NODE_MIN_WIDTH,
+    visual_node_size,
+)
 from .qt_theme import palette
 
 
@@ -48,7 +54,7 @@ NODE_DEFAULT_WIDTH = 310.0
 NODE_MIN_WIDTH = 260.0
 NODE_MIN_HEIGHT = 92.0
 NODE_MAX_NATURAL_WIDTH = 680.0
-HEADER_HEIGHT = 52.0
+HEADER_HEIGHT = VISUAL_NODE_HEADER_HEIGHT
 ROW_GAP = 7.0
 ROW_TOP = HEADER_HEIGHT + 6.0
 RESIZE_HANDLE = 20.0
@@ -334,22 +340,25 @@ class NodeItem(QGraphicsObject):
         self._draw_adaptive_center_text(painter, title_rect, self.node.title, zoom, 13, 42)
 
     def _paint_detail_mode(self, painter: QPainter, colors: dict[str, str], rect: QRectF) -> None:
+        visual_fields = [field for field in self.node.fields if field.has_visual_layout()]
         icon = self.node.display_icon() or ("画" if self.node.node_type == "画布" else "链" if self.node.node_type == "超文本" else "")
         title = f"{icon}  {self.node.title}" if icon else self.node.title
         painter.setPen(QColor(colors["node_text"]))
         title_font = _font(12, True)
         painter.setFont(title_font)
-        painter.drawText(QRectF(18, 28, rect.width() - 92, 22), Qt.AlignLeft | Qt.AlignVCenter, title)
-        painter.setPen(QColor(colors["node_muted"]))
-        painter.setFont(_font(8))
-        meta = (
-            "画布"
-            if self.node.node_type == "画布"
-            else self.node.link_format.upper()
-            if self.node.node_type == "超文本"
-            else f"{len(self.node.fields)} 项"
-        )
-        painter.drawText(QRectF(rect.width() - 72, 30, 54, 18), Qt.AlignRight | Qt.AlignVCenter, meta)
+        title_right_padding = 36 if visual_fields else 92
+        painter.drawText(QRectF(18, 28, rect.width() - title_right_padding, 22), Qt.AlignLeft | Qt.AlignVCenter, title)
+        if not visual_fields:
+            painter.setPen(QColor(colors["node_muted"]))
+            painter.setFont(_font(8))
+            meta = (
+                "画布"
+                if self.node.node_type == "画布"
+                else self.node.link_format.upper()
+                if self.node.node_type == "超文本"
+                else f"{len(self.node.fields)} 项"
+            )
+            painter.drawText(QRectF(rect.width() - 72, 30, 54, 18), Qt.AlignRight | Qt.AlignVCenter, meta)
 
         if not self.node.fields:
             painter.setPen(QColor(colors["node_muted"]))
@@ -361,7 +370,6 @@ class NodeItem(QGraphicsObject):
             self._paint_horizontal_data_row(painter, colors)
             return
 
-        visual_fields = [field for field in self.node.fields if field.has_visual_layout()]
         if visual_fields:
             self._paint_visual_fields(painter, colors, visual_fields)
         else:
@@ -469,17 +477,11 @@ class NodeItem(QGraphicsObject):
             painter.drawRect(rect.adjusted(1, 1, -1, -1))
 
     def _paint_visual_fields(self, painter: QPainter, colors: dict[str, str], fields: list[NodeField]) -> None:
-        content_w = max([field.x + field.width for field in fields] + [self.width - 28]) + 20
-        content_h = max([field.y + field.height for field in fields] + [self.height - HEADER_HEIGHT - 24]) + 20
-        available_w = max(1.0, self.width - 28)
-        available_h = max(1.0, self.height - HEADER_HEIGHT - 18)
-        scale_x = min(available_w / content_w, 3.0)
-        scale_y = min(available_h / content_h, 3.0)
         for field in fields:
-            x = 14 + field.x * scale_x
-            y = HEADER_HEIGHT + field.y * scale_y
-            w = max(24, field.width * scale_x)
-            h = max(22, field.height * scale_y)
+            x = field.x
+            y = HEADER_HEIGHT + field.y
+            w = max(24.0, field.width)
+            h = max(22.0, field.height)
             card = QRectF(x, y, w, h)
             path = QPainterPath()
             path.addRoundedRect(card, 9, 9)
@@ -508,7 +510,7 @@ class NodeItem(QGraphicsObject):
                 text = field.value
             else:
                 text = field.value or field.name
-            self._draw_visual_field_text(painter, colors, card.adjusted(9, 8, -9, -8), field, text, min(scale_x, scale_y))
+            self._draw_visual_field_text(painter, colors, card.adjusted(10, 9, -10, -9), field, text, 1.0)
 
     def _draw_visual_field_text(
         self,
@@ -649,9 +651,12 @@ class NodeItem(QGraphicsObject):
         if self._resizing:
             delta = event.scenePos() - self._resize_origin
             self.prepareGeometryChange()
-            self.width = max(NODE_MIN_WIDTH, self._resize_size[0] + delta.x())
-            requested_height = max(NODE_MIN_HEIGHT, self._resize_size[1] + delta.y())
-            if any(field.has_visual_layout() for field in self.node.fields):
+            has_visual_layout = any(field.has_visual_layout() for field in self.node.fields)
+            min_width = VISUAL_NODE_MIN_WIDTH if has_visual_layout else NODE_MIN_WIDTH
+            min_height = VISUAL_NODE_MIN_HEIGHT if has_visual_layout else NODE_MIN_HEIGHT
+            self.width = max(min_width, self._resize_size[0] + delta.x())
+            requested_height = max(min_height, self._resize_size[1] + delta.y())
+            if has_visual_layout:
                 self.height = requested_height
             else:
                 self.height = max(requested_height, self._natural_detail_height(self.width))
@@ -720,16 +725,17 @@ class NodeItem(QGraphicsObject):
             return
         visual_fields = [field for field in self.node.fields if field.has_visual_layout()]
         if visual_fields and not self._uses_horizontal_data_row():
-            natural_w = max([field.x + field.width for field in visual_fields] + [NODE_DEFAULT_WIDTH]) + 34
-            natural_h = HEADER_HEIGHT + max([field.y + field.height for field in visual_fields] + [120]) + 24
+            node_width = 0.0 if use_natural_size else self.node.width
+            node_height = 0.0 if use_natural_size else self.node.height
+            visual_w, visual_h = visual_node_size(visual_fields, node_width, node_height)
             if use_natural_size:
-                self.width = max(NODE_MIN_WIDTH, natural_w)
-                self.height = max(NODE_MIN_HEIGHT, natural_h)
+                self.width = visual_w
+                self.height = visual_h
                 self.node.width = self.width
                 self.node.height = self.height
             else:
-                self.width = max(NODE_MIN_WIDTH, self.node.width if self.node.width > 0 else min(NODE_MAX_NATURAL_WIDTH, natural_w))
-                self.height = max(NODE_MIN_HEIGHT, self.node.height if self.node.height > 0 else natural_h)
+                self.width = visual_w
+                self.height = visual_h
             return
         natural_width = self._natural_detail_width()
         if use_natural_size:
