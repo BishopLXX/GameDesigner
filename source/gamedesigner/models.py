@@ -266,19 +266,36 @@ class Edge:
     target: str = ""
     label: str = ""
     style: str = "curve"
+    orthogonal_bend_x: float | None = None
+    orthogonal_bend_y: float | None = None
+    orthogonal_route: list[dict[str, float]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.style not in EDGE_STYLES:
             self.style = "curve"
+        self.orthogonal_bend_x = _optional_float(self.orthogonal_bend_x)
+        self.orthogonal_bend_y = _optional_float(self.orthogonal_bend_y)
+        self.orthogonal_route = _point_dicts(self.orthogonal_route)
+        if self.orthogonal_route and self.orthogonal_bend_x is None and self.orthogonal_bend_y is None:
+            first = self.orthogonal_route[0]
+            self.orthogonal_bend_x = first["x"]
+            self.orthogonal_bend_y = first["y"]
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data = {
             "id": self.id,
             "source": self.source,
             "target": self.target,
             "label": self.label,
             "style": self.style if self.style in EDGE_STYLES else "curve",
         }
+        if self.orthogonal_bend_x is not None:
+            data["orthogonal_bend_x"] = self.orthogonal_bend_x
+        if self.orthogonal_bend_y is not None:
+            data["orthogonal_bend_y"] = self.orthogonal_bend_y
+        if self.orthogonal_route:
+            data["orthogonal_route"] = [dict(point) for point in self.orthogonal_route]
+        return data
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "Edge":
@@ -291,6 +308,9 @@ class Edge:
             target=str(raw.get("target", "")),
             label=str(raw.get("label", "")),
             style=style,
+            orthogonal_bend_x=_optional_float(raw.get("orthogonal_bend_x")),
+            orthogonal_bend_y=_optional_float(raw.get("orthogonal_bend_y")),
+            orthogonal_route=_point_dicts(raw.get("orthogonal_route")),
         )
 
 
@@ -796,6 +816,30 @@ def _float_or(value: Any, fallback: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return fallback
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _point_dicts(value: Any) -> list[dict[str, float]]:
+    if not isinstance(value, list):
+        return []
+    points: list[dict[str, float]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        x = _optional_float(item.get("x"))
+        y = _optional_float(item.get("y"))
+        if x is None or y is None:
+            continue
+        points.append({"x": x, "y": y})
+    return points
 
 
 def _choice_or(value: Any, choices: list[str], fallback: str) -> str:

@@ -6,11 +6,12 @@ from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import QPointF
 from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
 
 from gamedesigner.app import GameDesignerApp
 from gamedesigner.canvas_io import import_canvas_sheet
-from gamedesigner.qt_dialogs import NodeEditorDialog
+from gamedesigner.qt_dialogs import HEADER_HEIGHT, NodeEditorDialog
 from gamedesigner.models import BlueprintGroup, Node, NodeField, NodeTemplate, ProjectData
 from gamedesigner.storage import AppSettings, load_project, save_project, save_settings
 from gamedesigner.ui.link_document_dialog import LinkDocumentDialog
@@ -69,6 +70,26 @@ class AppEditingTests(unittest.TestCase):
 
         created = project.root_canvas().nodes[-1]
         self.assertEqual(created.group_id, group.id)
+        window.deleteLater()
+
+    def test_new_edges_use_last_selected_edge_style(self) -> None:
+        window = GameDesignerApp()
+        project = ProjectData(name="连线样式记忆")
+        project.ensure_canvas_structure()
+        canvas = project.root_canvas()
+        first = canvas.add_node(Node(title="A"))
+        second = canvas.add_node(Node(title="B", x=420))
+        third = canvas.add_node(Node(title="C", y=260))
+        existing = canvas.add_edge(first.id, second.id)
+        page = window._add_page(project, None, dirty=False, canvas_data=canvas)
+        window.tabs.setCurrentWidget(page)
+
+        window._set_edge_style(existing.id, "straight")
+        window._create_edge(first.id, third.id)
+
+        created = next(edge for edge in canvas.edges if edge.target == third.id)
+        self.assertEqual(existing.style, "straight")
+        self.assertEqual(created.style, "straight")
         window.deleteLater()
 
     def test_add_data_canvas_creates_templated_child_canvas(self) -> None:
@@ -434,6 +455,48 @@ class AppEditingTests(unittest.TestCase):
         self.assertIsNotNone(dialog.result)
         self.assertEqual(dialog.result.width, 640)
         self.assertEqual(dialog.result.height, 360)
+        dialog.deleteLater()
+
+    def test_node_editor_field_drag_snaps_to_other_field_edges(self) -> None:
+        node = Node(
+            title="模块",
+            fields=[
+                NodeField("左", "文本", "A", x=23, y=10, width=90, height=40),
+                NodeField("右", "文本", "B", x=220, y=84, width=80, height=40),
+            ],
+        )
+        dialog = NodeEditorDialog(None, node, templates=[])
+        items = {
+            item.index: item
+            for item in dialog.canvas.scene_obj.items()
+            if item.__class__.__name__ == "EditorFieldItem"
+        }
+
+        snapped = dialog.canvas.snap_field_position(items[1], QPointF(112, HEADER_HEIGHT + 84))
+
+        self.assertEqual(snapped.x(), 113.0)
+        self.assertTrue(any(guide.axis == "x" and guide.value == 113.0 for guide in dialog.canvas.snap_guides))
+        dialog.deleteLater()
+
+    def test_node_editor_field_resize_snaps_to_other_field_edges(self) -> None:
+        node = Node(
+            title="模块",
+            fields=[
+                NodeField("左", "文本", "A", x=17, y=10, width=120, height=40),
+                NodeField("右", "文本", "B", x=40, y=84, width=80, height=40),
+            ],
+        )
+        dialog = NodeEditorDialog(None, node, templates=[])
+        items = {
+            item.index: item
+            for item in dialog.canvas.scene_obj.items()
+            if item.__class__.__name__ == "EditorFieldItem"
+        }
+
+        width, _height = dialog.canvas.snap_field_resize(items[1], 94, 40)
+
+        self.assertEqual(width, 97.0)
+        self.assertTrue(any(guide.axis == "x" and guide.value == 137.0 for guide in dialog.canvas.snap_guides))
         dialog.deleteLater()
 
     def test_edit_data_canvas_node_updates_canvas_template_and_syncs_all_nodes(self) -> None:

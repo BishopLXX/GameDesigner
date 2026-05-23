@@ -1,4 +1,5 @@
 import os
+import math
 import unittest
 from unittest import mock
 
@@ -68,6 +69,21 @@ class _ViewContextMenuEvent:
         self.accepted = True
 
 
+class _KeyEvent:
+    def __init__(self, key: Qt.Key) -> None:
+        self._key = key
+        self.accepted = False
+
+    def key(self):
+        return self._key
+
+    def isAutoRepeat(self) -> bool:
+        return False
+
+    def accept(self) -> None:
+        self.accepted = True
+
+
 class QtCanvasTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -109,6 +125,341 @@ class QtCanvasTests(unittest.TestCase):
 
         self.assertEqual(node.width, 398)
         self.assertEqual(node.height, 188)
+        view.deleteLater()
+
+    def test_dragging_node_edge_handle_creates_edge(self) -> None:
+        canvas = CanvasData(name="主画布")
+        source = canvas.add_node(Node(title="源", x=0, y=0, width=320, height=180))
+        target = canvas.add_node(Node(title="目标", x=480, y=20, width=320, height=180))
+        view = NodeGraphView(canvas)
+        created: list[tuple[str, str]] = []
+        view.edgeCreated.connect(lambda source_id, target_id: created.append((source_id, target_id)))
+        source_item = view.node_items[source.id]
+        target_item = view.node_items[target.id]
+        handle_pos = source_item._connection_handle_points()["right"]
+        press_scene_pos = source_item.mapToScene(handle_pos)
+        release_scene_pos = target_item.sceneBoundingRect().center()
+
+        source_item.mousePressEvent(_ScenePointerEvent(handle_pos, press_scene_pos))
+        self.assertTrue(view.is_connection_dragging_from(source.id))
+        self.assertEqual(view.connection_anchor_scene, press_scene_pos)
+
+        source_item.mouseMoveEvent(
+            _ScenePointerEvent(source_item.mapFromScene(release_scene_pos), release_scene_pos)
+        )
+        source_item.mouseReleaseEvent(
+            _ScenePointerEvent(source_item.mapFromScene(release_scene_pos), release_scene_pos)
+        )
+
+        self.app.processEvents()
+        self.assertEqual(created, [(source.id, target.id)])
+        self.assertFalse(view.connecting)
+        view.deleteLater()
+
+    def test_drag_edge_from_node_to_pasted_node_defers_rebuild_until_release_returns(self) -> None:
+        canvas = CanvasData(name="主画布")
+        source = canvas.add_node(Node(title="源", x=0, y=0, width=320, height=180))
+        original = canvas.add_node(Node(title="复制源", x=0, y=280, width=320, height=180))
+        pasted = canvas.add_node(Node.from_dict(original.to_dict()))
+        pasted.id = "node_pasted"
+        pasted.x = 420
+        pasted.y = 280
+        view = NodeGraphView(canvas)
+        source_item = view.node_items[source.id]
+        target_item = view.node_items[pasted.id]
+        handle_pos = source_item._connection_handle_points()["bottom"]
+        press_scene_pos = source_item.mapToScene(handle_pos)
+        release_scene_pos = target_item.sceneBoundingRect().center()
+
+        def add_and_rebuild(source_id: str, target_id: str) -> None:
+            canvas.add_edge(source_id, target_id)
+            view.rebuild()
+
+        view.edgeCreated.connect(add_and_rebuild)
+
+        source_item.mousePressEvent(_ScenePointerEvent(handle_pos, press_scene_pos))
+        source_item.mouseReleaseEvent(
+            _ScenePointerEvent(source_item.mapFromScene(release_scene_pos), release_scene_pos)
+        )
+
+        self.assertEqual(canvas.edges, [])
+        self.app.processEvents()
+        self.assertEqual(len(canvas.edges), 1)
+        self.assertEqual((canvas.edges[0].source, canvas.edges[0].target), (source.id, pasted.id))
+        self.assertIn(pasted.id, view.node_items)
+        view.deleteLater()
+
+    def test_orthogonal_edge_keeps_stubs_perpendicular_to_nodes(self) -> None:
+        canvas = CanvasData(name="主画布")
+        source = canvas.add_node(Node(title="源", x=0, y=0, width=320, height=180))
+        target = canvas.add_node(Node(title="目标", x=80, y=360, width=320, height=180))
+        edge = canvas.add_edge(source.id, target.id)
+        edge.style = "orthogonal"
+        edge.orthogonal_route = [{"x": 260.0, "y": 270.0}]
+
+        view = NodeGraphView(canvas)
+        item = view.edge_items[edge.id]
+        points = list(item.path().toSubpathPolygons()[0])
+        source_rect = view.node_items[source.id].sceneBoundingRect()
+        target_rect = view.node_items[target.id].sceneBoundingRect()
+
+        self.assertEqual(points[0].x(), source_rect.center().x())
+        self.assertEqual(points[0].y(), source_rect.bottom())
+        self.assertEqual(points[1].x(), points[0].x())
+        self.assertGreater(points[1].y(), points[0].y())
+        self.assertLess(points[-2].y(), points[-1].y())
+        self.assertEqual(points[-2].x(), points[-1].x())
+        view.deleteLater()
+
+    def test_orthogonal_route_point_near_target_entry_axis_merges_into_entry_line(self) -> None:
+        canvas = CanvasData(name="主画布")
+        source = canvas.add_node(Node(title="源", x=0, y=0, width=320, height=180))
+        target = canvas.add_node(Node(title="目标", x=80, y=360, width=320, height=180))
+        edge = canvas.add_edge(source.id, target.id)
+        edge.style = "orthogonal"
+        edge.orthogonal_route = [{"x": 260.0, "y": 270.0}]
+
+        view = NodeGraphView(canvas)
+        item = view.edge_items[edge.id]
+        route_points = item._route_points()
+        points = list(item.path().toSubpathPolygons()[0])
+        source_rect = view.node_items[source.id].sceneBoundingRect()
+        target_rect = view.node_items[target.id].sceneBoundingRect()
+        target_anchor = item._anchor(target_rect, source_rect)
+        distances = [
+            math.hypot(points[index + 1].x() - points[index].x(), points[index + 1].y() - points[index].y())
+            for index in range(len(points) - 1)
+        ]
+
+        self.assertEqual(len(route_points), 1)
+        self.assertAlmostEqual(route_points[0].x(), target_anchor.x())
+        self.assertTrue(all(distance > 14.0 for distance in distances))
+        self.assertEqual(points[-2].x(), target_anchor.x())
+        view.deleteLater()
+
+    def test_dragging_orthogonal_edge_bend_updates_edge_and_emits_change(self) -> None:
+        canvas = CanvasData(name="主画布")
+        source = canvas.add_node(Node(title="源", x=0, y=0, width=320, height=180))
+        target = canvas.add_node(Node(title="目标", x=560, y=80, width=320, height=180))
+        edge = canvas.add_edge(source.id, target.id)
+        edge.style = "orthogonal"
+        view = NodeGraphView(canvas)
+        changed: list[bool] = []
+        view.projectChanged.connect(lambda: changed.append(True))
+        item = view.edge_items[edge.id]
+        view.select_edge(edge.id)
+        handle_scene = item._bend_handles()[0][0]
+        handle_pos = item.mapFromScene(handle_scene)
+
+        item.mousePressEvent(_ScenePointerEvent(handle_pos, handle_scene))
+        item.mouseMoveEvent(_ScenePointerEvent(handle_pos, QPointF(455, handle_scene.y() + 18)))
+        item.mouseReleaseEvent(_ScenePointerEvent(handle_pos, QPointF(455, handle_scene.y() + 18)))
+
+        self.assertEqual(edge.orthogonal_route, [{"x": 455.0, "y": handle_scene.y() + 18}])
+        self.assertAlmostEqual(edge.orthogonal_bend_x, 455.0)
+        self.assertAlmostEqual(edge.orthogonal_bend_y, handle_scene.y() + 18)
+        self.assertEqual(changed, [True])
+        view.deleteLater()
+
+    def test_close_orthogonal_route_points_merge(self) -> None:
+        canvas = CanvasData(name="主画布")
+        source = canvas.add_node(Node(title="源", x=0, y=0, width=320, height=180))
+        target = canvas.add_node(Node(title="目标", x=560, y=260, width=320, height=180))
+        edge = canvas.add_edge(source.id, target.id)
+        edge.style = "orthogonal"
+        view = NodeGraphView(canvas)
+        item = view.edge_items[edge.id]
+
+        item._set_route_points([QPointF(320, 180), QPointF(330, 188), QPointF(460, 230)])
+
+        self.assertEqual(len(edge.orthogonal_route), 2)
+        self.assertAlmostEqual(edge.orthogonal_route[0]["x"], 325.0)
+        self.assertAlmostEqual(edge.orthogonal_route[0]["y"], 184.0)
+        view.deleteLater()
+
+    def test_short_orthogonal_step_is_removed_from_rendered_path(self) -> None:
+        canvas = CanvasData(name="主画布")
+        source = canvas.add_node(Node(title="源", x=0, y=0, width=320, height=180))
+        target = canvas.add_node(Node(title="目标", x=560, y=260, width=320, height=180))
+        edge = canvas.add_edge(source.id, target.id)
+        edge.style = "orthogonal"
+        edge.orthogonal_route = [{"x": 380.0, "y": 190.0}, {"x": 392.0, "y": 190.0}, {"x": 500.0, "y": 260.0}]
+        view = NodeGraphView(canvas)
+        item = view.edge_items[edge.id]
+        points = list(item.path().toSubpathPolygons()[0])
+
+        distances = [
+            math.hypot(points[index + 1].x() - points[index].x(), points[index + 1].y() - points[index].y())
+            for index in range(len(points) - 1)
+        ]
+
+        self.assertTrue(all(distance > 14.0 for distance in distances))
+        view.deleteLater()
+
+    def test_clicking_orthogonal_segment_inserts_route_point_and_right_click_deletes_it(self) -> None:
+        canvas = CanvasData(name="主画布")
+        source = canvas.add_node(Node(title="源", x=0, y=0, width=320, height=180))
+        target = canvas.add_node(Node(title="目标", x=560, y=260, width=320, height=180))
+        edge = canvas.add_edge(source.id, target.id)
+        edge.style = "orthogonal"
+        view = NodeGraphView(canvas)
+        changed: list[bool] = []
+        deleted_edges: list[str] = []
+        view.projectChanged.connect(lambda: changed.append(True))
+        view.edgeDeleteRequested.connect(lambda edge_id: deleted_edges.append(edge_id))
+        item = view.edge_items[edge.id]
+        view.select_edge(edge.id)
+        points = item._orthogonal_points(
+            item._anchor(item.source.sceneBoundingRect(), item.target.sceneBoundingRect()),
+            item._anchor(item.target.sceneBoundingRect(), item.source.sceneBoundingRect()),
+            item.source.sceneBoundingRect(),
+            item.target.sceneBoundingRect(),
+        )
+        insert_scene = QPointF((points[1].x() + points[2].x()) / 2, (points[1].y() + points[2].y()) / 2)
+
+        item.mousePressEvent(_ScenePointerEvent(item.mapFromScene(insert_scene), insert_scene))
+        item.mouseReleaseEvent(_ScenePointerEvent(item.mapFromScene(insert_scene), insert_scene))
+
+        self.assertEqual(edge.orthogonal_route, [{"x": insert_scene.x(), "y": insert_scene.y()}])
+        self.assertEqual(changed, [True])
+
+        self.assertEqual(item.route_point_index_at_scene(insert_scene), 0)
+        self.assertTrue(item.delete_route_point_at_scene(insert_scene))
+        view.projectChanged.emit()
+
+        self.assertEqual(edge.orthogonal_route, [])
+        self.assertEqual(changed, [True, True])
+        self.assertEqual(deleted_edges, [])
+        view.deleteLater()
+
+    def test_delete_key_on_selected_edge_deletes_whole_edge_even_when_route_point_selected(self) -> None:
+        canvas = CanvasData(name="主画布")
+        source = canvas.add_node(Node(title="源", x=0, y=0, width=320, height=180))
+        target = canvas.add_node(Node(title="目标", x=560, y=260, width=320, height=180))
+        edge = canvas.add_edge(source.id, target.id)
+        edge.style = "orthogonal"
+        edge.orthogonal_route = [{"x": 410.0, "y": 170.0}]
+        view = NodeGraphView(canvas)
+        deleted_edges: list[str] = []
+        view.edgeDeleteRequested.connect(lambda edge_id: deleted_edges.append(edge_id))
+        item = view.edge_items[edge.id]
+        view.select_edge(edge.id)
+        item._selected_route_index = 0
+
+        delete = _KeyEvent(Qt.Key_Delete)
+        view.keyPressEvent(delete)
+
+        self.assertTrue(delete.accepted)
+        self.assertEqual(deleted_edges, [edge.id])
+        self.assertEqual(edge.orthogonal_route, [{"x": 410.0, "y": 170.0}])
+        view.deleteLater()
+
+    def test_curve_edge_enters_target_instead_of_running_parallel(self) -> None:
+        canvas = CanvasData(name="主画布")
+        source = canvas.add_node(Node(title="源", x=0, y=0, width=320, height=180))
+        target = canvas.add_node(Node(title="目标", x=560, y=240, width=320, height=180))
+        edge = canvas.add_edge(source.id, target.id)
+        edge.style = "curve"
+        view = NodeGraphView(canvas)
+        item = view.edge_items[edge.id]
+        path = item.path()
+        end = path.pointAtPercent(1)
+        before = item._point_before_end(path)
+        tangent = end - before
+        into_target = view.node_items[target.id].sceneBoundingRect().center() - end
+        dot = tangent.x() * into_target.x() + tangent.y() * into_target.y()
+
+        self.assertGreater(dot, 0)
+        view.deleteLater()
+
+    def test_resizing_visual_node_scales_inner_fields(self) -> None:
+        canvas = CanvasData(name="主画布")
+        field = NodeField("说明", "文本", "内容", x=20, y=10, width=120, height=40, font_size=12)
+        node = canvas.add_node(Node(title="视觉节点", width=400, height=252, fields=[field]))
+        view = NodeGraphView(canvas)
+        item = view.node_items[node.id]
+        handle_pos = QPointF(item.width - 1, item.height - 1)
+        press_scene_pos = item.mapToScene(handle_pos)
+
+        item.mousePressEvent(_ScenePointerEvent(handle_pos, press_scene_pos))
+        item.mouseMoveEvent(_ScenePointerEvent(handle_pos, press_scene_pos + QPointF(100, 50)))
+
+        self.assertEqual(node.width, 500)
+        self.assertEqual(node.height, 302)
+        self.assertAlmostEqual(field.x, 25.0)
+        self.assertAlmostEqual(field.y, 12.5)
+        self.assertAlmostEqual(field.width, 150.0)
+        self.assertAlmostEqual(field.height, 50.0)
+        self.assertEqual(field.font_size, 15)
+        view.deleteLater()
+
+    def test_inline_edit_visual_field_updates_value_and_emits_change(self) -> None:
+        canvas = CanvasData(name="主画布")
+        field = NodeField("数值", "文本", "5", x=20, y=10, width=120, height=40)
+        node = canvas.add_node(Node(title="视觉节点", width=320, height=180, fields=[field]))
+        view = NodeGraphView(canvas)
+        item = view.node_items[node.id]
+        changed: list[bool] = []
+        view.projectChanged.connect(lambda: changed.append(True))
+
+        view.start_inline_field_edit(item, field, item._editable_field_rects()[0][1])
+        self.assertTrue(view.is_inline_field_editing())
+        self.assertIsNotNone(view._inline_editor)
+        view._inline_editor.setPlainText("9")
+        view._close_inline_field_editor(commit=True)
+
+        self.assertEqual(field.value, "9")
+        self.assertEqual(changed, [True])
+        view.deleteLater()
+
+    def test_inline_edit_cancel_keeps_original_value(self) -> None:
+        canvas = CanvasData(name="主画布")
+        field = NodeField("数值", "文本", "5", x=20, y=10, width=120, height=40)
+        node = canvas.add_node(Node(title="视觉节点", width=320, height=180, fields=[field]))
+        view = NodeGraphView(canvas)
+        item = view.node_items[node.id]
+        changed: list[bool] = []
+        view.projectChanged.connect(lambda: changed.append(True))
+
+        view.start_inline_field_edit(item, field, item._editable_field_rects()[0][1])
+        self.assertIsNotNone(view._inline_editor)
+        view._inline_editor.setPlainText("9")
+        view._close_inline_field_editor(commit=False)
+
+        self.assertEqual(field.value, "5")
+        self.assertEqual(changed, [])
+        view.deleteLater()
+
+    def test_left_click_blank_canvas_commits_inline_edit(self) -> None:
+        canvas = CanvasData(name="主画布")
+        field = NodeField("数值", "文本", "5", x=20, y=10, width=120, height=40)
+        node = canvas.add_node(Node(title="视觉节点", width=320, height=180, fields=[field]))
+        view = NodeGraphView(canvas)
+        item = view.node_items[node.id]
+        changed: list[bool] = []
+        view.projectChanged.connect(lambda: changed.append(True))
+        view.start_inline_field_edit(item, field, item._editable_field_rects()[0][1])
+        self.assertIsNotNone(view._inline_editor)
+        view._inline_editor.setPlainText("9")
+
+        press = _ViewMouseEvent(Qt.LeftButton, QPoint(760, 520))
+        view.mousePressEvent(press)
+
+        self.assertTrue(press.accepted)
+        self.assertFalse(view.is_inline_field_editing())
+        self.assertEqual(field.value, "9")
+        self.assertEqual(changed, [True])
+        view.deleteLater()
+
+    def test_data_canvas_nodes_do_not_offer_connection_handles(self) -> None:
+        canvas = CanvasData(name="数据", canvas_type="data")
+        node = canvas.add_node(Node(title="数据节点", width=320, height=180))
+        view = NodeGraphView(canvas)
+        item = view.node_items[node.id]
+        handle_pos = item._connection_handle_points()["right"]
+
+        self.assertFalse(view.can_create_edges())
+        self.assertIsNone(item._connection_handle_at(handle_pos))
         view.deleteLater()
 
     def test_data_canvas_without_visual_template_allows_node_move_but_not_resize(self) -> None:

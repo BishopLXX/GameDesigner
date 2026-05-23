@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import QPoint, QPointF, QRectF, QSize, Qt, QTimer, Signal
@@ -15,6 +16,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -69,6 +71,16 @@ from .window_layouts import restore_window_layout, save_window_layout
 
 HEADER_HEIGHT = VISUAL_NODE_HEADER_HEIGHT
 FIELD_HANDLE = 16.0
+FIELD_SNAP_UNIT = 10.0
+FIELD_SNAP_THRESHOLD = 6.0
+
+
+@dataclass
+class FieldSnapGuide:
+    axis: str
+    value: float
+    label: str
+    kind: str = "align"
 
 
 def _safe_color(value: str, fallback: str) -> QColor:
@@ -647,9 +659,16 @@ class EditorFieldItem(QGraphicsObject):
     def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
         if self._resizing:
             delta = event.scenePos() - self._press_pos
+            width = max(44.0, self._origin_rect.width() + delta.x())
+            height = max(34.0, self._origin_rect.height() + delta.y())
+            canvas = self._field_canvas()
+            if canvas is not None and not QApplication.keyboardModifiers() & Qt.ControlModifier:
+                width, height = canvas.snap_field_resize(self, width, height)
+            elif canvas is not None:
+                canvas.clear_snap_guides()
             self.prepareGeometryChange()
-            self.field.width = max(44.0, self._origin_rect.width() + delta.x())
-            self.field.height = max(34.0, self._origin_rect.height() + delta.y())
+            self.field.width = width
+            self.field.height = height
             self.update()
             event.accept()
             return
@@ -659,13 +678,22 @@ class EditorFieldItem(QGraphicsObject):
         self.field.x = max(0.0, self.pos().x())
         self.field.y = max(0.0, self.pos().y() - HEADER_HEIGHT)
         self._resizing = False
+        canvas = self._field_canvas()
+        if canvas is not None:
+            canvas.clear_snap_guides()
         self.changed.emit()
         super().mouseReleaseEvent(event)
 
     def itemChange(self, change: QGraphicsItem.GraphicsItemChange, value):  # type: ignore[override]
         if change == QGraphicsItem.ItemPositionChange and self.scene():
             pos = value
-            return QPointF(max(0.0, pos.x()), max(HEADER_HEIGHT, pos.y()))
+            constrained = QPointF(max(0.0, pos.x()), max(HEADER_HEIGHT, pos.y()))
+            canvas = self._field_canvas()
+            if canvas is None or QApplication.keyboardModifiers() & Qt.ControlModifier:
+                if canvas is not None:
+                    canvas.clear_snap_guides()
+                return constrained
+            return canvas.snap_field_position(self, constrained)
         if change == QGraphicsItem.ItemPositionHasChanged:
             self.field.x = max(0.0, self.pos().x())
             self.field.y = max(0.0, self.pos().y() - HEADER_HEIGHT)
@@ -674,6 +702,15 @@ class EditorFieldItem(QGraphicsObject):
     def _on_handle(self, pos: QPointF) -> bool:
         rect = self.boundingRect()
         return pos.x() >= rect.right() - FIELD_HANDLE and pos.y() >= rect.bottom() - FIELD_HANDLE
+
+    def _field_canvas(self) -> "FieldCanvas | None":
+        scene = self.scene()
+        if scene is None:
+            return None
+        for view in scene.views():
+            if isinstance(view, FieldCanvas):
+                return view
+        return None
 
 
 class InlineFieldEditor(QPlainTextEdit):
@@ -727,6 +764,7 @@ class FieldCanvas(QGraphicsView):
         self._inline_proxy: QGraphicsProxyWidget | None = None
         self._inline_editor: InlineFieldEditor | None = None
         self._inline_index: int | None = None
+        self.snap_guides: list[FieldSnapGuide] = []
         self.scene_obj = QGraphicsScene(self)
         self.setScene(self.scene_obj)
         self.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing | QPainter.SmoothPixmapTransform)
@@ -769,8 +807,21 @@ class FieldCanvas(QGraphicsView):
             painter.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
             y += step
 
+    def drawForeground(self, painter: QPainter, rect: QRectF) -> None:  # type: ignore[override]
+        colors = palette(self.theme)
+        for guide in self.snap_guides:
+            color = QColor(colors["blue"] if guide.kind == "align" else colors.get("warning", "#FF9500"))
+            painter.setPen(QPen(color, 0, Qt.DashLine))
+            if guide.axis == "x":
+                painter.drawLine(QPointF(guide.value, rect.top()), QPointF(guide.value, rect.bottom()))
+                painter.drawText(QPointF(guide.value + 8, rect.top() + 24), guide.label)
+            else:
+                painter.drawLine(QPointF(rect.left(), guide.value), QPointF(rect.right(), guide.value))
+                painter.drawText(QPointF(rect.left() + 18, guide.value - 8), guide.label)
+
     def refresh(self, selected_index: int | None = None) -> None:
         self._close_inline_editor(emit_changed=False)
+        self.clear_snap_guides()
         self.scene_obj.clear()
         self.selected_index = selected_index if selected_index is not None else self.selected_index
         width, height = self._card_size()
@@ -791,6 +842,157 @@ class FieldCanvas(QGraphicsView):
         self.node_height = max(VISUAL_NODE_MIN_HEIGHT, float(height))
         self.scene_obj.setSceneRect(QRectF(-80, -80, self.node_width + 160, self.node_height + 160))
         self.nodeSizeChanged.emit(self.node_width, self.node_height)
+
+    def clear_snap_guides(self) -> None:
+        if not self.snap_guides:
+            return
+        self.snap_guides = []
+        self.viewport().update()
+
+    def snap_field_position(self, moving: EditorFieldItem, target: QPointF) -> QPointF:
+        scale = max(0.001, self.transform().m11())
+        snapped = QPointF(target)
+        guides: list[FieldSnapGuide] = []
+        target_rect = self._field_rect_at(moving, target)
+        x_result = self._best_field_grid_snap(target.x(), "x", scale)
+        y_result = self._best_field_grid_snap(target.y() - HEADER_HEIGHT, "y", scale, HEADER_HEIGHT)
+        align_x = self._best_field_align_snap(moving, target_rect, "x", scale)
+        align_y = self._best_field_align_snap(moving, target_rect, "y", scale)
+        if align_x and (not x_result or align_x[1] <= x_result[1]):
+            x_result = align_x
+        if align_y and (not y_result or align_y[1] <= y_result[1]):
+            y_result = align_y
+        if x_result:
+            snapped.setX(max(0.0, target.x() + x_result[0]))
+            guides.append(x_result[2])
+        if y_result:
+            snapped.setY(max(HEADER_HEIGHT, target.y() + y_result[0]))
+            guides.append(y_result[2])
+        self.snap_guides = guides
+        self.viewport().update()
+        return snapped
+
+    def snap_field_resize(self, moving: EditorFieldItem, width: float, height: float) -> tuple[float, float]:
+        scale = max(0.001, self.transform().m11())
+        snapped_width = max(44.0, width)
+        snapped_height = max(34.0, height)
+        target_rect = QRectF(moving.pos().x(), moving.pos().y(), snapped_width, snapped_height)
+        guides: list[FieldSnapGuide] = []
+        x_result = self._best_field_edge_grid_snap(target_rect.right(), "x", scale)
+        y_result = self._best_field_edge_grid_snap(target_rect.bottom() - HEADER_HEIGHT, "y", scale, HEADER_HEIGHT)
+        align_x = self._best_field_edge_align_snap(moving, target_rect, "x", scale)
+        align_y = self._best_field_edge_align_snap(moving, target_rect, "y", scale)
+        if align_x and (not x_result or align_x[1] <= x_result[1]):
+            x_result = align_x
+        if align_y and (not y_result or align_y[1] <= y_result[1]):
+            y_result = align_y
+        if x_result:
+            snapped_width = max(44.0, snapped_width + x_result[0])
+            guides.append(x_result[2])
+        if y_result:
+            snapped_height = max(34.0, snapped_height + y_result[0])
+            guides.append(y_result[2])
+        self.snap_guides = guides
+        self.viewport().update()
+        return snapped_width, snapped_height
+
+    def _best_field_grid_snap(
+        self,
+        value: float,
+        axis: str,
+        scale: float,
+        scene_offset: float = 0.0,
+    ) -> tuple[float, float, FieldSnapGuide] | None:
+        grid_value = round(value / FIELD_SNAP_UNIT) * FIELD_SNAP_UNIT
+        distance = abs(grid_value - value) * scale
+        if distance > FIELD_SNAP_THRESHOLD:
+            return None
+        return (
+            grid_value - value,
+            distance,
+            FieldSnapGuide(axis, grid_value + scene_offset, f"{axis.upper()} {grid_value:.0f}", "grid"),
+        )
+
+    def _best_field_edge_grid_snap(
+        self,
+        value: float,
+        axis: str,
+        scale: float,
+        scene_offset: float = 0.0,
+    ) -> tuple[float, float, FieldSnapGuide] | None:
+        result = self._best_field_grid_snap(value, axis, scale, scene_offset)
+        if result is None:
+            return None
+        delta, distance, guide = result
+        return delta, distance, FieldSnapGuide(axis, guide.value, f"{axis.upper()} 边 {value + delta:.0f}", "grid")
+
+    def _best_field_align_snap(
+        self,
+        moving: EditorFieldItem,
+        target_rect: QRectF,
+        axis: str,
+        scale: float,
+    ) -> tuple[float, float, FieldSnapGuide] | None:
+        moving_values = self._snap_axis_values(target_rect, axis)
+        best: tuple[float, float, FieldSnapGuide] | None = None
+        for other_rect, target_name in self._field_alignment_targets(moving):
+            other_values = self._snap_axis_values(other_rect, axis)
+            for moving_label, moving_value in moving_values.items():
+                for other_label, other_value in other_values.items():
+                    distance = abs(other_value - moving_value) * scale
+                    if distance <= FIELD_SNAP_THRESHOLD:
+                        delta = other_value - moving_value
+                        guide = FieldSnapGuide(
+                            axis,
+                            other_value,
+                            f"{target_name} {moving_label}/{other_label}",
+                        )
+                        if best is None or distance < best[1]:
+                            best = (delta, distance, guide)
+        return best
+
+    def _best_field_edge_align_snap(
+        self,
+        moving: EditorFieldItem,
+        target_rect: QRectF,
+        axis: str,
+        scale: float,
+    ) -> tuple[float, float, FieldSnapGuide] | None:
+        edge_value = target_rect.right() if axis == "x" else target_rect.bottom()
+        min_edge = target_rect.left() + 44.0 if axis == "x" else target_rect.top() + 34.0
+        best: tuple[float, float, FieldSnapGuide] | None = None
+        for other_rect, target_name in self._field_alignment_targets(moving):
+            other_values = self._snap_axis_values(other_rect, axis)
+            for other_label, other_value in other_values.items():
+                if other_value < min_edge:
+                    continue
+                distance = abs(other_value - edge_value) * scale
+                if distance <= FIELD_SNAP_THRESHOLD:
+                    delta = other_value - edge_value
+                    guide = FieldSnapGuide(axis, other_value, f"{target_name} 边/{other_label}")
+                    if best is None or distance < best[1]:
+                        best = (delta, distance, guide)
+        return best
+
+    def _field_alignment_targets(self, moving: EditorFieldItem) -> list[tuple[QRectF, str]]:
+        targets: list[tuple[QRectF, str]] = []
+        for item in self.scene_obj.items():
+            if not isinstance(item, EditorFieldItem) or item is moving:
+                continue
+            targets.append((item.sceneBoundingRect(), "字段"))
+        width, height = self._card_size()
+        content_rect = QRectF(0.0, HEADER_HEIGHT, width, max(1.0, height - HEADER_HEIGHT))
+        targets.append((content_rect, "节点"))
+        return targets
+
+    def _field_rect_at(self, item: EditorFieldItem, target: QPointF) -> QRectF:
+        rect = item.boundingRect()
+        return QRectF(target.x(), target.y(), rect.width(), rect.height())
+
+    def _snap_axis_values(self, rect: QRectF, axis: str) -> dict[str, float]:
+        if axis == "x":
+            return {"左": rect.left(), "中": rect.center().x(), "右": rect.right()}
+        return {"上": rect.top(), "中": rect.center().y(), "下": rect.bottom()}
 
     def wheelEvent(self, event) -> None:  # type: ignore[override]
         factor = 1.12 if event.angleDelta().y() > 0 else 1 / 1.12

@@ -417,6 +417,7 @@ class GameDesignerApp(QMainWindow):
         self._project_histories: dict[int, ProjectHistory] = {}
         self._copied_nodes: list[dict[str, Any]] = []
         self._paste_serial = 0
+        self._last_edge_style = "curve"
         self._report_startup_progress(48, "准备字体和主题...")
         configure_fonts()
         self.setWindowTitle("GameDesigner - 游戏设计师")
@@ -2108,6 +2109,7 @@ class GameDesignerApp(QMainWindow):
             return
         if style not in {"curve", "straight", "orthogonal"}:
             return
+        self._last_edge_style = style
         edge = next((item for item in page.canvas_data.edges if item.id == edge_id), None)
         if not edge or edge.style == style:
             return
@@ -2266,9 +2268,15 @@ class GameDesignerApp(QMainWindow):
         page = self._current_page()
         if not page or page.is_welcome:
             return
+        existing = next(
+            (item for item in page.canvas_data.edges if item.source == source and item.target == target),
+            None,
+        )
         edge = page.canvas_data.add_edge(source, target)
         if not edge:
             return
+        if existing is None and self._last_edge_style in {"curve", "straight", "orthogonal"}:
+            edge.style = self._last_edge_style
         page.canvas.rebuild()
         page.canvas.select_edge(edge.id)
         self._mark_dirty(page)

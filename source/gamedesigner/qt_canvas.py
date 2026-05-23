@@ -24,10 +24,12 @@ from PySide6.QtWidgets import (
     QGraphicsItem,
     QGraphicsObject,
     QGraphicsPathItem,
+    QGraphicsProxyWidget,
     QGraphicsScene,
     QGraphicsView,
     QInputDialog,
     QMenu,
+    QPlainTextEdit,
 )
 
 from .data_canvas import (
@@ -58,6 +60,14 @@ HEADER_HEIGHT = VISUAL_NODE_HEADER_HEIGHT
 ROW_GAP = 7.0
 ROW_TOP = HEADER_HEIGHT + 6.0
 RESIZE_HANDLE = 20.0
+CONNECTION_HANDLE_RADIUS = 4.5
+CONNECTION_HANDLE_HIT_RADIUS = 11.0
+EDGE_BEND_HANDLE_RADIUS = 5.5
+EDGE_BEND_HANDLE_HIT_RADIUS = 12.0
+ORTHOGONAL_STUB_LENGTH = 58.0
+ORTHOGONAL_ROUTE_MERGE_DISTANCE = 18.0
+ORTHOGONAL_ENDPOINT_AXIS_SNAP_DISTANCE = 48.0
+ORTHOGONAL_SEGMENT_MERGE_DISTANCE = 14.0
 GROUP_MIN_WIDTH = 220.0
 GROUP_MIN_HEIGHT = 120.0
 GROUP_HEADER_HEIGHT = 34.0
@@ -73,6 +83,25 @@ IMAGE_SOURCE_CACHE_LIMIT = 96
 IMAGE_SCALED_CACHE_LIMIT = 192
 INTERACTION_PREVIEW_DELAY_MS = 140
 _MISSING_PIXMAP = object()
+
+
+class InlineNodeFieldEditor(QPlainTextEdit):
+    editingFinished = Signal(bool)
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter) and event.modifiers() & Qt.ControlModifier:
+            self.editingFinished.emit(True)
+            event.accept()
+            return
+        if event.key() == Qt.Key_Escape:
+            self.editingFinished.emit(False)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def focusOutEvent(self, event) -> None:  # type: ignore[override]
+        self.editingFinished.emit(True)
+        super().focusOutEvent(event)
 
 
 def _safe_color(value: str, fallback: str) -> QColor:
@@ -256,8 +285,11 @@ class NodeItem(QGraphicsObject):
         self._resizing = False
         self._resize_origin = QPointF()
         self._resize_size = (0.0, 0.0)
+        self._resize_field_snapshot: list[tuple[NodeField, float, float, float, float, int]] = []
         self._pressed_pos = QPointF()
         self._moved = False
+        self._inline_candidate_field: NodeField | None = None
+        self._inline_candidate_rect = QRectF()
         self._sync_size()
         self.setPos(node.x, node.y)
         flags = QGraphicsItem.ItemIsSelectable
@@ -302,6 +334,8 @@ class NodeItem(QGraphicsObject):
 
         if self.view.can_resize_nodes() and (self.isSelected() or self.view.hover_node_id == self.node.id):
             self._paint_resize_handle(painter, colors, rect)
+        if self._shows_connection_handles():
+            self._paint_connection_handles(painter)
 
     def _paint_order_badge(self, painter: QPainter, colors: dict[str, str], rect: QRectF) -> None:
         if self.node.order <= 0:
@@ -567,6 +601,15 @@ class NodeItem(QGraphicsObject):
                 QPointF(rect.right() - 4, rect.bottom() - offset),
             )
 
+    def _paint_connection_handles(self, painter: QPainter) -> None:
+        fill = QColor("#FF496A")
+        outline = QColor("#FFFFFF" if self.view.theme == "dark" else "#1D1D1F")
+        painter.setBrush(QBrush(fill))
+        painter.setPen(QPen(outline, 1.2))
+        radius = CONNECTION_HANDLE_RADIUS
+        for point in self._connection_handle_points().values():
+            painter.drawEllipse(point, radius, radius)
+
     def _draw_adaptive_center_text(
         self,
         painter: QPainter,
@@ -602,11 +645,18 @@ class NodeItem(QGraphicsObject):
         return min_size
 
     def hoverMoveEvent(self, event) -> None:  # type: ignore[override]
-        if not self.view.can_resize_nodes():
-            self.setCursor(Qt.OpenHandCursor if self.view.can_move_nodes() else Qt.PointingHandCursor)
+        self.view.hover_node_id = self.node.id
+        connection_handle = self._connection_handle_at(event.pos())
+        if connection_handle:
+            self.setCursor(Qt.CrossCursor)
+            self.update()
             super().hoverMoveEvent(event)
             return
-        self.view.hover_node_id = self.node.id if self._on_resize_handle(event.pos()) else None
+        if not self.view.can_resize_nodes():
+            self.setCursor(Qt.OpenHandCursor if self.view.can_move_nodes() else Qt.PointingHandCursor)
+            self.update()
+            super().hoverMoveEvent(event)
+            return
         self.setCursor(Qt.SizeFDiagCursor if self._on_resize_handle(event.pos()) else Qt.OpenHandCursor)
         self.update()
         super().hoverMoveEvent(event)
@@ -619,6 +669,14 @@ class NodeItem(QGraphicsObject):
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         if event.button() == Qt.LeftButton:
+            connection_handle = self._connection_handle_at(event.pos())
+            if connection_handle:
+                self.view.begin_connection_drag(
+                    self.node.id,
+                    self.mapToScene(self._connection_handle_points()[connection_handle]),
+                )
+                event.accept()
+                return
             if QApplication.keyboardModifiers() & Qt.ControlModifier:
                 self.view.toggle_node_selection(self.node.id)
             elif not self.isSelected() or not self.view.has_multi_node_selection():
@@ -633,9 +691,13 @@ class NodeItem(QGraphicsObject):
                 self._resizing = True
                 self._resize_origin = event.scenePos()
                 self._resize_size = (self.width, self.height)
+                self._resize_field_snapshot = self._visual_resize_snapshot()
                 self.setCursor(Qt.SizeFDiagCursor)
                 event.accept()
                 return
+            field_hit = self._editable_field_at(event.pos())
+            self._inline_candidate_field = field_hit[0] if field_hit else None
+            self._inline_candidate_rect = field_hit[1] if field_hit else QRectF()
         super().mousePressEvent(event)
 
     def mouseDoubleClickEvent(self, event) -> None:  # type: ignore[override]
@@ -648,6 +710,10 @@ class NodeItem(QGraphicsObject):
         super().mouseDoubleClickEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
+        if self.view.is_connection_dragging_from(self.node.id):
+            self.view.update_connection_drag(event.scenePos())
+            event.accept()
+            return
         if self._resizing:
             delta = event.scenePos() - self._resize_origin
             self.prepareGeometryChange()
@@ -658,6 +724,8 @@ class NodeItem(QGraphicsObject):
             requested_height = max(min_height, self._resize_size[1] + delta.y())
             if has_visual_layout:
                 self.height = requested_height
+                if not self.view.is_data_canvas():
+                    self._scale_visual_fields_for_resize()
             else:
                 self.height = max(requested_height, self._natural_detail_height(self.width))
             self.node.width = self.width
@@ -669,11 +737,18 @@ class NodeItem(QGraphicsObject):
             return
         if (event.scenePos() - self._pressed_pos).manhattanLength() > 1:
             self._moved = True
+            self._inline_candidate_field = None
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        if self.view.is_connection_dragging_from(self.node.id):
+            self.view.finish_connection_drag(event.scenePos())
+            self.setCursor(Qt.OpenHandCursor)
+            event.accept()
+            return
         was_resizing = self._resizing
         self._resizing = False
+        self._resize_field_snapshot = []
         self.setCursor(Qt.OpenHandCursor)
         self.view.snap_guides.clear()
         self.view.viewport().update()
@@ -687,6 +762,18 @@ class NodeItem(QGraphicsObject):
             else:
                 self.view.refresh_group_membership()
                 self.view.projectChanged.emit()
+        elif (
+            event.button() == Qt.LeftButton
+            and self._inline_candidate_field is not None
+            and not was_resizing
+        ):
+            self.view.start_inline_field_edit(self, self._inline_candidate_field, self._inline_candidate_rect)
+            event.accept()
+            self._inline_candidate_field = None
+            self._inline_candidate_rect = QRectF()
+            return
+        self._inline_candidate_field = None
+        self._inline_candidate_rect = QRectF()
         super().mouseReleaseEvent(event)
 
     def itemChange(self, change: QGraphicsItem.GraphicsItemChange, value):  # type: ignore[override]
@@ -797,14 +884,19 @@ class NodeItem(QGraphicsObject):
         )
 
     def _horizontal_data_segments(self) -> list[tuple[NodeField, float, float]]:
+        return [(field, label_w, segment_w) for field, label_w, segment_w, _x in self._horizontal_data_segments_with_x()]
+
+    def _horizontal_data_segments_with_x(self) -> list[tuple[NodeField, float, float, float]]:
         name_metrics = QFontMetrics(_font(8, True))
         value_metrics = QFontMetrics(_font(9))
-        segments: list[tuple[NodeField, float, float]] = []
+        segments: list[tuple[NodeField, float, float, float]] = []
+        x = 10.0
         for field in self.node.fields:
             label_w = min(140.0, max(46.0, float(name_metrics.horizontalAdvance(field.name) + 4)))
             value_w = min(360.0, max(44.0, float(value_metrics.horizontalAdvance(self._horizontal_field_value(field) or " ") + 6)))
             segment_w = max(140.0, min(320.0, label_w + value_w + 28.0))
-            segments.append((field, label_w, segment_w))
+            segments.append((field, label_w, segment_w, x))
+            x += segment_w + ROW_GAP
         return segments
 
     def _horizontal_field_value(self, field: NodeField) -> str:
@@ -850,6 +942,104 @@ class NodeItem(QGraphicsObject):
         rect = self.boundingRect()
         return pos.x() >= rect.right() - RESIZE_HANDLE and pos.y() >= rect.bottom() - RESIZE_HANDLE
 
+    def field_scene_rect(self, field: NodeField) -> QRectF:
+        for candidate, rect in self._editable_field_rects():
+            if candidate is field:
+                return self.mapRectToScene(rect)
+        return QRectF()
+
+    def _editable_field_at(self, pos: QPointF) -> tuple[NodeField, QRectF] | None:
+        if self.view.read_only or self.view.is_inline_field_editing():
+            return None
+        for field, rect in reversed(self._editable_field_rects()):
+            if rect.contains(pos):
+                return field, rect
+        return None
+
+    def _editable_field_rects(self) -> list[tuple[NodeField, QRectF]]:
+        if self._uses_horizontal_thumbnail_row():
+            return []
+        if self._uses_horizontal_data_row():
+            return [
+                (field, QRectF(x, ROW_TOP, segment_w, 42.0))
+                for field, _label_w, segment_w, x in self._horizontal_data_segments_with_x()
+                if field.data_type != "图片"
+            ]
+        visual_fields = [field for field in self.node.fields if field.has_visual_layout()]
+        if visual_fields:
+            return [
+                (
+                    field,
+                    QRectF(
+                        field.x,
+                        HEADER_HEIGHT + field.y,
+                        max(24.0, field.width),
+                        max(22.0, field.height),
+                    ),
+                )
+                for field in visual_fields
+                if field.data_type != "图片"
+            ]
+        name_w, type_w = self._row_column_widths()
+        y = ROW_TOP
+        rects: list[tuple[NodeField, QRectF]] = []
+        for field in self.node.fields:
+            row_h = self._row_height(field, self.width, name_w, type_w)
+            value_x = 20 + name_w + 14
+            rects.append((field, QRectF(value_x, y + 8, self.width - value_x - 20, row_h - 16)))
+            y += row_h + ROW_GAP
+        return rects
+
+    def _visual_resize_snapshot(self) -> list[tuple[NodeField, float, float, float, float, int]]:
+        if self.view.is_data_canvas():
+            return []
+        return [
+            (field, field.x, field.y, field.width, field.height, field.font_size)
+            for field in self.node.fields
+            if field.has_visual_layout()
+        ]
+
+    def _scale_visual_fields_for_resize(self) -> None:
+        if not self._resize_field_snapshot:
+            return
+        origin_width = max(1.0, self._resize_size[0])
+        origin_content_height = max(1.0, self._resize_size[1] - HEADER_HEIGHT)
+        scale_x = max(0.05, self.width / origin_width)
+        scale_y = max(0.05, (self.height - HEADER_HEIGHT) / origin_content_height)
+        font_scale = max(0.25, min(4.0, min(scale_x, scale_y)))
+        for field, x, y, width, height, font_size in self._resize_field_snapshot:
+            field.x = max(0.0, x * scale_x)
+            field.y = max(0.0, y * scale_y)
+            field.width = max(44.0, width * scale_x)
+            field.height = max(34.0, height * scale_y)
+            field.font_size = max(8, min(48, int(round(font_size * font_scale))))
+
+    def _shows_connection_handles(self) -> bool:
+        return bool(
+            self.view.can_create_edges()
+            and not self._uses_horizontal_thumbnail_row()
+            and (self.isSelected() or self.view.hover_node_id == self.node.id or self.view.connection_source == self.node.id)
+        )
+
+    def _connection_handle_points(self) -> dict[str, QPointF]:
+        rect = self.boundingRect()
+        inset = CONNECTION_HANDLE_RADIUS + 1.0
+        return {
+            "top": QPointF(rect.center().x(), rect.top() + inset),
+            "right": QPointF(rect.right() - inset, rect.center().y()),
+            "bottom": QPointF(rect.center().x(), rect.bottom() - inset),
+            "left": QPointF(rect.left() + inset, rect.center().y()),
+        }
+
+    def _connection_handle_at(self, pos: QPointF) -> str | None:
+        if not self.view.can_create_edges() or self._uses_horizontal_thumbnail_row():
+            return None
+        for side, point in self._connection_handle_points().items():
+            delta = point - pos
+            if math.hypot(delta.x(), delta.y()) <= CONNECTION_HANDLE_HIT_RADIUS:
+                return side
+        return None
+
 
 class EdgeItem(QGraphicsPathItem):
     def __init__(self, edge: Edge, source: QGraphicsItem, target: QGraphicsItem, view: "NodeGraphView") -> None:
@@ -858,6 +1048,10 @@ class EdgeItem(QGraphicsPathItem):
         self.source = source
         self.target = target
         self.view = view
+        self._dragging_bend = False
+        self._dragging_route_index: int | None = None
+        self._selected_route_index: int | None = None
+        self._dragging_bend_changed = False
         self.setZValue(0)
         self.setFlags(QGraphicsItem.ItemIsSelectable)
         self.setAcceptHoverEvents(True)
@@ -882,19 +1076,8 @@ class EdgeItem(QGraphicsPathItem):
             self.setPath(path)
             return
 
-        dx = end.x() - start.x()
-        dy = end.y() - start.y()
+        c1, c2 = self._curve_control_points(start, end, source_rect, target_rect)
         path = QPainterPath(start)
-        if abs(dx) >= abs(dy):
-            pull = max(70.0, min(abs(dx) * 0.45, 190.0))
-            direction = 1.0 if dx >= 0 else -1.0
-            c1 = QPointF(start.x() + pull * direction, start.y())
-            c2 = QPointF(end.x() - pull * direction, end.y())
-        else:
-            pull = max(70.0, min(abs(dy) * 0.45, 190.0))
-            direction = 1.0 if dy >= 0 else -1.0
-            c1 = QPointF(start.x(), start.y() + pull * direction)
-            c2 = QPointF(end.x(), end.y() - pull * direction)
         path.cubicTo(c1, c2, end)
         self.setPath(path)
 
@@ -909,6 +1092,8 @@ class EdgeItem(QGraphicsPathItem):
         painter.setPen(QPen(edge_color, 3.2 if selected else 2.2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
         painter.drawPath(self.path())
         self._draw_arrow(painter, edge_color)
+        if selected and self.edge.style == "orthogonal":
+            self._paint_bend_handles(painter, colors)
         if self.edge.label:
             point = self.path().pointAtPercent(0.5)
             painter.setPen(QColor(colors["edge_label"]))
@@ -922,10 +1107,73 @@ class EdgeItem(QGraphicsPathItem):
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         if event.button() == Qt.LeftButton:
+            was_selected = self.isSelected()
             self.view.select_edge(self.edge.id)
+            bend_hit = self._bend_handle_at(event.pos())
+            if bend_hit is not None:
+                route_index, route_point = bend_hit
+                if route_index is None:
+                    route_index = self._set_route_points([route_point])
+                self._dragging_bend = True
+                self._dragging_route_index = route_index
+                self._selected_route_index = route_index
+                self._dragging_bend_changed = False
+                self.setCursor(Qt.SizeAllCursor)
+                event.accept()
+                return
+            if was_selected and self.edge.style == "orthogonal":
+                inserted_index = self._insert_route_point_at(event.scenePos())
+                if inserted_index is not None:
+                    self._dragging_bend = True
+                    self._dragging_route_index = inserted_index
+                    self._selected_route_index = inserted_index
+                    self._dragging_bend_changed = True
+                    self.setCursor(Qt.SizeAllCursor)
+                    self.update_path()
+                    event.accept()
+                    return
+            self._selected_route_index = None
+            self.update()
             event.accept()
             return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
+        if self._dragging_bend:
+            scene_pos = event.scenePos()
+            if self._move_route_point(self._dragging_route_index, scene_pos):
+                self._dragging_bend_changed = True
+            self.update_path()
+            self.update()
+            self.view.viewport().update()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        if self._dragging_bend:
+            changed = self._dragging_bend_changed
+            self._dragging_bend = False
+            self._dragging_route_index = None
+            self._dragging_bend_changed = False
+            self.unsetCursor()
+            self.view.select_edge(self.edge.id)
+            if changed:
+                self.view.projectChanged.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def hoverMoveEvent(self, event) -> None:  # type: ignore[override]
+        if self._bend_handle_at(event.pos()):
+            self.setCursor(Qt.SizeAllCursor)
+        else:
+            self.setCursor(Qt.PointingHandCursor)
+        super().hoverMoveEvent(event)
+
+    def hoverLeaveEvent(self, event) -> None:  # type: ignore[override]
+        self.unsetCursor()
+        super().hoverLeaveEvent(event)
 
     def _draw_arrow(self, painter: QPainter, color: QColor) -> None:
         path = self.path()
@@ -952,6 +1200,8 @@ class EdgeItem(QGraphicsPathItem):
                 points = list(polygons[0])
                 if len(points) >= 2:
                     return points[-2]
+        if self.edge.style == "curve":
+            return path.pointAtPercent(0.995)
         return path.pointAtPercent(0.97)
 
     def _anchor(self, rect: QRectF, other: QRectF) -> QPointF:
@@ -963,6 +1213,249 @@ class EdgeItem(QGraphicsPathItem):
             return QPointF(rect.right() if dx >= 0 else rect.left(), center.y())
         return QPointF(center.x(), rect.bottom() if dy >= 0 else rect.top())
 
+    def _curve_control_points(
+        self,
+        start: QPointF,
+        end: QPointF,
+        source_rect: QRectF,
+        target_rect: QRectF,
+    ) -> tuple[QPointF, QPointF]:
+        distance = max(1.0, math.hypot(end.x() - start.x(), end.y() - start.y()))
+        pull = max(70.0, min(distance * 0.34, 220.0))
+        source_vector = self._normalized(start - source_rect.center())
+        target_vector = self._normalized(target_rect.center() - end)
+        if source_vector is None or target_vector is None:
+            dx = end.x() - start.x()
+            dy = end.y() - start.y()
+            if abs(dx) >= abs(dy):
+                direction = 1.0 if dx >= 0 else -1.0
+                source_vector = QPointF(direction, 0)
+                target_vector = QPointF(direction, 0)
+            else:
+                direction = 1.0 if dy >= 0 else -1.0
+                source_vector = QPointF(0, direction)
+                target_vector = QPointF(0, direction)
+        c1 = start + source_vector * pull
+        c2 = end - target_vector * pull
+        return c1, c2
+
+    def _paint_bend_handles(self, painter: QPainter, colors: dict[str, str]) -> None:
+        painter.setPen(QPen(QColor("#FFFFFF" if self.view.theme == "dark" else colors["accent_dark"]), 1.4))
+        for point, route_index in self._bend_handles():
+            painter.setBrush(QBrush(QColor(colors["warning"] if route_index == self._selected_route_index else colors["blue"])))
+            painter.drawEllipse(point, EDGE_BEND_HANDLE_RADIUS, EDGE_BEND_HANDLE_RADIUS)
+
+    def _bend_handles(self) -> list[tuple[QPointF, int | None]]:
+        if self.edge.style != "orthogonal":
+            return []
+        route_points = self._route_points()
+        if route_points:
+            return [(point, index) for index, point in enumerate(route_points)]
+        source_rect = self.source.sceneBoundingRect()
+        target_rect = self.target.sceneBoundingRect()
+        start = self._anchor(source_rect, target_rect)
+        end = self._anchor(target_rect, source_rect)
+        points = self._orthogonal_points(start, end, source_rect, target_rect)
+        if len(points) < 3:
+            return []
+        handles: list[tuple[QPointF, int | None]] = []
+        for index in range(1, len(points) - 1):
+            previous = points[index - 1]
+            point = points[index]
+            next_point = points[index + 1]
+            if not self._is_turn(previous, point, next_point):
+                continue
+            if not any(math.hypot(point.x() - existing.x(), point.y() - existing.y()) < 0.5 for existing, _route_index in handles):
+                handles.append((point, None))
+        return handles
+
+    def _bend_handle_at(self, pos: QPointF) -> tuple[int | None, QPointF] | None:
+        if self.edge.style != "orthogonal" or not self.isSelected():
+            return None
+        scene_pos = self.mapToScene(pos)
+        for point, route_index in self._bend_handles():
+            if math.hypot(scene_pos.x() - point.x(), scene_pos.y() - point.y()) <= EDGE_BEND_HANDLE_HIT_RADIUS:
+                return route_index, point
+        return None
+
+    def delete_selected_route_point(self) -> bool:
+        route_index = self._selected_route_index
+        return self.delete_route_point(route_index)
+
+    def delete_route_point(self, route_index: int | None) -> bool:
+        route_points = self._route_points()
+        if route_index is None or route_index < 0 or route_index >= len(route_points):
+            return False
+        del route_points[route_index]
+        self._set_route_points(route_points)
+        self._selected_route_index = None
+        self.update_path()
+        self.update()
+        self.view.viewport().update()
+        return True
+
+    def route_point_index_at_scene(self, scene_pos: QPointF) -> int | None:
+        hit = self._bend_handle_at(self.mapFromScene(scene_pos))
+        if hit is None:
+            return None
+        route_index, _route_point = hit
+        return route_index
+
+    def delete_route_point_at_scene(self, scene_pos: QPointF) -> bool:
+        return self.delete_route_point(self.route_point_index_at_scene(scene_pos))
+
+    def _insert_route_point_at(self, scene_pos: QPointF) -> int | None:
+        source_rect = self.source.sceneBoundingRect()
+        target_rect = self.target.sceneBoundingRect()
+        start = self._anchor(source_rect, target_rect)
+        end = self._anchor(target_rect, source_rect)
+        path_points = self._orthogonal_points(start, end, source_rect, target_rect)
+        segment_index = self._segment_index_at(path_points, scene_pos)
+        if segment_index is None:
+            return None
+        route_points = self._route_points()
+        insert_index = self._route_insert_index_for_segment(segment_index, path_points, route_points)
+        route_points.insert(insert_index, QPointF(scene_pos))
+        return self._set_route_points(route_points, preferred_index=insert_index)
+
+    def _move_route_point(self, route_index: int | None, scene_pos: QPointF) -> bool:
+        if route_index is None:
+            return False
+        route_points = self._route_points()
+        if route_index < 0 or route_index >= len(route_points):
+            return False
+        current = route_points[route_index]
+        if math.hypot(current.x() - scene_pos.x(), current.y() - scene_pos.y()) < 0.5:
+            return False
+        route_points[route_index] = QPointF(scene_pos)
+        merge_index = self._set_route_points(route_points, preferred_index=route_index)
+        current_route = self._route_points()
+        self._selected_route_index = min(merge_index, max(0, len(current_route) - 1)) if current_route else None
+        self._dragging_route_index = self._selected_route_index
+        return True
+
+    def _route_points(self) -> list[QPointF]:
+        route = getattr(self.edge, "orthogonal_route", [])
+        if route:
+            return self._normalized_route_points([QPointF(float(point["x"]), float(point["y"])) for point in route])
+        if self.edge.orthogonal_bend_x is not None and self.edge.orthogonal_bend_y is not None:
+            return self._normalized_route_points([QPointF(self.edge.orthogonal_bend_x, self.edge.orthogonal_bend_y)])
+        return []
+
+    def _set_route_points(self, points: list[QPointF], preferred_index: int | None = None) -> int:
+        cleaned = [QPointF(point) for point in points]
+        selected_index = self._merge_close_route_points(cleaned, preferred_index=preferred_index)
+        cleaned = self._snap_route_points_for_endpoints(cleaned)
+        selected_index = min(selected_index, max(0, len(cleaned) - 1)) if cleaned else 0
+        self.edge.orthogonal_route = [{"x": point.x(), "y": point.y()} for point in cleaned]
+        if cleaned:
+            self.edge.orthogonal_bend_x = cleaned[0].x()
+            self.edge.orthogonal_bend_y = cleaned[0].y()
+        else:
+            self.edge.orthogonal_bend_x = None
+            self.edge.orthogonal_bend_y = None
+        return selected_index
+
+    def _merge_close_route_points(self, points: list[QPointF], preferred_index: int | None = None) -> int:
+        index = 1
+        selected_index = preferred_index if preferred_index is not None else 0
+        while index < len(points):
+            if self._point_distance(points[index - 1], points[index]) <= ORTHOGONAL_ROUTE_MERGE_DISTANCE:
+                merged = self._average_point(points[index - 1], points[index])
+                points[index - 1] = merged
+                del points[index]
+                if selected_index is not None and selected_index >= index:
+                    selected_index -= 1
+                continue
+            index += 1
+        return max(0, min(selected_index or 0, len(points) - 1)) if points else 0
+
+    def _merged_route_points(self, points: list[QPointF]) -> list[QPointF]:
+        merged = [QPointF(point) for point in points]
+        self._merge_close_route_points(merged)
+        return merged
+
+    def _normalized_route_points(self, points: list[QPointF]) -> list[QPointF]:
+        normalized = self._merged_route_points(points)
+        normalized = self._snap_route_points_for_endpoints(normalized)
+        self._merge_close_route_points(normalized)
+        return normalized
+
+    def _snap_route_points_for_endpoints(self, points: list[QPointF]) -> list[QPointF]:
+        if not points:
+            return []
+        snapped = [QPointF(point) for point in points]
+        source_rect = self.source.sceneBoundingRect()
+        target_rect = self.target.sceneBoundingRect()
+        start = self._anchor(source_rect, target_rect)
+        end = self._anchor(target_rect, source_rect)
+        source_normal = self._anchor_normal(source_rect, start)
+        target_normal = self._anchor_normal(target_rect, end)
+        source_stub = start + source_normal * ORTHOGONAL_STUB_LENGTH
+        target_stub = end + target_normal * ORTHOGONAL_STUB_LENGTH
+        source_axis = self._axis_for_vector(source_normal)
+        target_axis = self._axis_for_vector(target_normal)
+        self._snap_point_to_axis(snapped[0], source_stub, self._perpendicular_axis(source_axis))
+        self._snap_point_to_axis(snapped[-1], target_stub, target_axis, ORTHOGONAL_ENDPOINT_AXIS_SNAP_DISTANCE)
+        self._snap_point_to_axis(snapped[-1], target_stub, self._perpendicular_axis(target_axis))
+        for index in range(1, len(snapped)):
+            previous = snapped[index - 1]
+            current = snapped[index]
+            if abs(previous.x() - current.x()) <= ORTHOGONAL_ROUTE_MERGE_DISTANCE:
+                x = (previous.x() + current.x()) / 2
+                previous.setX(x)
+                current.setX(x)
+            if abs(previous.y() - current.y()) <= ORTHOGONAL_ROUTE_MERGE_DISTANCE:
+                y = (previous.y() + current.y()) / 2
+                previous.setY(y)
+                current.setY(y)
+        return snapped
+
+    def _snap_point_to_axis(
+        self,
+        point: QPointF,
+        anchor: QPointF,
+        axis: str,
+        distance: float = ORTHOGONAL_ROUTE_MERGE_DISTANCE,
+    ) -> None:
+        if axis == "y" and abs(point.x() - anchor.x()) <= distance:
+            point.setX(anchor.x())
+        elif axis == "x" and abs(point.y() - anchor.y()) <= distance:
+            point.setY(anchor.y())
+
+    def _segment_index_at(self, points: list[QPointF], scene_pos: QPointF) -> int | None:
+        if len(points) < 2:
+            return None
+        scale = max(0.001, self.view.transform().m11())
+        threshold = max(7.0, 10.0 / scale)
+        best: tuple[float, int] | None = None
+        for index in range(len(points) - 1):
+            distance = self._distance_to_segment(scene_pos, points[index], points[index + 1])
+            if distance <= threshold and (best is None or distance < best[0]):
+                best = (distance, index)
+        return best[1] if best else None
+
+    def _route_insert_index_for_segment(
+        self,
+        segment_index: int,
+        path_points: list[QPointF],
+        route_points: list[QPointF],
+    ) -> int:
+        if not route_points:
+            return 0
+        route_path_indices: list[int] = []
+        for route_point in route_points:
+            path_index = next(
+                (
+                    index
+                    for index, path_point in enumerate(path_points)
+                    if math.hypot(path_point.x() - route_point.x(), path_point.y() - route_point.y()) < 0.5
+                ),
+                len(path_points),
+            )
+            route_path_indices.append(path_index)
+        return sum(1 for path_index in route_path_indices if path_index <= segment_index)
+
     def _orthogonal_points(
         self,
         start: QPointF,
@@ -970,34 +1463,201 @@ class EdgeItem(QGraphicsPathItem):
         source_rect: QRectF,
         target_rect: QRectF,
     ) -> list[QPointF]:
+        source_normal = self._anchor_normal(source_rect, start)
+        target_normal = self._anchor_normal(target_rect, end)
+        source_stub = start + source_normal * ORTHOGONAL_STUB_LENGTH
+        target_stub = end + target_normal * ORTHOGONAL_STUB_LENGTH
+        route_points = self._route_points() or self._legacy_axis_route_points(source_stub, target_stub)
+
+        source_axis = self._axis_for_vector(source_normal)
+        target_axis = self._axis_for_vector(target_normal)
+        first_axis = self._perpendicular_axis(source_axis)
+        last_axis = self._perpendicular_axis(target_axis)
+        points = [start, source_stub]
+        current = source_stub
+        previous_axis = source_axis
+
+        for route_index, route_point in enumerate(route_points):
+            connector_axis = self._perpendicular_axis(previous_axis)
+            if route_index == 0 and self._axis_between(current, route_point) == source_axis:
+                additions = [route_point]
+            else:
+                additions = self._orthogonal_connector(current, route_point, first_axis=connector_axis)
+            points.extend(additions)
+            previous_axis = self._last_segment_axis(points, previous_axis)
+            current = route_point
+
+        connector_axis = self._perpendicular_axis(previous_axis) if route_points else first_axis
+        if route_points and self._axis_between(current, target_stub) == target_axis:
+            points.append(target_stub)
+        else:
+            points.extend(
+                self._orthogonal_connector(
+                    current,
+                    target_stub,
+                    first_axis=connector_axis,
+                    last_axis=last_axis,
+                )
+            )
+        points.append(end)
+        return self._clean_orthogonal_points(points)
+
+    def _legacy_axis_route_points(self, source_stub: QPointF, target_stub: QPointF) -> list[QPointF]:
+        if self.edge.orthogonal_bend_x is not None and self.edge.orthogonal_bend_y is None:
+            x = self.edge.orthogonal_bend_x
+            return [QPointF(x, source_stub.y()), QPointF(x, target_stub.y())]
+        if self.edge.orthogonal_bend_y is not None and self.edge.orthogonal_bend_x is None:
+            y = self.edge.orthogonal_bend_y
+            return [QPointF(source_stub.x(), y), QPointF(target_stub.x(), y)]
+        return []
+
+    def _orthogonal_connector(
+        self,
+        start: QPointF,
+        end: QPointF,
+        *,
+        first_axis: str | None = None,
+        last_axis: str | None = None,
+    ) -> list[QPointF]:
         dx = end.x() - start.x()
         dy = end.y() - start.y()
-        if abs(dx) >= abs(dy):
-            mid_x = (start.x() + end.x()) / 2
-            if abs(dx) < 80:
-                if start.x() >= source_rect.center().x():
-                    mid_x = max(source_rect.right(), target_rect.right()) + 58
-                else:
-                    mid_x = min(source_rect.left(), target_rect.left()) - 58
-            return [
-                start,
-                QPointF(mid_x, start.y()),
-                QPointF(mid_x, end.y()),
-                end,
-            ]
+        if abs(dx) < 0.5 and abs(dy) < 0.5:
+            return [end]
+        direct_axis = "x" if abs(dy) < 0.5 else "y" if abs(dx) < 0.5 else None
+        if direct_axis is not None:
+            if (first_axis and first_axis != direct_axis) or (last_axis and last_axis != direct_axis):
+                return self._detour_connector(start, end, direct_axis, first_axis, last_axis)
+            return [end]
 
-        mid_y = (start.y() + end.y()) / 2
-        if abs(dy) < 80:
-            if start.y() >= source_rect.center().y():
-                mid_y = max(source_rect.bottom(), target_rect.bottom()) + 58
-            else:
-                mid_y = min(source_rect.top(), target_rect.top()) - 58
-        return [
-            start,
-            QPointF(start.x(), mid_y),
-            QPointF(end.x(), mid_y),
-            end,
-        ]
+        if first_axis and last_axis and first_axis == last_axis:
+            if first_axis == "x":
+                mid_x = (start.x() + end.x()) / 2
+                return [QPointF(mid_x, start.y()), QPointF(mid_x, end.y()), end]
+            mid_y = (start.y() + end.y()) / 2
+            return [QPointF(start.x(), mid_y), QPointF(end.x(), mid_y), end]
+        axis = first_axis or ("x" if abs(dx) >= abs(dy) else "y")
+        if last_axis and not first_axis:
+            axis = "y" if last_axis == "x" else "x"
+        if axis == "x":
+            return [QPointF(end.x(), start.y()), end]
+        return [QPointF(start.x(), end.y()), end]
+
+    def _detour_connector(
+        self,
+        start: QPointF,
+        end: QPointF,
+        direct_axis: str,
+        first_axis: str | None,
+        last_axis: str | None,
+    ) -> list[QPointF]:
+        offset = ORTHOGONAL_STUB_LENGTH
+        if direct_axis == "x":
+            sign = 1.0 if (end.y() - start.y()) >= 0 else -1.0
+            y = start.y() + offset * sign
+            if first_axis == "x" and last_axis == "x":
+                y = (start.y() + end.y()) / 2
+            return [QPointF(start.x(), y), QPointF(end.x(), y), end]
+        sign = 1.0 if (end.x() - start.x()) >= 0 else -1.0
+        x = start.x() + offset * sign
+        if first_axis == "y" and last_axis == "y":
+            x = (start.x() + end.x()) / 2
+        return [QPointF(x, start.y()), QPointF(x, end.y()), end]
+
+    def _clean_orthogonal_points(self, points: list[QPointF]) -> list[QPointF]:
+        cleaned: list[QPointF] = []
+        for point in points:
+            if cleaned and self._point_distance(point, cleaned[-1]) < 0.5:
+                continue
+            cleaned.append(point)
+        changed = True
+        while changed and len(cleaned) >= 3:
+            changed = False
+            reduced: list[QPointF] = [cleaned[0]]
+            for index in range(1, len(cleaned) - 1):
+                previous = reduced[-1]
+                point = cleaned[index]
+                next_point = cleaned[index + 1]
+                if self._can_remove_orthogonal_point(previous, point, next_point):
+                    changed = True
+                    continue
+                reduced.append(point)
+            reduced.append(cleaned[-1])
+            cleaned = reduced
+        return cleaned
+
+    def _can_remove_orthogonal_point(self, previous: QPointF, point: QPointF, next_point: QPointF) -> bool:
+        if not self._is_axis_aligned(previous, next_point):
+            return False
+        if self._point_distance(previous, point) <= ORTHOGONAL_SEGMENT_MERGE_DISTANCE:
+            return True
+        if self._point_distance(point, next_point) <= ORTHOGONAL_SEGMENT_MERGE_DISTANCE:
+            return True
+        return self._is_redundant_orthogonal_point(previous, point, next_point)
+
+    def _is_redundant_orthogonal_point(self, previous: QPointF, point: QPointF, next_point: QPointF) -> bool:
+        if abs(previous.x() - point.x()) <= ORTHOGONAL_SEGMENT_MERGE_DISTANCE and abs(point.x() - next_point.x()) <= ORTHOGONAL_SEGMENT_MERGE_DISTANCE:
+            return True
+        if abs(previous.y() - point.y()) <= ORTHOGONAL_SEGMENT_MERGE_DISTANCE and abs(point.y() - next_point.y()) <= ORTHOGONAL_SEGMENT_MERGE_DISTANCE:
+            return True
+        return False
+
+    def _is_axis_aligned(self, first: QPointF, second: QPointF) -> bool:
+        return abs(first.x() - second.x()) < 0.5 or abs(first.y() - second.y()) < 0.5
+
+    def _point_distance(self, first: QPointF, second: QPointF) -> float:
+        return math.hypot(first.x() - second.x(), first.y() - second.y())
+
+    def _average_point(self, first: QPointF, second: QPointF) -> QPointF:
+        return QPointF((first.x() + second.x()) / 2, (first.y() + second.y()) / 2)
+
+    def _anchor_normal(self, rect: QRectF, anchor: QPointF) -> QPointF:
+        delta = anchor - rect.center()
+        if abs(delta.x()) >= abs(delta.y()):
+            return QPointF(1.0 if delta.x() >= 0 else -1.0, 0.0)
+        return QPointF(0.0, 1.0 if delta.y() >= 0 else -1.0)
+
+    def _axis_for_vector(self, vector: QPointF) -> str:
+        return "x" if abs(vector.x()) >= abs(vector.y()) else "y"
+
+    def _perpendicular_axis(self, axis: str) -> str:
+        return "y" if axis == "x" else "x"
+
+    def _last_segment_axis(self, points: list[QPointF], fallback: str) -> str:
+        if len(points) < 2:
+            return fallback
+        delta = points[-1] - points[-2]
+        if abs(delta.x()) < 0.5 and abs(delta.y()) < 0.5:
+            return fallback
+        return "x" if abs(delta.x()) >= abs(delta.y()) else "y"
+
+    def _axis_between(self, start: QPointF, end: QPointF) -> str | None:
+        if abs(start.x() - end.x()) < 0.5:
+            return "y"
+        if abs(start.y() - end.y()) < 0.5:
+            return "x"
+        return None
+
+    def _is_turn(self, previous: QPointF, point: QPointF, next_point: QPointF) -> bool:
+        first_axis = self._last_segment_axis([previous, point], "")
+        second_axis = self._last_segment_axis([point, next_point], "")
+        return bool(first_axis and second_axis and first_axis != second_axis)
+
+    def _distance_to_segment(self, point: QPointF, start: QPointF, end: QPointF) -> float:
+        dx = end.x() - start.x()
+        dy = end.y() - start.y()
+        length_sq = dx * dx + dy * dy
+        if length_sq < 0.001:
+            return math.hypot(point.x() - start.x(), point.y() - start.y())
+        t = ((point.x() - start.x()) * dx + (point.y() - start.y()) * dy) / length_sq
+        t = max(0.0, min(1.0, t))
+        projection = QPointF(start.x() + dx * t, start.y() + dy * t)
+        return math.hypot(point.x() - projection.x(), point.y() - projection.y())
+
+    def _normalized(self, vector: QPointF) -> QPointF | None:
+        length = math.hypot(vector.x(), vector.y())
+        if length < 0.001:
+            return None
+        return QPointF(vector.x() / length, vector.y() / length)
 
 
 class DataCanvasHeaderItem(QGraphicsObject):
@@ -1101,6 +1761,13 @@ class NodeGraphView(QGraphicsView):
         self.selected_edge_id: str | None = None
         self.connecting = False
         self.connection_source: str | None = None
+        self.connection_anchor_scene: QPointF | None = None
+        self._connection_dragging = False
+        self._pending_drag_edge: tuple[str, str] | None = None
+        self._inline_proxy: QGraphicsProxyWidget | None = None
+        self._inline_editor: InlineNodeFieldEditor | None = None
+        self._inline_field: NodeField | None = None
+        self._inline_original_value = ""
         self.mouse_scene = QPointF()
         self.hover_node_id: str | None = None
         self.snap_guides: list[SnapGuide] = []
@@ -1152,6 +1819,84 @@ class NodeGraphView(QGraphicsView):
             fields = self._data_canvas_template_fields()
             return self.can_move_nodes() and any(field.has_visual_layout() for field in fields)
         return self.can_move_nodes()
+
+    def can_create_edges(self) -> bool:
+        return not self.read_only and not self.is_data_canvas()
+
+    def is_inline_field_editing(self) -> bool:
+        return self._inline_proxy is not None
+
+    def start_inline_field_edit(self, item: NodeItem, field: NodeField, local_rect: QRectF | None = None) -> None:
+        if self.read_only or field.data_type == "图片":
+            return
+        self._close_inline_field_editor(commit=True)
+        self.select_node(item.node.id)
+        rect = item.mapRectToScene(local_rect if local_rect is not None and local_rect.isValid() else item.field_scene_rect(field))
+        if local_rect is None or not local_rect.isValid():
+            rect = item.field_scene_rect(field)
+        if not rect.isValid() or rect.width() <= 0 or rect.height() <= 0:
+            return
+        editor = InlineNodeFieldEditor()
+        editor.setObjectName("inlineCanvasFieldEditor")
+        editor.setPlainText(field.value)
+        editor.setStyleSheet(
+            "QPlainTextEdit#inlineCanvasFieldEditor {"
+            "border: 2px solid #0A84FF;"
+            "border-radius: 8px;"
+            "padding: 6px;"
+            f"color: {field.text_color or '#1D1D1F'};"
+            f"background: {field.bg_color or '#FFFFFF'};"
+            "}"
+        )
+        font = editor.font()
+        font.setPointSize(max(8, min(48, field.font_size)))
+        editor.setFont(font)
+        editor.editingFinished.connect(self._close_inline_field_editor)
+
+        proxy = QGraphicsProxyWidget()
+        proxy.setWidget(editor)
+        proxy.setZValue(2000)
+        proxy.setPos(rect.topLeft())
+        proxy.resize(max(46.0, rect.width()), max(32.0, rect.height()))
+        self.scene_obj.addItem(proxy)
+        self._inline_proxy = proxy
+        self._inline_editor = editor
+        self._inline_field = field
+        self._inline_original_value = field.value
+        editor.setFocus()
+        editor.selectAll()
+
+    def _close_inline_field_editor(self, commit: bool = True) -> None:
+        proxy = self._inline_proxy
+        editor = self._inline_editor
+        field = self._inline_field
+        if proxy is None:
+            return
+        self._inline_proxy = None
+        self._inline_editor = None
+        self._inline_field = None
+        self.scene_obj.removeItem(proxy)
+        proxy.deleteLater()
+        changed = False
+        if field is not None:
+            new_value = editor.toPlainText() if editor is not None and commit else self._inline_original_value
+            if field.value != new_value:
+                field.value = new_value
+                changed = True
+        self._inline_original_value = ""
+        self.viewport().update()
+        if changed:
+            self.projectChanged.emit()
+
+    def close_inline_field_editor_if_outside(self, view_pos: QPoint, *, commit: bool = True) -> bool:
+        proxy = self._inline_proxy
+        if proxy is None:
+            return False
+        scene_pos = self.mapToScene(view_pos)
+        if proxy.sceneBoundingRect().contains(scene_pos):
+            return False
+        self._close_inline_field_editor(commit=commit)
+        return True
 
     def can_move_groups(self) -> bool:
         if self.is_data_canvas():
@@ -1483,7 +2228,7 @@ class NodeGraphView(QGraphicsView):
             cache.popitem(last=False)
 
     def start_connection(self, source_id: str | None) -> None:
-        if self.read_only:
+        if not self.can_create_edges():
             return
         if not source_id:
             return
@@ -1491,6 +2236,8 @@ class NodeGraphView(QGraphicsView):
             return
         self.connecting = True
         self.connection_source = source_id
+        self.connection_anchor_scene = None
+        self._connection_dragging = False
         if source_id in self.node_items:
             self.select_node(source_id)
         elif source_id in self.group_items:
@@ -1498,9 +2245,56 @@ class NodeGraphView(QGraphicsView):
         self._refresh_interaction_cursor()
         self.viewport().update()
 
+    def begin_connection_drag(self, source_id: str, anchor_scene: QPointF) -> None:
+        if not self.can_create_edges():
+            return
+        if not self._endpoint_item(source_id):
+            return
+        self.connecting = True
+        self.connection_source = source_id
+        self.connection_anchor_scene = QPointF(anchor_scene)
+        self._connection_dragging = True
+        self.mouse_scene = QPointF(anchor_scene)
+        if source_id in self.node_items:
+            self.select_node(source_id)
+        elif source_id in self.group_items:
+            self.select_group(source_id)
+        self._refresh_interaction_cursor()
+        self.viewport().update()
+
+    def is_connection_dragging_from(self, source_id: str) -> bool:
+        return bool(self.connecting and self._connection_dragging and self.connection_source == source_id)
+
+    def update_connection_drag(self, scene_pos: QPointF) -> None:
+        if not self._connection_dragging:
+            return
+        self.mouse_scene = QPointF(scene_pos)
+        self.viewport().update()
+
+    def finish_connection_drag(self, scene_pos: QPointF) -> None:
+        if not self._connection_dragging:
+            return
+        self.mouse_scene = QPointF(scene_pos)
+        source = self.connection_source
+        target_id = self._endpoint_id_at(self.mapFromScene(scene_pos), include_group_body=True)
+        self.cancel_connection()
+        if source and target_id and target_id != source:
+            self._pending_drag_edge = (source, target_id)
+            QTimer.singleShot(0, self._emit_pending_drag_edge)
+
+    def _emit_pending_drag_edge(self) -> None:
+        edge = self._pending_drag_edge
+        self._pending_drag_edge = None
+        if edge is None:
+            return
+        source, target = edge
+        self.edgeCreated.emit(source, target)
+
     def cancel_connection(self) -> None:
         self.connecting = False
         self.connection_source = None
+        self.connection_anchor_scene = None
+        self._connection_dragging = False
         self._refresh_interaction_cursor()
         self.viewport().update()
 
@@ -1874,12 +2668,13 @@ class NodeGraphView(QGraphicsView):
         if self.connecting and self.connection_source:
             source = self._endpoint_item(self.connection_source)
             if source:
-                start = self._connection_start(source.sceneBoundingRect(), self.mouse_scene)
+                start = self.connection_anchor_scene or self._connection_start(source.sceneBoundingRect(), self.mouse_scene)
                 path = self._preview_path(start, self.mouse_scene)
                 painter.setPen(QPen(QColor(colors["edge"]), 2.2, Qt.DashLine, Qt.RoundCap, Qt.RoundJoin))
                 painter.drawPath(path)
 
     def wheelEvent(self, event) -> None:  # type: ignore[override]
+        self._close_inline_field_editor(commit=True)
         self._begin_interaction_preview()
         factor = 1.12 if event.angleDelta().y() > 0 else 1 / 1.12
         current = self.transform().m11()
@@ -1891,6 +2686,11 @@ class NodeGraphView(QGraphicsView):
         self.setFocus()
         self._suppress_context_menu = False
         self.mouse_scene = self.mapToScene(event.position().toPoint())
+        if self.close_inline_field_editor_if_outside(event.position().toPoint(), commit=True):
+            if event.button() == Qt.LeftButton and not self.itemAt(event.position().toPoint()):
+                self.clear_selection()
+                event.accept()
+                return
         if event.button() == Qt.LeftButton and self.connecting:
             target_id = self._endpoint_id_at(event.position().toPoint(), include_group_body=True)
             if target_id and self.connection_source and target_id != self.connection_source:
@@ -2062,6 +2862,7 @@ class NodeGraphView(QGraphicsView):
             self._suppress_context_menu = False
             event.accept()
             return
+        self.close_inline_field_editor_if_outside(event.pos(), commit=True)
         self._show_context_menu(event.pos(), event.globalPos())
 
     def _show_context_menu(self, view_pos: QPoint, global_pos: QPoint) -> None:
@@ -2127,6 +2928,12 @@ class NodeGraphView(QGraphicsView):
                 self.nodeDeleteRequested.emit(node.node.id)
             return
         if edge:
+            route_point_index = edge.route_point_index_at_scene(scene_pos)
+            if route_point_index is not None:
+                delete_route_point = menu.addAction("删除折点")
+                menu.addSeparator()
+            else:
+                delete_route_point = None
             edit_edge = menu.addAction("编辑连接标签")
             style_menu = menu.addMenu("连线样式")
             curve = style_menu.addAction("曲线")
@@ -2140,7 +2947,10 @@ class NodeGraphView(QGraphicsView):
             orthogonal.setChecked(edge.edge.style == "orthogonal")
             delete_edge = menu.addAction("删除连线")
             action = menu.exec(global_pos)
-            if action == edit_edge:
+            if delete_route_point and action == delete_route_point:
+                if edge.delete_route_point_at_scene(scene_pos):
+                    self.projectChanged.emit()
+            elif action == edit_edge:
                 self.edgeEditRequested.emit(edge.edge.id)
             elif action == curve:
                 self.edgeStyleRequested.emit(edge.edge.id, "curve")

@@ -63,6 +63,9 @@ class DataIoTests(unittest.TestCase):
             first.group_id = group.id
             edge = project.add_edge(first.id, second.id)
             edge.style = "orthogonal"
+            edge.orthogonal_bend_x = 180.0
+            edge.orthogonal_bend_y = 90.0
+            edge.orthogonal_route = [{"x": 180.0, "y": 90.0}, {"x": 260.0, "y": 140.0}]
 
             path = tmp_path / "project.gdc"
             save_project(project, path)
@@ -96,6 +99,12 @@ class DataIoTests(unittest.TestCase):
             self.assertEqual(loaded.edges[0].source, first.id)
             self.assertEqual(loaded.edges[0].target, second.id)
             self.assertEqual(loaded.edges[0].style, "orthogonal")
+            self.assertEqual(loaded.edges[0].orthogonal_bend_x, 180.0)
+            self.assertEqual(loaded.edges[0].orthogonal_bend_y, 90.0)
+            self.assertEqual(
+                loaded.edges[0].orthogonal_route,
+                [{"x": 180.0, "y": 90.0}, {"x": 260.0, "y": 140.0}],
+            )
 
     def test_split_project_manifest_does_not_embed_canvases(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
