@@ -33,6 +33,8 @@ FIELD_TYPES = [
 NODE_TYPES = ["普通", "画布", "超文本"]
 CANVAS_TYPES = ["normal", "data"]
 DATA_LAYOUT_MODES = ["horizontal", "grid", "table"]
+DATA_ROW_STYLE_MODES = ["independent", "thumbnail"]
+IMAGE_FIT_MODES = ["stretch", "contain", "cover", "nine_slice"]
 TEXT_H_ALIGNMENTS = ["left", "center", "right"]
 TEXT_V_ALIGNMENTS = ["top", "center", "bottom"]
 DEFAULT_NODE_COLOR = "#ffffff"
@@ -58,7 +60,13 @@ class NodeField:
     text_h_align: str = "left"
     text_v_align: str = "top"
     image_path: str = ""
+    image_fit: str = "stretch"
+    slice_left: int = 0
+    slice_top: int = 0
+    slice_right: int = 0
+    slice_bottom: int = 0
     export_props: list[str] = field(default_factory=list)
+    show_label: bool = False
     id: str = field(default_factory=lambda: new_id("field"))
 
     def to_dict(self) -> dict[str, Any]:
@@ -77,7 +85,13 @@ class NodeField:
             "text_h_align": self.text_h_align if self.text_h_align in TEXT_H_ALIGNMENTS else "left",
             "text_v_align": self.text_v_align if self.text_v_align in TEXT_V_ALIGNMENTS else "top",
             "image_path": self.image_path if self.data_type == "图片" else "",
+            "image_fit": self.image_fit if self.image_fit in IMAGE_FIT_MODES else "stretch",
+            "slice_left": max(0, int(self.slice_left)),
+            "slice_top": max(0, int(self.slice_top)),
+            "slice_right": max(0, int(self.slice_right)),
+            "slice_bottom": max(0, int(self.slice_bottom)),
             "export_props": [item for item in self.export_props if item in FIELD_EXPORT_PROPS],
+            "show_label": self.show_label,
         }
 
     @classmethod
@@ -108,7 +122,13 @@ class NodeField:
             text_h_align=_choice_or(raw.get("text_h_align"), TEXT_H_ALIGNMENTS, "left"),
             text_v_align=_choice_or(raw.get("text_v_align"), TEXT_V_ALIGNMENTS, "top"),
             image_path=image_path,
+            image_fit=_choice_or(raw.get("image_fit"), IMAGE_FIT_MODES, "stretch"),
+            slice_left=max(0, int(_float_or(raw.get("slice_left"), 0.0))),
+            slice_top=max(0, int(_float_or(raw.get("slice_top"), 0.0))),
+            slice_right=max(0, int(_float_or(raw.get("slice_right"), 0.0))),
+            slice_bottom=max(0, int(_float_or(raw.get("slice_bottom"), 0.0))),
             export_props=[str(item) for item in export_props if str(item) in FIELD_EXPORT_PROPS],
+            show_label=bool(raw.get("show_label", False)),
         )
 
     def has_visual_layout(self) -> bool:
@@ -280,6 +300,7 @@ class CanvasData:
     name: str = "主画布"
     canvas_type: str = "normal"
     data_layout: str = "grid"
+    data_row_style: str = "independent"
     data_grid_rows: int = 0
     template_id: str = ""
     parent_canvas_id: str = ""
@@ -294,6 +315,7 @@ class CanvasData:
             "name": self.name,
             "canvas_type": self.canvas_type if self.canvas_type in CANVAS_TYPES else "normal",
             "data_layout": self.data_layout if self.data_layout in DATA_LAYOUT_MODES else "grid",
+            "data_row_style": self.data_row_style if self.data_row_style in DATA_ROW_STYLE_MODES else "independent",
             "data_grid_rows": max(0, int(self.data_grid_rows)),
             "template_id": self.template_id,
             "parent_canvas_id": self.parent_canvas_id,
@@ -319,6 +341,7 @@ class CanvasData:
             name=str(raw.get("name") or "画布"),
             canvas_type=_choice_or(raw.get("canvas_type"), CANVAS_TYPES, "normal"),
             data_layout=_choice_or(raw.get("data_layout"), DATA_LAYOUT_MODES, "grid"),
+            data_row_style=_choice_or(raw.get("data_row_style"), DATA_ROW_STYLE_MODES, "independent"),
             data_grid_rows=max(0, int(_float_or(raw.get("data_grid_rows"), 0.0))),
             template_id=str(raw.get("template_id") or ""),
             parent_canvas_id=str(raw.get("parent_canvas_id") or ""),
@@ -586,6 +609,7 @@ class ProjectData:
         name: str,
         canvas_type: str = "normal",
         data_layout: str = "grid",
+        data_row_style: str = "independent",
         data_grid_rows: int = 0,
         template_id: str = "",
         parent_canvas_id: str = "",
@@ -597,6 +621,7 @@ class ProjectData:
             name=name.strip() or "新画布",
             canvas_type=canvas_type if canvas_type in CANVAS_TYPES else "normal",
             data_layout=data_layout if data_layout in DATA_LAYOUT_MODES else "grid",
+            data_row_style=data_row_style if data_row_style in DATA_ROW_STYLE_MODES else "independent",
             data_grid_rows=max(0, int(data_grid_rows)),
             template_id=template_id,
             parent_canvas_id=parent_canvas_id,

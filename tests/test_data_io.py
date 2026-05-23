@@ -45,6 +45,11 @@ class DataIoTests(unittest.TestCase):
                         "图片",
                         "",
                         image_path=str(tmp_path / "hero.png"),
+                        image_fit="nine_slice",
+                        slice_left=12,
+                        slice_top=8,
+                        slice_right=12,
+                        slice_bottom=8,
                         export_props=["x", "width"],
                     ),
                 ],
@@ -76,6 +81,11 @@ class DataIoTests(unittest.TestCase):
             self.assertEqual(loaded.nodes[0].height, 220)
             self.assertEqual(loaded.nodes[0].fields[1].data_type, "图片")
             self.assertEqual(loaded.nodes[0].fields[1].image_path, str(tmp_path / "hero.png"))
+            self.assertEqual(loaded.nodes[0].fields[1].image_fit, "nine_slice")
+            self.assertEqual(loaded.nodes[0].fields[1].slice_left, 12)
+            self.assertEqual(loaded.nodes[0].fields[1].slice_top, 8)
+            self.assertEqual(loaded.nodes[0].fields[1].slice_right, 12)
+            self.assertEqual(loaded.nodes[0].fields[1].slice_bottom, 8)
             self.assertEqual(loaded.nodes[0].fields[1].export_props, ["x", "width"])
             self.assertEqual(loaded.nodes[0].fields[0].text_h_align, "center")
             self.assertEqual(loaded.nodes[0].fields[0].text_v_align, "bottom")
@@ -346,6 +356,7 @@ class DataIoTests(unittest.TestCase):
                 "数据画布",
                 canvas_type="data",
                 data_layout="horizontal",
+                data_row_style="thumbnail",
                 template_id=template.id,
                 parent_canvas_id=root.id,
                 parent_node_id=entry.id,
@@ -365,6 +376,7 @@ class DataIoTests(unittest.TestCase):
 
             self.assertEqual(loaded_canvas.canvas_type, "data")
             self.assertEqual(loaded_canvas.data_layout, "horizontal")
+            self.assertEqual(loaded_canvas.data_row_style, "thumbnail")
             self.assertEqual(loaded_canvas.template_id, template.id)
             self.assertEqual(loaded_row.template_id, template.id)
             self.assertTrue(loaded_row.template_locked)
@@ -511,6 +523,14 @@ class DataIoTests(unittest.TestCase):
         self.assertEqual(field.data_type, "日期")
         self.assertEqual(field.image_path, "")
         self.assertEqual(field.export_props, ["x", "font_size"])
+
+    def test_field_show_label_roundtrip(self) -> None:
+        field = NodeField("moveSpeed", "文本", "4", show_label=True)
+        loaded = NodeField.from_dict(field.to_dict())
+
+        self.assertTrue(loaded.show_label)
+        self.assertEqual(loaded.name, "moveSpeed")
+        self.assertEqual(loaded.value, "4")
 
     def test_default_tech_tree_template_uses_visual_cards(self) -> None:
         template = next(item for item in default_templates() if item.name == "科技树节点")

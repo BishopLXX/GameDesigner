@@ -170,9 +170,13 @@ class AppEditingTests(unittest.TestCase):
 
         self.assertTrue(page.function_bar.isVisible())
         self.assertTrue(page.reset_view_button.isVisible())
+        self.assertFalse(page.parent_button.isVisible())
+        self.assertFalse(page.return_button.isVisible())
         self.assertFalse(page.horizontal_layout_button.isVisible())
         self.assertFalse(page.grid_layout_button.isVisible())
         self.assertFalse(page.table_layout_button.isVisible())
+        self.assertFalse(page.independent_row_button.isVisible())
+        self.assertFalse(page.thumbnail_row_button.isVisible())
         self.assertFalse(page.grid_rows_spin.isVisible())
         window.deleteLater()
 
@@ -198,6 +202,11 @@ class AppEditingTests(unittest.TestCase):
 
         page.refresh_canvas_mode()
 
+        self.assertTrue(page.parent_button.isVisible())
+        self.assertTrue(page.return_button.isVisible())
+        self.assertIs(page.function_bar.layout().itemAt(0).widget(), page.parent_button)
+        self.assertIs(page.function_bar.layout().itemAt(1).widget(), page.return_button)
+        self.assertIsNotNone(page.function_bar.layout().itemAt(2).spacerItem())
         self.assertTrue(page.horizontal_layout_button.isVisible())
         self.assertTrue(page.grid_layout_button.isVisible())
         self.assertTrue(page.table_layout_button.isVisible())
@@ -216,10 +225,19 @@ class AppEditingTests(unittest.TestCase):
         self.assertEqual(data_canvas.data_layout, "horizontal")
         self.assertTrue(page.canvas.isVisible())
         self.assertFalse(page.table_view.isVisible())
+        self.assertTrue(page.independent_row_button.isVisible())
+        self.assertTrue(page.thumbnail_row_button.isVisible())
+        self.assertTrue(page.independent_row_button.isChecked())
+        page.thumbnail_row_button.click()
+        self.app.processEvents()
+        self.assertEqual(data_canvas.data_row_style, "thumbnail")
+        self.assertIsNotNone(page.canvas.data_header_item)
 
         page.grid_layout_button.click()
         self.app.processEvents()
         self.assertEqual(data_canvas.data_layout, "grid")
+        self.assertFalse(page.independent_row_button.isVisible())
+        self.assertFalse(page.thumbnail_row_button.isVisible())
         page.grid_rows_spin.setValue(5)
         self.app.processEvents()
         self.assertEqual(data_canvas.data_grid_rows, 5)
@@ -251,6 +269,34 @@ class AppEditingTests(unittest.TestCase):
             self.assertEqual(page.table_view.item(0, 0).text(), "A")
             self.assertEqual(page.table_view.item(1, 1).text(), "2")
             window.deleteLater()
+
+    def test_data_canvas_table_paste_expands_rows_and_columns(self) -> None:
+        window = GameDesignerApp()
+        project = ProjectData(name="表格粘贴测试")
+        project.ensure_canvas_structure()
+        data_canvas = project.add_canvas(
+            "排序画布",
+            canvas_type="data",
+            data_layout="table",
+            parent_canvas_id=project.root_canvas_id,
+            parent_node_id="node_parent",
+        )
+        page = window._add_page(project, None, dirty=False, canvas_data=data_canvas)
+        window.tabs.setCurrentWidget(page)
+        page.show()
+        window.show()
+        self.app.processEvents()
+
+        QApplication.clipboard().setText("A\t1\nB\t2")
+        page.table_view._paste_clipboard()
+
+        self.assertEqual(len(data_canvas.nodes), 2)
+        self.assertEqual(len(project.find_template(data_canvas.template_id).fields), 2)
+        self.assertEqual(page.table_view.rowCount(), 2)
+        self.assertEqual(page.table_view.columnCount(), 2)
+        self.assertEqual(data_canvas.nodes[0].fields[0].value, "A")
+        self.assertEqual(data_canvas.nodes[1].fields[1].value, "2")
+        window.deleteLater()
 
     def test_export_canvas_csv_dialog_collects_per_canvas_folder(self) -> None:
         from gamedesigner.qt_dialogs import ExportCanvasCsvDialog
@@ -314,6 +360,7 @@ class AppEditingTests(unittest.TestCase):
         canvas.add_node(unlocked)
 
         template.color = "#334455"
+        locked.icon = "锁"
         template.icon = "新"
         template.fields[0].name = "主名称"
         template.fields.append(NodeField("新增字段", "文本", "默认新增"))
@@ -321,7 +368,7 @@ class AppEditingTests(unittest.TestCase):
         window._sync_project_templates(project)
 
         self.assertEqual(locked.color, "#334455")
-        self.assertEqual(locked.icon, "新")
+        self.assertEqual(locked.icon, "锁")
         self.assertEqual(locked.fields[0].name, "主名称")
         self.assertEqual(locked.fields[0].value, "锁定节点")
         self.assertEqual(len(locked.fields), 3)
@@ -349,6 +396,32 @@ class AppEditingTests(unittest.TestCase):
         self.assertFalse(dialog.template_lock_button.isChecked())
         self.assertFalse(dialog.import_template_button.isHidden())
         self.assertFalse(dialog.save_template_button.isHidden())
+        dialog.deleteLater()
+
+    def test_save_template_does_not_capture_node_icon(self) -> None:
+        node = Node(title="Boss", icon="Boss", icon_from_title=False, fields=[NodeField("名称", "文本", "HeroBody")])
+        dialog = NodeEditorDialog(None, node, templates=[])
+
+        with mock.patch("gamedesigner.qt_dialogs.QInputDialog.getText", return_value=("敌人模板", True)):
+            dialog._save_current_template()
+
+        self.assertIsNotNone(dialog.templates)
+        self.assertEqual(dialog.templates[-1].name, "敌人模板")
+        self.assertEqual(dialog.templates[-1].icon, "")
+        self.assertFalse(dialog.templates[-1].icon_from_title)
+        dialog.deleteLater()
+
+    def test_node_editor_field_show_label_toggle_is_saved(self) -> None:
+        node = Node(title="属性", fields=[NodeField("moveSpeed", "文本", "4")])
+        dialog = NodeEditorDialog(None, node, templates=[])
+
+        self.assertFalse(dialog.fields[0].show_label)
+        dialog.field_label_button.click()
+        self.assertTrue(dialog.fields[0].show_label)
+        dialog._accept()
+
+        self.assertIsNotNone(dialog.result)
+        self.assertTrue(dialog.result.fields[0].show_label)
         dialog.deleteLater()
 
     def test_edit_data_canvas_node_updates_canvas_template_and_syncs_all_nodes(self) -> None:
@@ -428,10 +501,12 @@ class AppEditingTests(unittest.TestCase):
 
         synced_template = project.find_template(template.id)
         self.assertIsNotNone(synced_template)
-        self.assertEqual(synced_template.icon, "新")
+        self.assertEqual(synced_template.icon, "数")
         self.assertEqual(synced_template.color, "#CCE4FF")
         self.assertEqual([field.name for field in synced_template.fields], ["名称", "职业"])
         self.assertTrue(all(node.template_locked for node in data_canvas.nodes))
+        self.assertEqual(data_canvas.nodes[0].icon, "新")
+        self.assertEqual(data_canvas.nodes[1].icon, "数")
         self.assertEqual([field.name for field in data_canvas.nodes[0].fields], ["名称", "职业"])
         self.assertEqual([field.name for field in data_canvas.nodes[1].fields], ["名称", "职业"])
         self.assertEqual(data_canvas.nodes[0].fields[0].value, "第一项")

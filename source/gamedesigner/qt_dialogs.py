@@ -6,6 +6,7 @@ from pathlib import Path
 from PySide6.QtCore import QPoint, QPointF, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
+    QFontMetrics,
     QIcon,
     QPainter,
     QPainterPath,
@@ -45,6 +46,7 @@ from PySide6.QtWidgets import (
 
 from .csv_io import CanvasCsvExportSpec, CSV_SORT_MODE_LABELS, DATA_CANVAS_SORT_LABEL
 from .data_canvas import apply_template_to_node
+from .image_rendering import IMAGE_FIT_MODES, draw_field_pixmap
 from .models import (
     DEFAULT_NODE_COLOR,
     FIELD_EXPORT_PROPS,
@@ -59,6 +61,8 @@ from .models import (
 )
 from .project_files.linked_documents import import_link_document, read_link_document
 from .qt_theme import palette
+from .storage import project_bundle_dir
+from .ui.image_paint_dialog import ImagePaintDialog
 from .window_layouts import restore_window_layout, save_window_layout
 
 
@@ -69,6 +73,11 @@ FIELD_HANDLE = 16.0
 def _safe_color(value: str, fallback: str) -> QColor:
     color = QColor(value)
     return color if color.isValid() else QColor(fallback)
+
+
+def _safe_asset_name(value: str) -> str:
+    cleaned = "".join("_" if char in '\\/:*?"<>|' else char for char in value.strip())
+    return cleaned or "image"
 
 
 def _field_text_flags(field: NodeField) -> Qt.AlignmentFlag:
@@ -376,13 +385,20 @@ class ExportCanvasCsvDialog(QDialog):
 
 
 def _display_field_text(field: NodeField, project_path: str | Path | None = None) -> str:
+    value = _display_field_value(field, project_path)
+    if field.data_type == "图片":
+        return value
+    return value or field.name
+
+
+def _display_field_value(field: NodeField, project_path: str | Path | None = None) -> str:
     if field.data_type == "图片":
         return field.value
     if field.data_type != "资源路径":
-        return field.value or field.name
+        return field.value
     path_text = (field.value or "").strip()
     if not path_text:
-        return field.name
+        return ""
     suffix = Path(path_text).suffix.lower()
     if suffix not in {".md", ".txt"}:
         return path_text
@@ -394,6 +410,59 @@ def _display_field_text(field: NodeField, project_path: str | Path | None = None
         return path_text
     content = content.strip()
     return content or path_text
+
+
+def _draw_field_display_text(
+    painter: QPainter,
+    rect: QRectF,
+    field: NodeField,
+    colors: dict[str, str],
+    project_path: str | Path | None = None,
+) -> None:
+    text_color = _safe_color(field.text_color or colors["node_text"], colors["node_text"])
+    font = painter.font()
+    font.setPointSize(max(8, min(48, field.font_size)))
+    if field.show_label and field.data_type != "图片":
+        label = field.name.strip() or "字段"
+        value = _display_field_value(field, project_path).strip() or " "
+        label_font = painter.font()
+        label_font.setPointSize(max(8, min(48, field.font_size)))
+        label_font.setBold(True)
+        value_font = painter.font()
+        value_font.setPointSize(max(8, min(48, field.font_size)))
+        value_font.setBold(False)
+        label_metrics = QFontMetrics(label_font)
+        value_metrics = QFontMetrics(value_font)
+        label_width = min(
+            max(42.0, float(label_metrics.horizontalAdvance(label) + 8)),
+            max(42.0, rect.width() * 0.48),
+        )
+        label_rect = QRectF(rect.x(), rect.y(), label_width, rect.height())
+        value_rect = QRectF(label_rect.right() + 8, rect.y(), max(1.0, rect.right() - label_rect.right() - 8), rect.height())
+        label_color = QColor(text_color)
+        label_color.setAlpha(178)
+        painter.setPen(label_color)
+        painter.setFont(label_font)
+        painter.drawText(
+            label_rect,
+            Qt.AlignLeft | Qt.AlignVCenter | Qt.TextSingleLine,
+            label_metrics.elidedText(label, Qt.ElideRight, max(1, int(label_rect.width()))),
+        )
+        painter.setPen(text_color)
+        painter.setFont(value_font)
+        painter.drawText(
+            value_rect,
+            Qt.AlignLeft | Qt.AlignVCenter | Qt.TextSingleLine,
+            value_metrics.elidedText(value, Qt.ElideRight, max(1, int(value_rect.width()))),
+        )
+        return
+
+    text = _display_field_text(field, project_path)
+    if not text:
+        return
+    painter.setPen(text_color)
+    painter.setFont(font)
+    painter.drawText(rect, _field_text_flags(field), text)
 
 
 class NodeFrameItem(QGraphicsItem):
@@ -474,21 +543,15 @@ class EditorFieldItem(QGraphicsObject):
         path = QPainterPath()
         path.addRoundedRect(rect, 10, 10)
         painter.fillPath(path, QColor(self.field.bg_color or "#FFFFFF"))
-        painter.setPen(QPen(QColor(colors["blue"] if self.isSelected() else "#DADAE0"), 2 if self.isSelected() else 1))
-        painter.drawPath(path)
 
         is_image = self.field.data_type == "图片"
         if is_image and self.field.image_path:
             pixmap = QPixmap(self.field.image_path)
             if not pixmap.isNull():
-                target = QRectF(10, 10, max(10.0, rect.width() - 20), max(10.0, rect.height() - 20))
-                scaled = pixmap.scaled(
-                    int(target.width()),
-                    int(target.height()),
-                    Qt.KeepAspectRatio,
-                    Qt.SmoothTransformation,
-                )
-                painter.drawPixmap(int(target.x()), int(target.y()), scaled)
+                painter.save()
+                painter.setClipPath(path)
+                draw_field_pixmap(painter, pixmap, rect, self.field)
+                painter.restore()
             else:
                 painter.setPen(QColor(colors["accent_dark"]))
                 painter.drawText(rect.adjusted(10, 10, -10, -10), Qt.AlignLeft | Qt.AlignTop, "图片无法读取")
@@ -496,13 +559,10 @@ class EditorFieldItem(QGraphicsObject):
             painter.setPen(QColor(colors["node_muted"]))
             painter.drawText(rect.adjusted(10, 10, -10, -10), Qt.AlignCenter | Qt.TextWordWrap, "选择图片")
 
-        text = _display_field_text(self.field, self.project_path)
-        if text:
-            painter.setPen(QColor(self.field.text_color or colors["node_text"]))
-            font = painter.font()
-            font.setPointSize(max(8, min(48, self.field.font_size)))
-            painter.setFont(font)
-            painter.drawText(rect.adjusted(10, 9, -10, -9), _field_text_flags(self.field), text)
+        painter.setPen(QPen(QColor(colors["blue"] if self.isSelected() else "#DADAE0"), 2 if self.isSelected() else 1))
+        painter.drawPath(path)
+
+        _draw_field_display_text(painter, rect.adjusted(10, 9, -10, -9), self.field, colors, self.project_path)
 
         if self.isSelected():
             painter.setPen(QPen(QColor(colors["blue"]), 1.4))
@@ -884,13 +944,29 @@ class NodeEditorDialog(QDialog):
         self.template_lock_button.setFixedSize(34, 30)
 
         self.field_name = QLineEdit()
+        self.field_label_button = QToolButton()
+        self.field_label_button.setObjectName("bindingToolButton")
+        self.field_label_button.setText("显")
+        self.field_label_button.setCheckable(True)
+        self.field_label_button.setFixedSize(34, 30)
+        self.field_label_button.setToolTip("在节点卡片上显示字段名")
         self.field_type = QComboBox()
         self.field_type.addItems(FIELD_TYPES)
         self.field_value = QPlainTextEdit()
         self.field_value.setFixedHeight(86)
         self.image_path = QLineEdit()
         self.image_button: QPushButton | None = None
+        self.draw_image_button: QPushButton | None = None
         self.file_load_button: QPushButton | None = None
+        self.image_fit = QComboBox()
+        self.image_fit.addItem("自由拉伸", "stretch")
+        self.image_fit.addItem("等比完整", "contain")
+        self.image_fit.addItem("等比裁切", "cover")
+        self.image_fit.addItem("九宫格", "nine_slice")
+        self.slice_left = QLineEdit()
+        self.slice_top = QLineEdit()
+        self.slice_right = QLineEdit()
+        self.slice_bottom = QLineEdit()
         self.field_x = QLineEdit()
         self.field_y = QLineEdit()
         self.field_w = QLineEdit()
@@ -960,14 +1036,18 @@ class NodeEditorDialog(QDialog):
         props_layout.setSpacing(8)
         self.content_label = QLabel("内容")
         self.image_label = QLabel("图片")
-        self.image_row = self._path_row(self.image_path, "选择图片", self._pick_image)
+        self.image_row = self._image_path_row()
+        self.image_fit_row = self._labeled_row("缩放", self.image_fit)
+        self.image_slice_row = self._labeled_row("九宫", self._slice_row())
         self.file_row = self._path_row(self.field_value, "加载", self._load_field_file, button_attr="file_load_button")
-        props_layout.addWidget(self._labeled_row("字段", self.field_name))
+        props_layout.addWidget(self._labeled_row("字段", self._field_name_row()))
         props_layout.addWidget(self._labeled_row("类型", self.field_type))
         self.content_row = self._labeled_row(self.content_label, self._content_binding_row())
         self.image_picker_row = self._labeled_row(self.image_label, self.image_row)
         props_layout.addWidget(self.content_row)
         props_layout.addWidget(self.image_picker_row)
+        props_layout.addWidget(self.image_fit_row)
+        props_layout.addWidget(self.image_slice_row)
         props_layout.addWidget(self._geometry_row())
         props_layout.addWidget(self._font_row())
         props_layout.addWidget(self._alignment_row())
@@ -1117,8 +1197,8 @@ class NodeEditorDialog(QDialog):
             title_field_id = working.title_field_id
         else:
             title = template.name
-            icon_from_title = template.icon_from_title
-            icon = template.icon
+            icon_from_title = self.icon_from_title_button.isChecked()
+            icon = self.icon_edit.text().strip()
             color = template.color or DEFAULT_NODE_COLOR
             fields = [NodeField.from_dict(field.to_dict()) for field in template.fields]
             title_field_id = template.title_field_id if any(field.id == template.title_field_id for field in fields) else ""
@@ -1182,6 +1262,15 @@ class NodeEditorDialog(QDialog):
         layout.addWidget(self.icon_from_title_button)
         return row
 
+    def _field_name_row(self) -> QWidget:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        layout.addWidget(self.field_name, 1)
+        layout.addWidget(self.field_label_button)
+        return row
+
     def _content_binding_row(self) -> QWidget:
         row = QWidget()
         layout = QHBoxLayout(row)
@@ -1207,6 +1296,40 @@ class NodeEditorDialog(QDialog):
         button.clicked.connect(slot)
         layout.addWidget(edit, 1)
         layout.addWidget(button)
+        return row
+
+    def _image_path_row(self) -> QWidget:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        self.image_button = QPushButton("选择图片")
+        self.image_button.clicked.connect(self._pick_image)
+        self.draw_image_button = QPushButton("绘制")
+        self.draw_image_button.clicked.connect(self._paint_image)
+        layout.addWidget(self.image_path, 1)
+        layout.addWidget(self.image_button)
+        layout.addWidget(self.draw_image_button)
+        return row
+
+    def _slice_row(self) -> QWidget:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(5)
+        for label, editor in (
+            ("左", self.slice_left),
+            ("上", self.slice_top),
+            ("右", self.slice_right),
+            ("下", self.slice_bottom),
+        ):
+            label_widget = QLabel(label)
+            label_widget.setFixedWidth(16)
+            editor.setAlignment(Qt.AlignCenter)
+            editor.setFixedWidth(42)
+            layout.addWidget(label_widget)
+            layout.addWidget(editor)
+        layout.addStretch(1)
         return row
 
     def _geometry_row(self) -> QWidget:
@@ -1404,6 +1527,10 @@ class NodeEditorDialog(QDialog):
         for widget in (
             self.field_name,
             self.image_path,
+            self.slice_left,
+            self.slice_top,
+            self.slice_right,
+            self.slice_bottom,
             self.field_x,
             self.field_y,
             self.field_w,
@@ -1414,6 +1541,8 @@ class NodeEditorDialog(QDialog):
         ):
             widget.textChanged.connect(self._apply_props)
         self.field_type.currentTextChanged.connect(self._on_field_type_changed)
+        self.image_fit.currentIndexChanged.connect(lambda _index: self._on_image_fit_changed())
+        self.field_label_button.toggled.connect(lambda _checked=False: self._apply_props())
         self.node_type.currentTextChanged.connect(lambda _text: self._update_template_lock_controls())
         self.field_value.textChanged.connect(self._apply_props)
         self.template_lock_button.toggled.connect(self._on_template_lock_toggled)
@@ -1531,6 +1660,10 @@ class NodeEditorDialog(QDialog):
             for widget in (
                 self.field_name,
                 self.image_path,
+                self.slice_left,
+                self.slice_top,
+                self.slice_right,
+                self.slice_bottom,
                 self.field_x,
                 self.field_y,
                 self.field_w,
@@ -1541,6 +1674,10 @@ class NodeEditorDialog(QDialog):
             ):
                 widget.clear()
             self.field_value.setPlainText("")
+            self.field_label_button.blockSignals(True)
+            self.field_label_button.setChecked(False)
+            self.field_label_button.blockSignals(False)
+            self.image_fit.setCurrentIndex(max(0, self.image_fit.findData("stretch")))
             self._set_alignment_value(self.h_align_buttons, "left", "left")
             self._set_alignment_value(self.v_align_buttons, "top", "top")
             self._updating = False
@@ -1549,9 +1686,17 @@ class NodeEditorDialog(QDialog):
             self._update_title_binding_controls()
             return
         self.field_name.setText(field.name)
+        self.field_label_button.blockSignals(True)
+        self.field_label_button.setChecked(bool(field.show_label))
+        self.field_label_button.blockSignals(False)
         self.field_type.setCurrentText(field.data_type if field.data_type in FIELD_TYPES else "文本")
         self.field_value.setPlainText(field.value)
         self.image_path.setText(field.image_path)
+        self.image_fit.setCurrentIndex(max(0, self.image_fit.findData(field.image_fit if field.image_fit in IMAGE_FIT_MODES else "stretch")))
+        self.slice_left.setText(str(max(0, int(field.slice_left))))
+        self.slice_top.setText(str(max(0, int(field.slice_top))))
+        self.slice_right.setText(str(max(0, int(field.slice_right))))
+        self.slice_bottom.setText(str(max(0, int(field.slice_bottom))))
         self.field_x.setText(f"{field.x:.0f}")
         self.field_y.setText(f"{field.y:.0f}")
         self.field_w.setText(f"{field.width:.0f}")
@@ -1585,6 +1730,10 @@ class NodeEditorDialog(QDialog):
         self._update_type_controls()
         self._update_pin_controls()
 
+    def _on_image_fit_changed(self) -> None:
+        self._apply_props()
+        self._update_type_controls()
+
     def _update_type_controls(self) -> None:
         has_field = self._selected_field() is not None
         is_image = has_field and self.field_type.currentText() == "图片"
@@ -1594,11 +1743,17 @@ class NodeEditorDialog(QDialog):
         self.content_row.setVisible(show_content)
         self.field_value.setVisible(show_content)
         self.image_picker_row.setVisible(show_image)
+        self.image_fit_row.setVisible(show_image)
+        self.image_slice_row.setVisible(show_image and self.image_fit.currentData() == "nine_slice")
         self.field_value.setEnabled(show_content)
+        self.field_label_button.setEnabled(show_content)
         self.image_path.setEnabled(show_image)
+        self.image_fit.setEnabled(show_image)
         self._set_alignment_enabled(has_field)
         if self.image_button:
             self.image_button.setEnabled(show_image)
+        if self.draw_image_button:
+            self.draw_image_button.setEnabled(show_image)
         if self.file_load_button:
             self.file_load_button.setVisible(show_content)
             self.file_load_button.setEnabled(show_content and self.field_type.currentText() in {"文本", "长文本", "资源路径"})
@@ -1643,8 +1798,14 @@ class NodeEditorDialog(QDialog):
             return
         field.name = self.field_name.text().strip() or "字段"
         field.data_type = self.field_type.currentText() if self.field_type.currentText() in FIELD_TYPES else "文本"
+        field.show_label = bool(self.field_label_button.isChecked() and field.data_type != "图片")
         field.value = "" if field.data_type == "图片" else self.field_value.toPlainText().strip()
         field.image_path = self.image_path.text().strip() if field.data_type == "图片" else ""
+        field.image_fit = str(self.image_fit.currentData() or "stretch") if field.data_type == "图片" else "stretch"
+        field.slice_left = max(0, int(self._float_text(self.slice_left, field.slice_left)))
+        field.slice_top = max(0, int(self._float_text(self.slice_top, field.slice_top)))
+        field.slice_right = max(0, int(self._float_text(self.slice_right, field.slice_right)))
+        field.slice_bottom = max(0, int(self._float_text(self.slice_bottom, field.slice_bottom)))
         field.x = self._float_text(self.field_x, field.x)
         field.y = self._float_text(self.field_y, field.y)
         field.width = max(44.0, self._float_text(self.field_w, field.width))
@@ -1765,16 +1926,17 @@ class NodeEditorDialog(QDialog):
             QMessageBox.warning(self, "模板名称不能为空", "请输入模板名称。")
             return
 
+        existing_index = next((index for index, item in enumerate(self.templates) if item.name == name), None)
+        existing_template = self.templates[existing_index] if existing_index is not None else None
         template = NodeTemplate(
             id=new_id("template"),
             name=name,
             color=self.color_edit.text().strip() or DEFAULT_NODE_COLOR,
-            icon=self.icon_edit.text().strip(),
-            icon_from_title=self.icon_from_title_button.isChecked(),
+            icon=existing_template.icon if existing_template is not None else "",
+            icon_from_title=existing_template.icon_from_title if existing_template is not None else False,
             title_field_id=self.title_field_id,
             fields=[NodeField.from_dict(field.to_dict()) for field in self.fields],
         )
-        existing_index = next((index for index, item in enumerate(self.templates) if item.name == name), None)
         if existing_index is not None:
             answer = QMessageBox.question(self, "覆盖模板", f"模板“{name}”已存在，是否覆盖？")
             if answer != QMessageBox.Yes:
@@ -1815,6 +1977,33 @@ class NodeEditorDialog(QDialog):
         )
         if path:
             self.image_path.setText(path)
+
+    def _paint_image(self) -> None:
+        field = self._selected_field()
+        if not field or self.field_type.currentText() != "图片":
+            return
+        self._apply_props()
+        current_path = self.image_path.text().strip()
+        initial_path = current_path if current_path and Path(current_path).exists() else None
+        output_path = Path(current_path) if current_path else self._next_drawn_image_path(field)
+        dialog = ImagePaintDialog(self, initial_path=initial_path, output_path=output_path)
+        if dialog.exec() != ImagePaintDialog.Accepted or not dialog.result_path:
+            return
+        self.image_path.setText(dialog.result_path)
+        self._apply_props()
+
+    def _next_drawn_image_path(self, field: NodeField) -> Path | None:
+        if not self.project_path:
+            return None
+        folder = project_bundle_dir(self.project_path) / "images"
+        folder.mkdir(parents=True, exist_ok=True)
+        base = _safe_asset_name(field.name or self.title_edit.text() or "绘制图片")
+        path = folder / f"{base}.png"
+        index = 2
+        while path.exists():
+            path = folder / f"{base}_{index}.png"
+            index += 1
+        return path
 
     def _load_field_file(self) -> None:
         field = self._selected_field()
@@ -2000,12 +2189,13 @@ class TemplateManagerDialog(QDialog):
         )
 
     def _node_to_template(self, node: Node, template_id: str) -> NodeTemplate:
+        existing = next((template for template in self.templates if template.id == template_id), None)
         return NodeTemplate(
             id=template_id,
             name=node.title,
             color=node.color,
-            icon=node.icon,
-            icon_from_title=node.icon_from_title,
+            icon=existing.icon if existing is not None else "",
+            icon_from_title=existing.icon_from_title if existing is not None else False,
             title_field_id=node.title_field_id,
             fields=[NodeField.from_dict(field.to_dict()) for field in node.fields],
         )

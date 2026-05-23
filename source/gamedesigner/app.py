@@ -102,6 +102,7 @@ class ProjectPage(QWidget):
     resetViewRequested = Signal()
     dataLayoutRequested = Signal(str)
     dataGridRowsRequested = Signal(int)
+    dataRowStyleRequested = Signal(str)
 
     def __init__(
         self,
@@ -150,9 +151,21 @@ class ProjectPage(QWidget):
         function_layout = QHBoxLayout(self.function_bar)
         function_layout.setContentsMargins(10, 8, 10, 8)
         function_layout.setSpacing(8)
-        self.function_label = QLabel("功能", self.function_bar)
-        self.function_label.setObjectName("canvasFunctionLabel")
-        function_layout.addWidget(self.function_label)
+        self.parent_button = QToolButton(self.function_bar)
+        self.parent_button.setObjectName("canvasFunctionNavButton")
+        self.parent_button.setText("回跳")
+        self.parent_button.setToolTip("跳到父画布")
+        self.parent_button.setAutoRaise(True)
+        self.parent_button.clicked.connect(self.parentJumpRequested.emit)
+        self.return_button = QToolButton(self.function_bar)
+        self.return_button.setObjectName("canvasFunctionNavButton")
+        self.return_button.setText("退回")
+        self.return_button.setToolTip("保存并关闭当前画布，回到上一个画布")
+        self.return_button.setAutoRaise(True)
+        self.return_button.clicked.connect(self.returnCloseRequested.emit)
+        function_layout.addWidget(self.parent_button)
+        function_layout.addWidget(self.return_button)
+        function_layout.addStretch(1)
 
         self.layout_button_group = QButtonGroup(self.function_bar)
         self.layout_button_group.setExclusive(True)
@@ -160,8 +173,13 @@ class ProjectPage(QWidget):
         self.grid_layout_button = self._function_toggle_button("网格", "网格卡片显示", "grid")
         self.table_layout_button = self._function_toggle_button("表格", "表格预览显示", "table")
         function_layout.addWidget(self.horizontal_layout_button)
+        self.row_style_button_group = QButtonGroup(self.function_bar)
+        self.row_style_button_group.setExclusive(True)
+        self.independent_row_button = self._row_style_toggle_button("独立", "每条数据显示为独立卡片", "independent")
+        self.thumbnail_row_button = self._row_style_toggle_button("缩略", "以表格缩略行显示数据", "thumbnail")
+        function_layout.addWidget(self.independent_row_button)
+        function_layout.addWidget(self.thumbnail_row_button)
         function_layout.addWidget(self.grid_layout_button)
-        function_layout.addWidget(self.table_layout_button)
         self.grid_rows_spin = QSpinBox(self.function_bar)
         self.grid_rows_spin.setObjectName("canvasFunctionSpin")
         self.grid_rows_spin.setMinimum(0)
@@ -171,7 +189,7 @@ class ProjectPage(QWidget):
         self.grid_rows_spin.setPrefix("行数 ")
         self.grid_rows_spin.valueChanged.connect(self._emit_grid_rows_requested)
         function_layout.addWidget(self.grid_rows_spin)
-        function_layout.addStretch(1)
+        function_layout.addWidget(self.table_layout_button)
         self.reset_view_button = QToolButton(self.function_bar)
         self.reset_view_button.setObjectName("canvasFunctionButton")
         self.reset_view_button.setText("重置")
@@ -187,23 +205,6 @@ class ProjectPage(QWidget):
         self.content_layout.addWidget(self.canvas)
         self.content_layout.addWidget(self.table_view)
         layout.addWidget(self.content)
-        self.nav_overlay = QWidget(self)
-        self.nav_overlay.setObjectName("canvasNav")
-        nav_layout = QHBoxLayout(self.nav_overlay)
-        nav_layout.setContentsMargins(5, 5, 5, 5)
-        nav_layout.setSpacing(4)
-        self.parent_button = QToolButton(self.nav_overlay)
-        self.parent_button.setObjectName("canvasNavButton")
-        self.parent_button.setText("回跳")
-        self.parent_button.setToolTip("跳到父画布")
-        self.parent_button.clicked.connect(self.parentJumpRequested.emit)
-        self.return_button = QToolButton(self.nav_overlay)
-        self.return_button.setObjectName("canvasNavButton")
-        self.return_button.setText("退回")
-        self.return_button.setToolTip("保存并关闭当前画布，回到上一个画布")
-        self.return_button.clicked.connect(self.returnCloseRequested.emit)
-        nav_layout.addWidget(self.parent_button)
-        nav_layout.addWidget(self.return_button)
         self.refresh_canvas_nav()
         self.refresh_active_template()
         self.refresh_canvas_mode()
@@ -223,6 +224,21 @@ class ProjectPage(QWidget):
         if checked:
             self.dataLayoutRequested.emit(layout_value)
 
+    def _row_style_toggle_button(self, text: str, tooltip: str, style_value: str) -> QToolButton:
+        button = QToolButton(self.function_bar)
+        button.setObjectName("canvasFunctionSubToggle")
+        button.setText(text)
+        button.setToolTip(tooltip)
+        button.setCheckable(True)
+        button.setAutoRaise(True)
+        button.clicked.connect(lambda checked=False, value=style_value: self._request_row_style(value, checked))
+        self.row_style_button_group.addButton(button)
+        return button
+
+    def _request_row_style(self, style_value: str, checked: bool) -> None:
+        if checked:
+            self.dataRowStyleRequested.emit(style_value)
+
     def _emit_grid_rows_requested(self, rows: int) -> None:
         if self.grid_rows_spin.signalsBlocked():
             return
@@ -239,10 +255,8 @@ class ProjectPage(QWidget):
 
     def refresh_canvas_nav(self) -> None:
         show_nav = bool(not self.is_welcome and self.canvas_data.parent_canvas_id)
-        self.nav_overlay.setVisible(show_nav)
-        if show_nav:
-            self.nav_overlay.adjustSize()
-            self.nav_overlay.raise_()
+        self.parent_button.setVisible(show_nav)
+        self.return_button.setVisible(show_nav)
 
     def refresh_canvas_mode(self) -> None:
         show_table = bool(self.canvas_data.is_data_canvas() and self.canvas_data.data_layout == "table")
@@ -254,6 +268,9 @@ class ProjectPage(QWidget):
         self.horizontal_layout_button.setVisible(is_data_canvas)
         self.grid_layout_button.setVisible(is_data_canvas)
         self.table_layout_button.setVisible(is_data_canvas)
+        show_row_style = bool(is_data_canvas and self.canvas_data.data_layout == "horizontal")
+        self.independent_row_button.setVisible(show_row_style)
+        self.thumbnail_row_button.setVisible(show_row_style)
         show_grid_rows = bool(is_data_canvas and self.canvas_data.data_layout == "grid")
         self.grid_rows_spin.setVisible(show_grid_rows)
         self.grid_rows_spin.blockSignals(True)
@@ -262,12 +279,8 @@ class ProjectPage(QWidget):
         self.horizontal_layout_button.setChecked(is_data_canvas and self.canvas_data.data_layout == "horizontal")
         self.grid_layout_button.setChecked(is_data_canvas and self.canvas_data.data_layout == "grid")
         self.table_layout_button.setChecked(is_data_canvas and self.canvas_data.data_layout == "table")
-        self.nav_overlay.raise_()
-
-    def resizeEvent(self, event) -> None:  # type: ignore[override]
-        super().resizeEvent(event)
-        self.nav_overlay.adjustSize()
-        self.nav_overlay.move(10, 10)
+        self.independent_row_button.setChecked(show_row_style and self.canvas_data.data_row_style != "thumbnail")
+        self.thumbnail_row_button.setChecked(show_row_style and self.canvas_data.data_row_style == "thumbnail")
 
 
 class CompactTitleBar(QWidget):
@@ -688,6 +701,7 @@ class GameDesignerApp(QMainWindow):
         page.resetViewRequested.connect(lambda page=page: page.canvas.reset_view())
         page.dataLayoutRequested.connect(self._set_data_canvas_layout)
         page.dataGridRowsRequested.connect(self._set_data_canvas_grid_rows)
+        page.dataRowStyleRequested.connect(self._set_data_canvas_row_style)
 
     def _show_welcome_page(self) -> None:
         for index in range(self.tabs.count()):
@@ -1794,6 +1808,18 @@ class GameDesignerApp(QMainWindow):
         page.canvas.rebuild()
         self._mark_dirty(page)
 
+    def _set_data_canvas_row_style(self, style: str) -> None:
+        page = self._current_page()
+        if not page or page.is_welcome or not page.canvas_data.is_data_canvas():
+            return
+        if style not in {"independent", "thumbnail"} or page.canvas_data.data_row_style == style:
+            return
+        page.canvas_data.data_row_style = style
+        self._sync_canvas_state(page)
+        page.refresh_canvas_mode()
+        page.canvas.rebuild()
+        self._mark_dirty(page)
+
     def _set_data_canvas_template(self, template_id: str) -> None:
         page = self._current_page()
         if not page or page.is_welcome or not page.canvas_data.is_data_canvas():
@@ -1992,8 +2018,6 @@ class GameDesignerApp(QMainWindow):
             if template is not None:
                 template.name = result.title
                 template.color = result.color
-                template.icon = result.icon
-                template.icon_from_title = result.icon_from_title
                 template.title_field_id = result.title_field_id
                 template.fields = [NodeField.from_dict(field.to_dict()) for field in result.fields]
                 page.active_template_id = template.id

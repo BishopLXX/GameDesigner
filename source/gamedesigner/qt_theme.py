@@ -284,11 +284,6 @@ def stylesheet(name: str) -> str:
         image: none;
         width: 0;
     }}
-    QWidget#canvasNav {{
-        background: {colors["panel"]};
-        border: 1px solid {colors["hairline"]};
-        border-radius: 10px;
-    }}
     QWidget#canvasFunctionBar {{
         background: {colors["window"]};
         border-bottom: 1px solid {colors["hairline"]};
@@ -299,19 +294,27 @@ def stylesheet(name: str) -> str:
         padding-right: 6px;
         font-size: 9pt;
     }}
-    QToolButton#canvasFunctionButton, QToolButton#canvasFunctionToggle {{
+    QToolButton#canvasFunctionButton, QToolButton#canvasFunctionToggle, QToolButton#canvasFunctionSubToggle, QToolButton#canvasFunctionNavButton {{
         background: transparent;
         color: {colors["text_muted"]};
         border: 1px solid transparent;
         border-radius: 8px;
         padding: 4px 10px;
     }}
-    QToolButton#canvasFunctionButton:hover, QToolButton#canvasFunctionToggle:hover {{
+    QToolButton#canvasFunctionNavButton {{
+        background: {colors["panel"]};
+        color: {colors["text"]};
+        border-color: {colors["hairline"]};
+    }}
+    QToolButton#canvasFunctionSubToggle {{
+        padding: 4px 8px;
+    }}
+    QToolButton#canvasFunctionButton:hover, QToolButton#canvasFunctionToggle:hover, QToolButton#canvasFunctionSubToggle:hover, QToolButton#canvasFunctionNavButton:hover {{
         background: {colors["control_hover"]};
         color: {colors["text"]};
         border-color: {colors["hairline"]};
     }}
-    QToolButton#canvasFunctionToggle:checked {{
+    QToolButton#canvasFunctionToggle:checked, QToolButton#canvasFunctionSubToggle:checked {{
         background: {colors["control"]};
         color: {colors["text"]};
         border-color: {colors["accent"]};
@@ -320,15 +323,5 @@ def stylesheet(name: str) -> str:
         min-width: 88px;
         max-width: 112px;
         padding-right: 18px;
-    }}
-    QToolButton#canvasNavButton {{
-        background: transparent;
-        color: {colors["text"]};
-        border: 0;
-        border-radius: 7px;
-        padding: 4px 9px;
-    }}
-    QToolButton#canvasNavButton:hover {{
-        background: {colors["control_hover"]};
     }}
     """

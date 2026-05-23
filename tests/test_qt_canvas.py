@@ -5,11 +5,11 @@ from unittest import mock
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QPoint, QPointF, Qt
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QImage, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication
 
 from gamedesigner.data_canvas import layout_data_canvas
-from gamedesigner.models import BlueprintGroup, CanvasData, Node, NodeField, ProjectData
+from gamedesigner.models import BlueprintGroup, CanvasData, Node, NodeField, NodeTemplate, ProjectData
 from gamedesigner.qt_canvas import NodeGraphView
 
 
@@ -111,13 +111,45 @@ class QtCanvasTests(unittest.TestCase):
         self.assertEqual(node.height, 188)
         view.deleteLater()
 
-    def test_data_canvas_allows_node_move_but_not_resize(self) -> None:
+    def test_data_canvas_without_visual_template_allows_node_move_but_not_resize(self) -> None:
         canvas = CanvasData(name="数据", canvas_type="data")
         canvas.add_node(Node(title="条目"))
         view = NodeGraphView(canvas)
 
         self.assertTrue(view.can_move_nodes())
         self.assertFalse(view.can_resize_nodes())
+        view.deleteLater()
+
+    def test_data_canvas_resize_scales_template_and_all_nodes(self) -> None:
+        field = NodeField("数值", "文本", "1", x=20, y=18, width=120, height=44, font_size=12)
+        template = NodeTemplate(name="数据模板", fields=[field])
+        canvas = CanvasData(name="数据", canvas_type="data", data_layout="grid", template_id=template.id)
+        first = template.create_node(0, 0)
+        first.fields[0].value = "10"
+        second = template.create_node(0, 0)
+        second.fields[0].value = "20"
+        canvas.add_node(first)
+        canvas.add_node(second)
+        view = NodeGraphView(canvas, templates=[template])
+        item = view.node_items[first.id]
+        handle_pos = QPointF(item.width - 1, item.height - 1)
+        press_scene_pos = item.mapToScene(handle_pos)
+
+        self.assertTrue(view.can_resize_nodes())
+        item.mousePressEvent(_ScenePointerEvent(handle_pos, press_scene_pos))
+        item.mouseMoveEvent(_ScenePointerEvent(handle_pos, press_scene_pos + QPointF(120, 72)))
+        changed = view.resize_data_canvas_template(first.id, item.width, item.height)
+
+        self.assertTrue(changed)
+        self.assertGreater(template.fields[0].width, 120)
+        self.assertGreater(template.fields[0].height, 44)
+        self.assertGreater(template.fields[0].font_size, 12)
+        self.assertEqual(first.fields[0].value, "10")
+        self.assertEqual(second.fields[0].value, "20")
+        self.assertEqual(first.fields[0].width, template.fields[0].width)
+        self.assertEqual(second.fields[0].width, template.fields[0].width)
+        self.assertEqual(first.width, second.width)
+        self.assertEqual(view.node_items[second.id].width, view.node_items[first.id].width)
         view.deleteLater()
 
     def test_data_canvas_drag_reorders_nodes(self) -> None:
@@ -179,6 +211,98 @@ class QtCanvasTests(unittest.TestCase):
 
         horizontal_view.deleteLater()
         vertical_view.deleteLater()
+
+    def test_grid_card_rows_do_not_reserve_type_column(self) -> None:
+        canvas = CanvasData(name="数据", canvas_type="data", data_layout="grid")
+        node = canvas.add_node(
+            Node(
+                title="角色",
+                fields=[
+                    NodeField(name="最大生命值", data_type="文本", value="100"),
+                    NodeField(name="移动速度", data_type="数字", value="4"),
+                ],
+            )
+        )
+        view = NodeGraphView(canvas)
+        item = view.node_items[node.id]
+        _name_w, type_w = item._row_column_widths()
+
+        self.assertEqual(type_w, 0.0)
+        self.assertGreater(item.width, 0)
+        view.deleteLater()
+
+    def test_horizontal_data_canvas_node_width_fits_many_fields(self) -> None:
+        canvas = CanvasData(name="数据", canvas_type="data", data_layout="horizontal")
+        node = canvas.add_node(
+            Node(
+                title="很多字段",
+                fields=[
+                    NodeField(name=f"field{i}", value=str(i))
+                    for i in range(24)
+                ],
+            )
+        )
+        view = NodeGraphView(canvas)
+        item = view.node_items[node.id]
+        expected_width = sum(segment_w for _field, _label_w, segment_w in item._horizontal_data_segments())
+        expected_width += 23 * 7.0 + 20.0
+
+        self.assertGreater(item.width, 2400.0)
+        self.assertGreaterEqual(item.width, expected_width)
+        self.assertEqual(node.width, item.width)
+        view.deleteLater()
+
+    def test_horizontal_thumbnail_data_canvas_uses_table_like_rows(self) -> None:
+        canvas = CanvasData(name="数据", canvas_type="data", data_layout="horizontal", data_row_style="thumbnail")
+        node = canvas.add_node(
+            Node(
+                title="缩略",
+                fields=[
+                    NodeField(name="姓名", data_type="文本", value="小明"),
+                    NodeField(name="数值", data_type="整数", value="12"),
+                ],
+            )
+        )
+
+        view = NodeGraphView(canvas)
+        item = view.node_items[node.id]
+
+        self.assertIsNotNone(view.data_header_item)
+        self.assertEqual(item.height, 34.0)
+        self.assertEqual(node.y, 136.0)
+        self.assertEqual(len(view.horizontal_thumbnail_columns()), 2)
+        view.deleteLater()
+
+    def test_visual_field_show_label_paints_field_name_and_value(self) -> None:
+        canvas = CanvasData(name="主画布")
+        node = canvas.add_node(
+            Node(
+                title="显示字段",
+                fields=[
+                    NodeField(
+                        name="moveSpeed",
+                        data_type="文本",
+                        value="4",
+                        x=20,
+                        y=18,
+                        width=220,
+                        height=58,
+                        show_label=True,
+                    )
+                ],
+            )
+        )
+        view = NodeGraphView(canvas)
+        item = view.node_items[node.id]
+        image = QImage(int(item.width), int(item.height), QImage.Format_ARGB32_Premultiplied)
+        image.fill(Qt.transparent)
+        painter = QPainter(image)
+        item.paint(painter, None)
+        painter.end()
+
+        self.assertTrue(node.fields[0].show_label)
+        self.assertGreater(image.pixelColor(36, 84).alpha(), 0)
+        view.deleteLater()
 
     def test_blueprint_group_snaps_to_grid(self) -> None:
         canvas = CanvasData(name="主画布")

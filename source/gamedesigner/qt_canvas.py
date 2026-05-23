@@ -30,7 +30,16 @@ from PySide6.QtWidgets import (
     QMenu,
 )
 
-from .data_canvas import layout_data_canvas, reorder_data_canvas_node
+from .data_canvas import (
+    DATA_CANVAS_MARGIN_X,
+    DATA_CANVAS_MARGIN_Y,
+    DATA_CANVAS_THUMBNAIL_HEADER_HEIGHT,
+    DATA_CANVAS_THUMBNAIL_ROW_HEIGHT,
+    apply_template_to_node,
+    layout_data_canvas,
+    reorder_data_canvas_node,
+)
+from .image_rendering import draw_field_pixmap
 from .models import BlueprintGroup, CanvasData, Edge, Node, NodeField, NodeTemplate, ProjectData
 from .qt_theme import palette
 
@@ -39,7 +48,6 @@ NODE_DEFAULT_WIDTH = 310.0
 NODE_MIN_WIDTH = 260.0
 NODE_MIN_HEIGHT = 92.0
 NODE_MAX_NATURAL_WIDTH = 680.0
-HORIZONTAL_DATA_NODE_MAX_NATURAL_WIDTH = 2400.0
 HEADER_HEIGHT = 52.0
 ROW_GAP = 7.0
 ROW_TOP = HEADER_HEIGHT + 6.0
@@ -261,6 +269,9 @@ class NodeItem(QGraphicsObject):
         zoom = self.view.transform().m11()
         painter.setRenderHint(QPainter.Antialiasing, True)
         rect = self.boundingRect()
+        if self._uses_horizontal_thumbnail_row():
+            self._paint_horizontal_thumbnail_row(painter, colors, rect)
+            return
         path = QPainterPath()
         path.addRoundedRect(rect.adjusted(1, 1, -1, -1), 14, 14)
         painter.fillPath(path, _safe_color(self.node.color, "#FFFFFF"))
@@ -375,17 +386,9 @@ class NodeItem(QGraphicsObject):
                 WRAP_FLAGS,
                 field.name,
             )
-            painter.setPen(QColor(colors["node_muted"]))
-            painter.setFont(_font(8))
-            type_x = row.x() + 10 + name_w + 10
-            painter.drawText(
-                QRectF(type_x, row.y() + 8, type_w, row.height() - 16),
-                WRAP_FLAGS,
-                field.data_type,
-            )
             painter.setPen(QColor(colors["node_text"]))
             painter.setFont(_font(9))
-            value_x = type_x + type_w + 10
+            value_x = row.x() + 10 + name_w + 14
             painter.drawText(
                 QRectF(value_x, row.y() + 8, row.right() - value_x - 10, row.height() - 16),
                 WRAP_FLAGS,
@@ -433,6 +436,38 @@ class NodeItem(QGraphicsObject):
             )
             x += segment_w + ROW_GAP
 
+    def _paint_horizontal_thumbnail_row(self, painter: QPainter, colors: dict[str, str], rect: QRectF) -> None:
+        columns = self.view.horizontal_thumbnail_columns()
+        if not columns:
+            return
+        background = QColor("#FFFFFF" if self.view.theme == "light" else colors["panel_alt"])
+        alternate = QColor("#F5F5F7" if self.view.theme == "light" else colors["panel"])
+        fill = alternate if int(max(1, self.node.order)) % 2 == 0 else background
+        painter.fillRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), fill)
+        if self.isSelected():
+            painter.fillRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), QColor(colors["blue_soft"]))
+
+        field_map = {field.id: field for field in self.node.fields}
+        x = 0.0
+        value_metrics = QFontMetrics(_font(9))
+        painter.setFont(_font(9))
+        for field_id, _name, _data_type, width in columns:
+            cell = QRectF(x, 0, width, rect.height())
+            painter.setPen(QPen(QColor(colors["hairline"]), 1))
+            painter.drawRect(cell)
+            field = field_map.get(field_id)
+            value = self._horizontal_field_value(field) if field is not None else " "
+            painter.setPen(QColor(colors["text"]))
+            painter.drawText(
+                cell.adjusted(8, 0, -8, 0),
+                Qt.AlignLeft | Qt.AlignVCenter | Qt.TextSingleLine,
+                value_metrics.elidedText(value, Qt.ElideRight, max(1, int(cell.width() - 16))),
+            )
+            x += width
+        if self.isSelected():
+            painter.setPen(QPen(QColor(colors["blue"]), 2))
+            painter.drawRect(rect.adjusted(1, 1, -1, -1))
+
     def _paint_visual_fields(self, painter: QPainter, colors: dict[str, str], fields: list[NodeField]) -> None:
         content_w = max([field.x + field.width for field in fields] + [self.width - 28]) + 20
         content_h = max([field.y + field.height for field in fields] + [self.height - HEADER_HEIGHT - 24]) + 20
@@ -449,39 +484,78 @@ class NodeItem(QGraphicsObject):
             path = QPainterPath()
             path.addRoundedRect(card, 9, 9)
             painter.fillPath(path, QColor(field.bg_color or "#FFFFFF"))
-            painter.setPen(QPen(QColor("#DADAE0"), 1))
-            painter.drawPath(path)
             is_image = field.data_type == "图片"
             if is_image and field.image_path:
-                target = card.adjusted(8, 8, -8, -8)
-                if self.view.is_interaction_preview():
-                    pixmap = self.view._source_image_pixmap(field.image_path)
-                    if pixmap is not None:
-                        image_rect = self._fit_pixmap_rect(target, pixmap.width(), pixmap.height())
-                        painter.save()
-                        painter.setRenderHint(QPainter.SmoothPixmapTransform, False)
-                        painter.drawPixmap(image_rect.toRect(), pixmap, pixmap.rect())
-                        painter.restore()
-                else:
-                    pixmap = self.view._scaled_image_pixmap(
-                        field.image_path,
-                        int(max(1, target.width())),
-                        int(max(1, target.height())),
+                pixmap = self.view._source_image_pixmap(field.image_path)
+                if pixmap is not None:
+                    painter.save()
+                    painter.setClipPath(path)
+                    draw_field_pixmap(
+                        painter,
+                        pixmap,
+                        card,
+                        field,
+                        smooth=not self.view.is_interaction_preview(),
                     )
-                    if pixmap is not None:
-                        image_rect = self._fit_pixmap_rect(target, pixmap.width(), pixmap.height())
-                        painter.drawPixmap(image_rect.toRect(), pixmap, pixmap.rect())
+                    painter.restore()
             elif is_image:
                 painter.setPen(QColor(colors["node_muted"]))
                 painter.setFont(_font(9))
                 painter.drawText(card.adjusted(9, 8, -9, -8), Qt.AlignCenter | Qt.TextWordWrap, "选择图片")
-            text = field.value if is_image else (field.value or field.name)
-            if not text:
-                continue
-            painter.setPen(QColor(field.text_color or colors["node_text"]))
-            font = _font(max(8, min(48, int(field.font_size * min(scale_x, scale_y)))))
-            painter.setFont(font)
-            painter.drawText(card.adjusted(9, 8, -9, -8), _field_text_flags(field), text)
+            painter.setPen(QPen(QColor("#DADAE0"), 1))
+            painter.drawPath(path)
+            if is_image:
+                text = field.value
+            else:
+                text = field.value or field.name
+            self._draw_visual_field_text(painter, colors, card.adjusted(9, 8, -9, -8), field, text, min(scale_x, scale_y))
+
+    def _draw_visual_field_text(
+        self,
+        painter: QPainter,
+        colors: dict[str, str],
+        rect: QRectF,
+        field: NodeField,
+        text: str,
+        scale: float,
+    ) -> None:
+        if not text and not field.show_label:
+            return
+        font_size = max(8, min(48, int(field.font_size * scale)))
+        text_color = _safe_color(field.text_color or colors["node_text"], colors["node_text"])
+        if field.show_label and field.data_type != "图片":
+            label = field.name.strip() or "字段"
+            value = field.value.strip() or " "
+            label_font = _font(font_size, True)
+            value_font = _font(font_size)
+            label_metrics = QFontMetrics(label_font)
+            value_metrics = QFontMetrics(value_font)
+            label_width = min(
+                max(42.0, float(label_metrics.horizontalAdvance(label) + 8)),
+                max(42.0, rect.width() * 0.48),
+            )
+            label_rect = QRectF(rect.x(), rect.y(), label_width, rect.height())
+            value_rect = QRectF(label_rect.right() + 8, rect.y(), max(1.0, rect.right() - label_rect.right() - 8), rect.height())
+            label_color = QColor(text_color)
+            label_color.setAlpha(178)
+            painter.setPen(label_color)
+            painter.setFont(label_font)
+            painter.drawText(
+                label_rect,
+                Qt.AlignLeft | Qt.AlignVCenter | Qt.TextSingleLine,
+                label_metrics.elidedText(label, Qt.ElideRight, max(1, int(label_rect.width()))),
+            )
+            painter.setPen(text_color)
+            painter.setFont(value_font)
+            painter.drawText(
+                value_rect,
+                Qt.AlignLeft | Qt.AlignVCenter | Qt.TextSingleLine,
+                value_metrics.elidedText(value, Qt.ElideRight, max(1, int(value_rect.width()))),
+            )
+            return
+        painter.setPen(text_color)
+        painter.setFont(_font(font_size))
+        painter.drawText(rect, _field_text_flags(field), text)
 
     def _paint_resize_handle(self, painter: QPainter, colors: dict[str, str], rect: QRectF) -> None:
         painter.setPen(QPen(QColor(colors["blue"]), 1.4))
@@ -593,16 +667,21 @@ class NodeItem(QGraphicsObject):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        was_resizing = self._resizing
         self._resizing = False
         self.setCursor(Qt.OpenHandCursor)
         self.view.snap_guides.clear()
         self.view.viewport().update()
         if self._moved:
-            if self.view.is_data_canvas():
+            if self.view.is_data_canvas() and was_resizing:
+                if self.view.resize_data_canvas_template(self.node.id, self.width, self.height):
+                    self.view.projectChanged.emit()
+            elif self.view.is_data_canvas():
                 self.view.commit_data_canvas_node_reorder(self.node.id)
+                self.view.projectChanged.emit()
             else:
                 self.view.refresh_group_membership()
-            self.view.projectChanged.emit()
+                self.view.projectChanged.emit()
         super().mouseReleaseEvent(event)
 
     def itemChange(self, change: QGraphicsItem.GraphicsItemChange, value):  # type: ignore[override]
@@ -633,12 +712,18 @@ class NodeItem(QGraphicsObject):
 
     def _sync_size(self) -> None:
         use_natural_size = self.view.is_data_canvas()
+        if self._uses_horizontal_thumbnail_row():
+            self.width = self.view.horizontal_thumbnail_table_width()
+            self.height = DATA_CANVAS_THUMBNAIL_ROW_HEIGHT
+            self.node.width = self.width
+            self.node.height = self.height
+            return
         visual_fields = [field for field in self.node.fields if field.has_visual_layout()]
         if visual_fields and not self._uses_horizontal_data_row():
             natural_w = max([field.x + field.width for field in visual_fields] + [NODE_DEFAULT_WIDTH]) + 34
             natural_h = HEADER_HEIGHT + max([field.y + field.height for field in visual_fields] + [120]) + 24
             if use_natural_size:
-                self.width = max(NODE_MIN_WIDTH, min(NODE_MAX_NATURAL_WIDTH, natural_w))
+                self.width = max(NODE_MIN_WIDTH, natural_w)
                 self.height = max(NODE_MIN_HEIGHT, natural_h)
                 self.node.width = self.width
                 self.node.height = self.height
@@ -664,8 +749,7 @@ class NodeItem(QGraphicsObject):
         if self._uses_horizontal_data_row():
             content_width = sum(segment_w for _field, _label_w, segment_w in self._horizontal_data_segments())
             content_width += max(0, len(self.node.fields) - 1) * ROW_GAP + 20
-            natural = max(NODE_DEFAULT_WIDTH, title_width, content_width)
-            return min(HORIZONTAL_DATA_NODE_MAX_NATURAL_WIDTH, natural)
+            return max(NODE_DEFAULT_WIDTH, title_width, content_width)
         name_w, type_w = self._row_column_widths()
         value_font = QFontMetrics(_font(9))
         value_widths = [
@@ -673,7 +757,7 @@ class NodeItem(QGraphicsObject):
             for field in self.node.fields
         ]
         value_width = max(value_widths + [170])
-        natural = max(NODE_DEFAULT_WIDTH, title_width, name_w + type_w + value_width + 50)
+        natural = max(NODE_DEFAULT_WIDTH, title_width, name_w + value_width + 44)
         return min(NODE_MAX_NATURAL_WIDTH, natural)
 
     def _natural_detail_height(self, width: float) -> float:
@@ -690,7 +774,21 @@ class NodeItem(QGraphicsObject):
 
     def _uses_horizontal_data_row(self) -> bool:
         canvas = self.view.active_canvas()
-        return bool(canvas and canvas.is_data_canvas() and canvas.data_layout == "horizontal")
+        return bool(
+            canvas
+            and canvas.is_data_canvas()
+            and canvas.data_layout == "horizontal"
+            and canvas.data_row_style != "thumbnail"
+        )
+
+    def _uses_horizontal_thumbnail_row(self) -> bool:
+        canvas = self.view.active_canvas()
+        return bool(
+            canvas
+            and canvas.is_data_canvas()
+            and canvas.data_layout == "horizontal"
+            and canvas.data_row_style == "thumbnail"
+        )
 
     def _horizontal_data_segments(self) -> list[tuple[NodeField, float, float]]:
         name_metrics = QFontMetrics(_font(8, True))
@@ -711,17 +809,14 @@ class NodeItem(QGraphicsObject):
 
     def _row_column_widths(self) -> tuple[float, float]:
         name_metrics = QFontMetrics(_font(9, True))
-        type_metrics = QFontMetrics(_font(8))
         name_w = max([name_metrics.horizontalAdvance(field.name) + 18 for field in self.node.fields] + [92])
-        type_w = max([type_metrics.horizontalAdvance(field.data_type) + 16 for field in self.node.fields] + [54])
-        return min(max(82.0, name_w), 132.0), min(max(52.0, type_w), 88.0)
+        return min(max(82.0, name_w), 148.0), 0.0
 
     def _row_height(self, field: NodeField, width: float, name_w: float, type_w: float) -> float:
-        value_w = max(40.0, width - 20 - 10 - name_w - 10 - type_w - 20)
+        value_w = max(40.0, width - 20 - 10 - name_w - 14 - 20)
         name_h = self._wrapped_height(field.name, _font(9, True), name_w)
-        type_h = self._wrapped_height(field.data_type, _font(8), type_w)
         value_h = self._wrapped_height(field.value or " ", _font(9), value_w)
-        return max(40.0, name_h + 16, type_h + 16, value_h + 16)
+        return max(40.0, name_h + 16, value_h + 16)
 
     def _wrapped_height(self, text: str, font: QFont, width: float) -> float:
         metrics = QFontMetrics(font)
@@ -899,6 +994,53 @@ class EdgeItem(QGraphicsPathItem):
         ]
 
 
+class DataCanvasHeaderItem(QGraphicsObject):
+    def __init__(self, view: "NodeGraphView") -> None:
+        super().__init__()
+        self.view = view
+        self.setZValue(9)
+
+    def boundingRect(self) -> QRectF:
+        return QRectF(0, 0, self.view.horizontal_thumbnail_table_width(), DATA_CANVAS_THUMBNAIL_HEADER_HEIGHT)
+
+    def paint(self, painter: QPainter, _option, _widget=None) -> None:  # type: ignore[override]
+        columns = self.view.horizontal_thumbnail_columns()
+        if not columns:
+            return
+        colors = palette(self.view.theme)
+        rect = self.boundingRect()
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        painter.fillRect(rect, QColor(colors["panel"]))
+
+        name_h = 34.0
+        type_h = rect.height() - name_h
+        x = 0.0
+        name_metrics = QFontMetrics(_font(9, True))
+        type_metrics = QFontMetrics(_font(8))
+        for _field_id, name, data_type, width in columns:
+            name_cell = QRectF(x, 0, width, name_h)
+            type_cell = QRectF(x, name_h, width, type_h)
+            painter.fillRect(name_cell, QColor(colors["panel_alt"]))
+            painter.setPen(QPen(QColor(colors["hairline"]), 1))
+            painter.drawRect(name_cell)
+            painter.drawRect(type_cell)
+            painter.setPen(QColor(colors["text"]))
+            painter.setFont(_font(9, True))
+            painter.drawText(
+                name_cell.adjusted(8, 0, -8, 0),
+                Qt.AlignLeft | Qt.AlignVCenter | Qt.TextSingleLine,
+                name_metrics.elidedText(name or "字段", Qt.ElideRight, max(1, int(width - 16))),
+            )
+            painter.setPen(QColor(colors["text_muted"]))
+            painter.setFont(_font(8))
+            painter.drawText(
+                type_cell.adjusted(8, 0, -8, 0),
+                Qt.AlignLeft | Qt.AlignVCenter | Qt.TextSingleLine,
+                type_metrics.elidedText(data_type or "文本", Qt.ElideRight, max(1, int(width - 16))),
+            )
+            x += width
+
+
 class NodeGraphView(QGraphicsView):
     selectionChanged = Signal(object, object)
     projectChanged = Signal()
@@ -946,6 +1088,7 @@ class NodeGraphView(QGraphicsView):
         self.node_items: dict[str, NodeItem] = {}
         self.group_items: dict[str, BlueprintGroupItem] = {}
         self.edge_items: dict[str, EdgeItem] = {}
+        self.data_header_item: DataCanvasHeaderItem | None = None
         self.selected_node_ids: set[str] = set()
         self.selected_group_ids: set[str] = set()
         self.selected_node_id: str | None = None
@@ -997,7 +1140,11 @@ class NodeGraphView(QGraphicsView):
 
     def can_resize_nodes(self) -> bool:
         if self.is_data_canvas():
-            return False
+            canvas = self.active_canvas()
+            if canvas is None or canvas.data_layout == "table" or self.uses_horizontal_thumbnail_rows():
+                return False
+            fields = self._data_canvas_template_fields()
+            return self.can_move_nodes() and any(field.has_visual_layout() for field in fields)
         return self.can_move_nodes()
 
     def can_move_groups(self) -> bool:
@@ -1011,6 +1158,78 @@ class NodeGraphView(QGraphicsView):
     def is_data_canvas(self) -> bool:
         canvas = self.active_canvas()
         return bool(canvas and canvas.is_data_canvas())
+
+    def uses_horizontal_thumbnail_rows(self) -> bool:
+        canvas = self.active_canvas()
+        return bool(
+            canvas
+            and canvas.is_data_canvas()
+            and canvas.data_layout == "horizontal"
+            and canvas.data_row_style == "thumbnail"
+        )
+
+    def horizontal_thumbnail_columns(self) -> list[tuple[str, str, str, float]]:
+        canvas = self.active_canvas()
+        if canvas is None:
+            return []
+        field_order: list[NodeField] = []
+        seen: set[str] = set()
+        template = next((item for item in self.templates if item.id == canvas.template_id), None)
+        sources = [template.fields if template is not None else []]
+        sources.extend(node.fields for node in canvas.nodes)
+        for fields in sources:
+            for field in fields:
+                if field.id in seen:
+                    continue
+                seen.add(field.id)
+                field_order.append(field)
+
+        value_metrics = QFontMetrics(_font(9))
+        name_metrics = QFontMetrics(_font(9, True))
+        type_metrics = QFontMetrics(_font(8))
+        columns: list[tuple[str, str, str, float]] = []
+        for field in field_order:
+            value_widths: list[int] = []
+            for node in canvas.nodes:
+                node_field = next((candidate for candidate in node.fields if candidate.id == field.id), None)
+                if node_field is None:
+                    continue
+                value = node_field.image_path.replace("\\", "/").rsplit("/", 1)[-1] if node_field.data_type == "图片" else node_field.value
+                value_widths.append(value_metrics.horizontalAdvance(value or " "))
+            width = max(
+                118.0,
+                min(
+                    260.0,
+                    float(
+                        max(
+                            [name_metrics.horizontalAdvance(field.name or "字段"), type_metrics.horizontalAdvance(field.data_type or "文本")]
+                            + value_widths
+                            + [84]
+                        )
+                        + 24
+                    ),
+                ),
+            )
+            columns.append((field.id, field.name or "字段", field.data_type or "文本", width))
+        return columns
+
+    def _data_canvas_template(self) -> NodeTemplate | None:
+        canvas = self.active_canvas()
+        if canvas is None or not canvas.template_id:
+            return None
+        return next((template for template in self.templates if template.id == canvas.template_id), None)
+
+    def _data_canvas_template_fields(self) -> list[NodeField]:
+        template = self._data_canvas_template()
+        if template is not None:
+            return template.fields
+        canvas = self.active_canvas()
+        if canvas is None or not canvas.nodes:
+            return []
+        return canvas.nodes[0].fields
+
+    def horizontal_thumbnail_table_width(self) -> float:
+        return max(NODE_MIN_WIDTH, sum(width for _field_id, _name, _data_type, width in self.horizontal_thumbnail_columns()))
 
     def eventFilter(self, _watched, event) -> bool:  # type: ignore[override]
         if event.type() in (QEvent.ApplicationDeactivate, QEvent.WindowDeactivate):
@@ -1124,6 +1343,7 @@ class NodeGraphView(QGraphicsView):
         self.group_items.clear()
         self.node_items.clear()
         self.edge_items.clear()
+        self.data_header_item = None
         groups = getattr(self.project, "groups", [])
         self.selected_node_ids &= {node.id for node in self.project.nodes}
         self.selected_group_ids &= {group.id for group in groups}
@@ -1144,6 +1364,10 @@ class NodeGraphView(QGraphicsView):
                     item = self.node_items.get(node.id)
                     if item is not None:
                         item.setPos(node.x, node.y)
+        if self.uses_horizontal_thumbnail_rows():
+            self.data_header_item = DataCanvasHeaderItem(self)
+            self.data_header_item.setPos(DATA_CANVAS_MARGIN_X, DATA_CANVAS_MARGIN_Y)
+            self.scene_obj.addItem(self.data_header_item)
         for edge in self.project.valid_edges():
             source = self._endpoint_item(edge.source)
             target = self._endpoint_item(edge.target)
@@ -1161,6 +1385,8 @@ class NodeGraphView(QGraphicsView):
                 item.sceneBoundingRect().adjusted(-200, -120, 200, 120)
                 for item in [*self.group_items.values(), *self.node_items.values()]
             ]
+            if self.data_header_item is not None:
+                item_rects.append(self.data_header_item.sceneBoundingRect().adjusted(-200, -120, 200, 120))
             if not item_rects:
                 self.scene_obj.setSceneRect(QRectF(-120, -120, 1280, 960))
                 return
@@ -1393,6 +1619,49 @@ class NodeGraphView(QGraphicsView):
         if changed:
             self.viewport().update()
 
+    def resize_data_canvas_template(self, node_id: str, target_width: float, target_height: float) -> bool:
+        canvas = self.active_canvas()
+        template = self._data_canvas_template()
+        if canvas is None or not canvas.is_data_canvas() or template is None:
+            return False
+        if canvas.data_layout == "table" or self.uses_horizontal_thumbnail_rows():
+            return False
+        if canvas.find_node(node_id) is None:
+            return False
+        visual_fields = [field for field in template.fields if field.has_visual_layout()]
+        if not visual_fields:
+            return False
+
+        content_width = max([field.x + field.width for field in visual_fields] + [1.0])
+        content_height = max([field.y + field.height for field in visual_fields] + [1.0])
+        target_content_width = max(1.0, target_width - 34.0)
+        target_content_height = max(1.0, target_height - HEADER_HEIGHT - 24.0)
+        scale_x = target_content_width / max(1.0, content_width)
+        scale_y = target_content_height / max(1.0, content_height)
+        if abs(scale_x - 1.0) < 0.001 and abs(scale_y - 1.0) < 0.001:
+            return False
+
+        font_scale = max(0.25, min(4.0, min(scale_x, scale_y)))
+        for field in template.fields:
+            if not field.has_visual_layout():
+                continue
+            field.x = max(0.0, field.x * scale_x)
+            field.y = max(0.0, field.y * scale_y)
+            field.width = max(44.0, field.width * scale_x)
+            field.height = max(34.0, field.height * scale_y)
+            field.font_size = max(8, min(48, int(round(field.font_size * font_scale))))
+
+        node_width = max(NODE_MIN_WIDTH, max([field.x + field.width for field in visual_fields] + [NODE_DEFAULT_WIDTH]) + 34.0)
+        node_height = max(NODE_MIN_HEIGHT, HEADER_HEIGHT + max([field.y + field.height for field in visual_fields] + [120.0]) + 24.0)
+        for node in canvas.nodes:
+            apply_template_to_node(node, template, preserve_values=True, force_lock=True)
+            node.width = node_width
+            node.height = node_height
+        layout_data_canvas(canvas)
+        self._sync_data_canvas_items()
+        self.select_node(node_id)
+        return True
+
     def commit_data_canvas_node_reorder(self, node_id: str) -> bool:
         canvas = self.active_canvas()
         if canvas is None or not canvas.is_data_canvas():
@@ -1413,6 +1682,7 @@ class NodeGraphView(QGraphicsView):
                 item = self.node_items.get(node.id)
                 if item is None:
                     continue
+                item.refresh()
                 item.setPos(node.x, node.y)
                 item.update()
             for edge_item in self.edge_items.values():

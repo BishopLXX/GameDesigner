@@ -10,6 +10,8 @@ DATA_CANVAS_GAP_Y = 18.0
 DATA_CANVAS_DEFAULT_CARD_WIDTH = 360.0
 DATA_CANVAS_DEFAULT_CARD_HEIGHT = 220.0
 DATA_CANVAS_GRID_MAX_WIDTH = 1360.0
+DATA_CANVAS_THUMBNAIL_HEADER_HEIGHT = 64.0
+DATA_CANVAS_THUMBNAIL_ROW_HEIGHT = 34.0
 
 
 def apply_template_to_node(
@@ -37,8 +39,6 @@ def apply_template_to_node(
     node.canvas_id = ""
     node.link_path = ""
     node.color = template.color
-    node.icon = template.icon
-    node.icon_from_title = template.icon_from_title
     node.template_id = template.id
     node.fields = cloned_fields
 
@@ -200,9 +200,14 @@ def _planned_positions(canvas: CanvasData, ordered_nodes: list[Node]) -> dict[st
         return positions
     if canvas.data_layout == "horizontal":
         y = DATA_CANVAS_MARGIN_Y
+        if canvas.data_row_style == "thumbnail":
+            y += DATA_CANVAS_THUMBNAIL_HEADER_HEIGHT
         for node in ordered_nodes:
             positions[node.id] = (DATA_CANVAS_MARGIN_X, y)
-            y += _node_height(node) + DATA_CANVAS_GAP_Y
+            if canvas.data_row_style == "thumbnail":
+                y += DATA_CANVAS_THUMBNAIL_ROW_HEIGHT
+            else:
+                y += _node_height(node) + DATA_CANVAS_GAP_Y
         return positions
 
     row_limit = 0
