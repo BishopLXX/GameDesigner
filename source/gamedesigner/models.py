@@ -31,6 +31,8 @@ FIELD_TYPES = [
 ]
 
 NODE_TYPES = ["普通", "画布", "超文本"]
+CANVAS_TYPES = ["normal", "data"]
+DATA_LAYOUT_MODES = ["horizontal", "grid", "table"]
 TEXT_H_ALIGNMENTS = ["left", "center", "right"]
 TEXT_V_ALIGNMENTS = ["top", "center", "bottom"]
 DEFAULT_NODE_COLOR = "#ffffff"
@@ -131,6 +133,8 @@ class Node:
     icon: str = ""
     icon_from_title: bool = False
     title_field_id: str = ""
+    template_id: str = ""
+    template_locked: bool = False
     fields: list[NodeField] = field(default_factory=list)
 
     def normalized_node_type(self) -> str:
@@ -160,6 +164,8 @@ class Node:
             "icon": self.icon,
             "icon_from_title": self.icon_from_title,
             "title_field_id": self.title_field_id,
+            "template_id": self.template_id,
+            "template_locked": self.template_locked,
             "fields": [item.to_dict() for item in self.fields],
         }
 
@@ -190,6 +196,8 @@ class Node:
             icon=str(raw.get("icon") or ""),
             icon_from_title=bool(raw.get("icon_from_title", False)),
             title_field_id=str(raw.get("title_field_id") or ""),
+            template_id=str(raw.get("template_id") or ""),
+            template_locked=bool(raw.get("template_locked", False)),
             fields=[NodeField.from_dict(item) for item in fields if isinstance(item, dict)],
         )
         if node.title_field_id and not any(field.id == node.title_field_id for field in node.fields):
@@ -270,6 +278,10 @@ class Edge:
 class CanvasData:
     id: str = field(default_factory=lambda: new_id("canvas"))
     name: str = "主画布"
+    canvas_type: str = "normal"
+    data_layout: str = "grid"
+    data_grid_rows: int = 0
+    template_id: str = ""
     parent_canvas_id: str = ""
     parent_node_id: str = ""
     nodes: list[Node] = field(default_factory=list)
@@ -280,6 +292,10 @@ class CanvasData:
         return {
             "id": self.id,
             "name": self.name,
+            "canvas_type": self.canvas_type if self.canvas_type in CANVAS_TYPES else "normal",
+            "data_layout": self.data_layout if self.data_layout in DATA_LAYOUT_MODES else "grid",
+            "data_grid_rows": max(0, int(self.data_grid_rows)),
+            "template_id": self.template_id,
             "parent_canvas_id": self.parent_canvas_id,
             "parent_node_id": self.parent_node_id,
             "groups": [group.to_dict() for group in self.groups],
@@ -301,6 +317,10 @@ class CanvasData:
         canvas = cls(
             id=str(raw.get("id") or new_id("canvas")),
             name=str(raw.get("name") or "画布"),
+            canvas_type=_choice_or(raw.get("canvas_type"), CANVAS_TYPES, "normal"),
+            data_layout=_choice_or(raw.get("data_layout"), DATA_LAYOUT_MODES, "grid"),
+            data_grid_rows=max(0, int(_float_or(raw.get("data_grid_rows"), 0.0))),
+            template_id=str(raw.get("template_id") or ""),
             parent_canvas_id=str(raw.get("parent_canvas_id") or ""),
             parent_node_id=str(raw.get("parent_node_id") or ""),
             groups=[BlueprintGroup.from_dict(item) for item in groups_raw if isinstance(item, dict)],
@@ -311,6 +331,9 @@ class CanvasData:
         canvas.remove_broken_groups()
         canvas.normalize_node_order()
         return canvas
+
+    def is_data_canvas(self) -> bool:
+        return self.canvas_type == "data"
 
     def find_node(self, node_id: str) -> Node | None:
         return next((node for node in self.nodes if node.id == node_id), None)
@@ -420,6 +443,7 @@ class NodeTemplate:
             icon=self.icon,
             icon_from_title=self.icon_from_title,
             title_field_id=title_field_id,
+            template_id=self.id,
             fields=fields,
         )
 
@@ -560,6 +584,10 @@ class ProjectData:
     def add_canvas(
         self,
         name: str,
+        canvas_type: str = "normal",
+        data_layout: str = "grid",
+        data_grid_rows: int = 0,
+        template_id: str = "",
         parent_canvas_id: str = "",
         parent_node_id: str = "",
     ) -> CanvasData:
@@ -567,6 +595,10 @@ class ProjectData:
         canvas = CanvasData(
             id=new_id("canvas"),
             name=name.strip() or "新画布",
+            canvas_type=canvas_type if canvas_type in CANVAS_TYPES else "normal",
+            data_layout=data_layout if data_layout in DATA_LAYOUT_MODES else "grid",
+            data_grid_rows=max(0, int(data_grid_rows)),
+            template_id=template_id,
             parent_canvas_id=parent_canvas_id,
             parent_node_id=parent_node_id,
         )

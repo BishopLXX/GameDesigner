@@ -26,6 +26,7 @@ class AppSettings:
     recent_projects: list[str] = field(default_factory=list)
     welcome_layout: dict[str, dict[str, float]] = field(default_factory=dict)
     welcome_recent_layouts: dict[str, dict[str, float]] = field(default_factory=dict)
+    window_layouts: dict[str, dict[str, float]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -36,6 +37,7 @@ class AppSettings:
             "recent_projects": self.recent_projects,
             "welcome_layout": self.welcome_layout,
             "welcome_recent_layouts": self.welcome_recent_layouts,
+            "window_layouts": self.window_layouts,
         }
 
     @classmethod
@@ -51,6 +53,7 @@ class AppSettings:
             recent_projects=[str(item) for item in recent if item],
             welcome_layout=_coerce_layout_map(raw.get("welcome_layout")),
             welcome_recent_layouts=_coerce_layout_map(raw.get("welcome_recent_layouts")),
+            window_layouts=_coerce_layout_map(raw.get("window_layouts")),
         )
 
 

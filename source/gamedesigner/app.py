@@ -21,22 +21,27 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QFileDialog,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QMenu,
     QMessageBox,
+    QSpinBox,
     QSizePolicy,
     QStatusBar,
     QTabBar,
     QTabWidget,
     QToolButton,
     QInputDialog,
+    QStackedLayout,
     QWidget,
     QVBoxLayout,
 )
 
+from .canvas_io import import_canvas_sheet
+from .data_canvas import apply_template_to_node, data_canvas_template, sync_data_canvas, sync_locked_template_nodes
 from .models import BlueprintGroup, CanvasData, Node, NodeField, ProjectData, default_project, default_tech_tree_node, new_id
 from .project_history import ProjectHistory, ProjectSnapshot
 from .qt_canvas import NodeGraphView
@@ -51,6 +56,8 @@ from .storage import (
     save_project,
     save_settings,
 )
+from .ui.data_canvas_table import DataCanvasTableWidget
+from .window_layouts import restore_window_layout, save_window_layout
 
 
 WELCOME_PROJECT_NAME = "开始"
@@ -92,6 +99,9 @@ def _app_icon_path() -> Path | None:
 class ProjectPage(QWidget):
     parentJumpRequested = Signal()
     returnCloseRequested = Signal()
+    resetViewRequested = Signal()
+    dataLayoutRequested = Signal(str)
+    dataGridRowsRequested = Signal(int)
 
     def __init__(
         self,
@@ -125,6 +135,9 @@ class ProjectPage(QWidget):
             allow_node_drag=is_welcome,
             templates=self.project.templates,
         )
+        self.table_view = DataCanvasTableWidget(self)
+        self.table_view.set_canvas(self.project, self.canvas_data)
+        self.table_view.setVisible(self.canvas_data.is_data_canvas() and self.canvas_data.data_layout == "table")
         if is_welcome:
             self.canvas.set_folder_action_node_ids({
                 node_id for node_id, action in self.welcome_actions.items() if action != "new"
@@ -132,7 +145,48 @@ class ProjectPage(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        layout.addWidget(self.canvas)
+        self.function_bar = QWidget(self)
+        self.function_bar.setObjectName("canvasFunctionBar")
+        function_layout = QHBoxLayout(self.function_bar)
+        function_layout.setContentsMargins(10, 8, 10, 8)
+        function_layout.setSpacing(8)
+        self.function_label = QLabel("功能", self.function_bar)
+        self.function_label.setObjectName("canvasFunctionLabel")
+        function_layout.addWidget(self.function_label)
+
+        self.layout_button_group = QButtonGroup(self.function_bar)
+        self.layout_button_group.setExclusive(True)
+        self.horizontal_layout_button = self._function_toggle_button("水平", "水平排序显示", "horizontal")
+        self.grid_layout_button = self._function_toggle_button("网格", "网格卡片显示", "grid")
+        self.table_layout_button = self._function_toggle_button("表格", "表格预览显示", "table")
+        function_layout.addWidget(self.horizontal_layout_button)
+        function_layout.addWidget(self.grid_layout_button)
+        function_layout.addWidget(self.table_layout_button)
+        self.grid_rows_spin = QSpinBox(self.function_bar)
+        self.grid_rows_spin.setObjectName("canvasFunctionSpin")
+        self.grid_rows_spin.setMinimum(0)
+        self.grid_rows_spin.setMaximum(999)
+        self.grid_rows_spin.setSingleStep(1)
+        self.grid_rows_spin.setToolTip("网格每列行数，0 为自动")
+        self.grid_rows_spin.setPrefix("行数 ")
+        self.grid_rows_spin.valueChanged.connect(self._emit_grid_rows_requested)
+        function_layout.addWidget(self.grid_rows_spin)
+        function_layout.addStretch(1)
+        self.reset_view_button = QToolButton(self.function_bar)
+        self.reset_view_button.setObjectName("canvasFunctionButton")
+        self.reset_view_button.setText("重置")
+        self.reset_view_button.setToolTip("重置视图")
+        self.reset_view_button.setAutoRaise(True)
+        self.reset_view_button.clicked.connect(self.resetViewRequested.emit)
+        function_layout.addWidget(self.reset_view_button)
+        layout.addWidget(self.function_bar)
+        self.content = QWidget(self)
+        self.content_layout = QStackedLayout(self.content)
+        self.content_layout.setContentsMargins(0, 0, 0, 0)
+        self.content_layout.setStackingMode(QStackedLayout.StackAll)
+        self.content_layout.addWidget(self.canvas)
+        self.content_layout.addWidget(self.table_view)
+        layout.addWidget(self.content)
         self.nav_overlay = QWidget(self)
         self.nav_overlay.setObjectName("canvasNav")
         nav_layout = QHBoxLayout(self.nav_overlay)
@@ -152,12 +206,36 @@ class ProjectPage(QWidget):
         nav_layout.addWidget(self.return_button)
         self.refresh_canvas_nav()
         self.refresh_active_template()
+        self.refresh_canvas_mode()
+
+    def _function_toggle_button(self, text: str, tooltip: str, layout_value: str) -> QToolButton:
+        button = QToolButton(self.function_bar)
+        button.setObjectName("canvasFunctionToggle")
+        button.setText(text)
+        button.setToolTip(tooltip)
+        button.setCheckable(True)
+        button.setAutoRaise(True)
+        button.clicked.connect(lambda checked=False, value=layout_value: self._request_layout(value, checked))
+        self.layout_button_group.addButton(button)
+        return button
+
+    def _request_layout(self, layout_value: str, checked: bool) -> None:
+        if checked:
+            self.dataLayoutRequested.emit(layout_value)
+
+    def _emit_grid_rows_requested(self, rows: int) -> None:
+        if self.grid_rows_spin.signalsBlocked():
+            return
+        self.dataGridRowsRequested.emit(rows)
 
     def refresh_active_template(self) -> None:
         ids = [template.id for template in self.project.templates]
-        if self.active_template_id not in ids:
+        if self.canvas_data.is_data_canvas() and self.canvas_data.template_id in ids:
+            self.active_template_id = self.canvas_data.template_id
+        elif self.active_template_id not in ids:
             self.active_template_id = ids[0] if ids else None
         self.canvas.set_templates(self.project.templates)
+        self.table_view.set_canvas(self.project, self.canvas_data)
 
     def refresh_canvas_nav(self) -> None:
         show_nav = bool(not self.is_welcome and self.canvas_data.parent_canvas_id)
@@ -165,6 +243,26 @@ class ProjectPage(QWidget):
         if show_nav:
             self.nav_overlay.adjustSize()
             self.nav_overlay.raise_()
+
+    def refresh_canvas_mode(self) -> None:
+        show_table = bool(self.canvas_data.is_data_canvas() and self.canvas_data.data_layout == "table")
+        self.canvas.setVisible(not show_table)
+        self.table_view.setVisible(show_table)
+        self.table_view.set_canvas(self.project, self.canvas_data)
+        self.function_bar.setVisible(not self.is_welcome)
+        is_data_canvas = self.canvas_data.is_data_canvas()
+        self.horizontal_layout_button.setVisible(is_data_canvas)
+        self.grid_layout_button.setVisible(is_data_canvas)
+        self.table_layout_button.setVisible(is_data_canvas)
+        show_grid_rows = bool(is_data_canvas and self.canvas_data.data_layout == "grid")
+        self.grid_rows_spin.setVisible(show_grid_rows)
+        self.grid_rows_spin.blockSignals(True)
+        self.grid_rows_spin.setValue(max(0, int(self.canvas_data.data_grid_rows)))
+        self.grid_rows_spin.blockSignals(False)
+        self.horizontal_layout_button.setChecked(is_data_canvas and self.canvas_data.data_layout == "horizontal")
+        self.grid_layout_button.setChecked(is_data_canvas and self.canvas_data.data_layout == "grid")
+        self.table_layout_button.setChecked(is_data_canvas and self.canvas_data.data_layout == "table")
+        self.nav_overlay.raise_()
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
@@ -314,6 +412,7 @@ class GameDesignerApp(QMainWindow):
             self.setWindowIcon(QIcon(str(self.icon_path)))
         self.resize(1360, 860)
         self.setMinimumSize(1020, 640)
+        restore_window_layout(self, "main_window")
         self.setStyleSheet(stylesheet(self.theme))
 
         self.tabs = QTabWidget()
@@ -370,15 +469,9 @@ class GameDesignerApp(QMainWindow):
         self.import_action.setShortcut(QKeySequence("Ctrl+I"))
         self.import_action.triggered.connect(self._import_gdc)
 
-        self.export_action = QAction("按创建顺序...", self)
+        self.export_action = QAction("导出所有画布 CSV...", self)
         self.export_action.setShortcut(QKeySequence("Ctrl+E"))
         self.export_action.triggered.connect(lambda: self._export_all_canvas_csv("created"))
-
-        self.export_x_action = QAction("按 X 往右排序...", self)
-        self.export_x_action.triggered.connect(lambda: self._export_all_canvas_csv("x"))
-
-        self.export_y_action = QAction("按 Y 往下排序...", self)
-        self.export_y_action.triggered.connect(lambda: self._export_all_canvas_csv("y"))
 
         self.add_node_action = QAction("新增节点", self)
         self.add_node_action.setShortcut(QKeySequence("N"))
@@ -411,6 +504,13 @@ class GameDesignerApp(QMainWindow):
         self.template_action = QAction("节点模板...", self)
         self.template_action.triggered.connect(self._manage_templates)
 
+        self.import_data_sheet_action = QAction("导入画布 CSV/Excel...", self)
+        self.import_data_sheet_action.triggered.connect(self._import_canvas_sheet)
+        self.convert_to_data_canvas_action = QAction("转换为排序画布", self)
+        self.convert_to_data_canvas_action.triggered.connect(lambda: self._convert_current_canvas_type("data"))
+        self.convert_to_normal_canvas_action = QAction("转换为自由画布", self)
+        self.convert_to_normal_canvas_action.triggered.connect(lambda: self._convert_current_canvas_type("normal"))
+
         self.reset_view_action = QAction("重置视图", self)
         self.reset_view_action.setShortcut(QKeySequence("Ctrl+0"))
         self.reset_view_action.triggered.connect(self._reset_view)
@@ -434,10 +534,7 @@ class GameDesignerApp(QMainWindow):
         self.file_menu.addAction(self.project_settings_action)
         self.file_menu.addSeparator()
         self.file_menu.addAction(self.import_action)
-        self.export_menu = self.file_menu.addMenu("导出所有画布 CSV")
-        self.export_menu.addAction(self.export_action)
-        self.export_menu.addAction(self.export_x_action)
-        self.export_menu.addAction(self.export_y_action)
+        self.file_menu.addAction(self.export_action)
         self.file_menu.addSeparator()
         self.file_menu.addAction(self.exit_action)
 
@@ -451,6 +548,10 @@ class GameDesignerApp(QMainWindow):
         self.edit_menu.addAction(self.add_node_action)
         self.edit_menu.addAction(self.edit_action)
         self.edit_menu.addAction(self.delete_action)
+        self.edit_menu.addSeparator()
+        self.edit_menu.addAction(self.import_data_sheet_action)
+        self.edit_menu.addAction(self.convert_to_data_canvas_action)
+        self.edit_menu.addAction(self.convert_to_normal_canvas_action)
         self.edit_menu.addSeparator()
         self.edit_menu.addAction(self.template_action)
 
@@ -526,6 +627,8 @@ class GameDesignerApp(QMainWindow):
         if not is_welcome:
             self._remove_welcome_pages()
         project.ensure_canvas_structure()
+        if not is_welcome:
+            self._sync_project_templates(project)
         active_canvas = canvas_data or project.root_canvas()
         history = self._project_history(project)
         if history is None:
@@ -569,13 +672,22 @@ class GameDesignerApp(QMainWindow):
         canvas.edgeCreated.connect(self._create_edge)
         canvas.createNodeRequested.connect(self._add_node_at)
         canvas.createCanvasNodeRequested.connect(self._add_canvas_node_at)
+        canvas.createDataCanvasRequested.connect(self._add_data_canvas_node_at)
         canvas.createLinkNodeRequested.connect(self._add_link_node_at)
         canvas.createGroupRequested.connect(self._add_blueprint_group_at)
         canvas.createTemplateNodeRequested.connect(self._add_node_from_template_at)
+        canvas.dataCanvasLayoutRequested.connect(self._set_data_canvas_layout)
+        canvas.dataCanvasTemplateRequested.connect(self._set_data_canvas_template)
+        canvas.dataCanvasGridRowsRequested.connect(self._set_data_canvas_grid_rows)
+        canvas.dataCanvasImportRequested.connect(self._import_canvas_sheet)
         canvas.templateManagerRequested.connect(self._manage_templates)
         canvas.openProjectRequested.connect(self._open_project)
+        page.table_view.projectChanged.connect(lambda page=page: self._mark_dirty(page))
         page.parentJumpRequested.connect(lambda page=page: self._jump_to_parent_canvas(page))
         page.returnCloseRequested.connect(lambda page=page: self._return_to_previous_canvas(page))
+        page.resetViewRequested.connect(lambda page=page: page.canvas.reset_view())
+        page.dataLayoutRequested.connect(self._set_data_canvas_layout)
+        page.dataGridRowsRequested.connect(self._set_data_canvas_grid_rows)
 
     def _show_welcome_page(self) -> None:
         for index in range(self.tabs.count()):
@@ -811,6 +923,25 @@ class GameDesignerApp(QMainWindow):
                 pages.append(page)
         return pages
 
+    def _sync_project_templates(self, project: ProjectData) -> bool:
+        return sync_locked_template_nodes(project)
+
+    def _sync_canvas_state(self, page: ProjectPage) -> bool:
+        if not page.canvas_data.is_data_canvas():
+            return False
+        return sync_data_canvas(page.project, page.canvas_data)
+
+    def _refresh_project_views(self, project: ProjectData) -> None:
+        for project_page in self._project_pages(project):
+            project_page.refresh_active_template()
+            project_page.refresh_canvas_nav()
+            project_page.refresh_canvas_mode()
+            project_page.canvas.set_templates(project.templates)
+            project_page.canvas.rebuild()
+            project_page.canvas.viewport().update()
+            self._update_tab_title(project_page)
+        self._update_status()
+
     def _project_history(self, project: ProjectData) -> ProjectHistory | None:
         return self._project_histories.get(id(project))
 
@@ -849,6 +980,7 @@ class GameDesignerApp(QMainWindow):
             project.root_canvas_id = restored.root_canvas_id
             project.canvases = restored.canvases
             project.ensure_canvas_structure()
+            self._sync_project_templates(project)
 
             target_canvas_id = snapshot.canvas_id or project.root_canvas_id
             target_page: ProjectPage | None = None
@@ -858,6 +990,7 @@ class GameDesignerApp(QMainWindow):
                 project_page.canvas_id = target_canvas.id
                 project_page.refresh_active_template()
                 project_page.refresh_canvas_nav()
+                project_page.refresh_canvas_mode()
                 project_page.canvas.set_templates(project.templates)
                 project_page.canvas.set_project(target_canvas)
                 project_page.canvas.clear_selection()
@@ -956,6 +1089,12 @@ class GameDesignerApp(QMainWindow):
 
     def _update_status(self) -> None:
         self.status.clearMessage()
+        page = self._current_page()
+        editable_canvas = bool(page and not page.is_welcome)
+        is_data_canvas = bool(editable_canvas and page.canvas_data.is_data_canvas())
+        self.import_data_sheet_action.setEnabled(editable_canvas)
+        self.convert_to_data_canvas_action.setEnabled(bool(editable_canvas and not is_data_canvas))
+        self.convert_to_normal_canvas_action.setEnabled(is_data_canvas)
 
     def _on_selection_changed(self, page: ProjectPage, node_id: str | None, edge_id: str | None) -> None:
         page.selected_node_id = node_id
@@ -1059,6 +1198,7 @@ class GameDesignerApp(QMainWindow):
             project = load_project(project_path)
             self._ensure_project_dirs(project, project_path)
             self._sync_settings_from_project(project)
+            self._sync_project_templates(project)
             self._remember_project(project_path)
         except Exception as exc:  # noqa: BLE001 - selected by user.
             QMessageBox.critical(self, "打开失败", f"无法重新加载项目：\n{exc}")
@@ -1142,7 +1282,7 @@ class GameDesignerApp(QMainWindow):
             )
             node.canvas_id = canvas.id
             if not node.icon:
-                node.icon = "画"
+                node.icon = "数" if canvas.is_data_canvas() else "画"
             if mark_dirty:
                 self._mark_dirty(page)
             return canvas
@@ -1150,6 +1290,8 @@ class GameDesignerApp(QMainWindow):
         if canvas.id != page.project.root_canvas_id:
             canvas.parent_canvas_id = canvas.parent_canvas_id or page.canvas_id
             canvas.parent_node_id = canvas.parent_node_id or node.id
+        if canvas.is_data_canvas() and not node.icon:
+            node.icon = "数"
         return canvas
 
     def _ensure_project_path_for_files(self, page: ProjectPage) -> Path:
@@ -1322,6 +1464,7 @@ class GameDesignerApp(QMainWindow):
             self._ensure_project_dirs(page.project, page.path)
             Path(page.project.source_dir).mkdir(parents=True, exist_ok=True)
             Path(page.project.output_dir).mkdir(parents=True, exist_ok=True)
+            self._sync_project_templates(page.project)
             self._ensure_all_link_node_files(page.project, page.path)
             save_project(page.project, page.path)
             if page.project.copy_link_docs_to_source:
@@ -1388,21 +1531,35 @@ class GameDesignerApp(QMainWindow):
 
     def _export_all_canvas_csv(self, sort_mode: str = "created") -> None:
         from .csv_io import export_all_canvas_csv
+        from .qt_dialogs import ExportCanvasCsvDialog
 
         page = self._current_page()
         if not page or page.is_welcome:
             return
         self._ensure_project_dirs(page.project, page.path)
-        default = str(Path(page.project.output_dir or self.settings.export_dir))
-        folder = QFileDialog.getExistingDirectory(
-            self,
-            "导出所有画布 CSV",
-            default,
+        default_folder = (
+            page.project.output_dir
+            or self.settings.export_dir
+            or self.settings.workspace_dir
+            or str(Path.home())
         )
-        if not folder:
+        dialog = ExportCanvasCsvDialog(
+            self,
+            page.project,
+            str(Path(default_folder)),
+            default_sort_mode=sort_mode,
+        )
+        if dialog.exec() != ExportCanvasCsvDialog.Accepted or not dialog.result_data:
             return
+        folder = str(dialog.result_data["folder"])
+        canvas_specs = list(dialog.result_data["canvas_specs"])
         try:
-            export_paths = export_all_canvas_csv(page.project, Path(folder), sort_mode)
+            export_paths = export_all_canvas_csv(
+                page.project,
+                Path(folder),
+                sort_mode=sort_mode,
+                canvas_specs=canvas_specs,
+            )
         except Exception as exc:  # noqa: BLE001 - surface IO errors.
             QMessageBox.critical(self, "导出失败", f"无法导出所有画布 CSV：\n{exc}")
             return
@@ -1432,12 +1589,25 @@ class GameDesignerApp(QMainWindow):
         pos = page.canvas.center_world()
         self._add_node_at(pos.x(), pos.y())
 
+    def _data_canvas_template_for_page(self, page: ProjectPage):
+        if not page.canvas_data.is_data_canvas():
+            return None
+        template = data_canvas_template(page.project, page.canvas_data)
+        if template is not None:
+            page.canvas_data.template_id = template.id
+            page.active_template_id = template.id
+        return template
+
     def _add_node_at(self, x: float, y: float) -> None:
         page = self._current_page()
         if not page:
             return
         if page.is_welcome:
             self._new_project()
+            return
+        if page.canvas_data.is_data_canvas():
+            template = self._data_canvas_template_for_page(page)
+            self._add_node_from_template_at(x, y, template.id if template is not None else None)
             return
         node = default_tech_tree_node(x - 255, y - 165)
         node.group_id = page.canvas.group_id_at_scene_pos(QPointF(x, y))
@@ -1452,6 +1622,8 @@ class GameDesignerApp(QMainWindow):
             return
         if page.is_welcome:
             self._new_project()
+            return
+        if page.canvas_data.is_data_canvas():
             return
         node = Node(
             title="新画布",
@@ -1476,12 +1648,52 @@ class GameDesignerApp(QMainWindow):
         self._mark_dirty(page)
         self._open_canvas_page(page.project, page.path, canvas.id, source_canvas_id=page.canvas_id)
 
+    def _add_data_canvas_node_at(self, x: float, y: float) -> None:
+        page = self._current_page()
+        if not page:
+            return
+        if page.is_welcome:
+            self._new_project()
+            return
+        template = page.project.find_template(page.active_template_id or "") or (
+            page.project.templates[0] if page.project.templates else None
+        )
+        template_id = template.id if template is not None else ""
+        node = Node(
+            title="数据画布",
+            node_type="画布",
+            icon="数",
+            x=x - 155,
+            y=y - 72,
+            fields=[
+                NodeField("入口", "画布", "双击打开数据画布"),
+            ],
+        )
+        canvas = page.project.add_canvas(
+            node.title,
+            canvas_type="data",
+            data_layout="grid",
+            template_id=template_id,
+            parent_canvas_id=page.canvas_id,
+            parent_node_id=node.id,
+        )
+        node.canvas_id = canvas.id
+        node.group_id = page.canvas.group_id_at_scene_pos(QPointF(x, y))
+        page.canvas_data.add_node(node)
+        self._sync_project_templates(page.project)
+        self._refresh_project_views(page.project)
+        page.canvas.select_node(node.id)
+        self._mark_dirty(page)
+        self._open_canvas_page(page.project, page.path, canvas.id, source_canvas_id=page.canvas_id)
+
     def _add_link_node_at(self, x: float, y: float, file_format: str = "md") -> None:
         page = self._current_page()
         if not page:
             return
         if page.is_welcome:
             self._new_project()
+            return
+        if page.canvas_data.is_data_canvas():
             return
         title = "新文档"
         node = Node(
@@ -1510,6 +1722,8 @@ class GameDesignerApp(QMainWindow):
         if page.is_welcome:
             self._new_project()
             return
+        if page.canvas_data.is_data_canvas():
+            return
         group = BlueprintGroup(
             title="蓝图组",
             x=x,
@@ -1529,6 +1743,9 @@ class GameDesignerApp(QMainWindow):
         if page.is_welcome:
             self._new_project()
             return
+        if page.canvas_data.is_data_canvas():
+            forced_template = self._data_canvas_template_for_page(page)
+            template_id = forced_template.id if forced_template is not None else template_id
         template_id = template_id or page.active_template_id
         if not template_id and page.project.templates:
             template_id = page.project.templates[0].id
@@ -1540,10 +1757,114 @@ class GameDesignerApp(QMainWindow):
             return
         page.active_template_id = template.id
         node = template.create_node(x - 155, y - 72)
-        node.group_id = page.canvas.group_id_at_scene_pos(QPointF(x, y))
+        if page.canvas_data.is_data_canvas():
+            node.group_id = ""
+            page.canvas_data.template_id = template.id
+        else:
+            node.group_id = page.canvas.group_id_at_scene_pos(QPointF(x, y))
         page.canvas_data.add_node(node)
+        if page.canvas_data.is_data_canvas():
+            self._sync_canvas_state(page)
         page.canvas.rebuild()
         page.canvas.select_node(node.id)
+        self._mark_dirty(page)
+
+    def _set_data_canvas_layout(self, layout: str) -> None:
+        page = self._current_page()
+        if not page or page.is_welcome or not page.canvas_data.is_data_canvas():
+            return
+        if layout not in {"horizontal", "grid", "table"} or page.canvas_data.data_layout == layout:
+            return
+        page.canvas_data.data_layout = layout
+        self._sync_canvas_state(page)
+        page.refresh_canvas_mode()
+        page.canvas.rebuild()
+        self._mark_dirty(page)
+
+    def _set_data_canvas_grid_rows(self, rows: int) -> None:
+        page = self._current_page()
+        if not page or page.is_welcome or not page.canvas_data.is_data_canvas():
+            return
+        normalized = max(0, int(rows))
+        if page.canvas_data.data_grid_rows == normalized:
+            return
+        page.canvas_data.data_grid_rows = normalized
+        self._sync_canvas_state(page)
+        page.refresh_canvas_mode()
+        page.canvas.rebuild()
+        self._mark_dirty(page)
+
+    def _set_data_canvas_template(self, template_id: str) -> None:
+        page = self._current_page()
+        if not page or page.is_welcome or not page.canvas_data.is_data_canvas():
+            return
+        template = page.project.find_template(template_id)
+        if template is None:
+            return
+        page.canvas_data.template_id = template.id
+        page.active_template_id = template.id
+        self._sync_canvas_state(page)
+        self._refresh_project_views(page.project)
+        self._mark_dirty(page)
+
+    def _import_canvas_sheet(self) -> None:
+        page = self._current_page()
+        if not page or page.is_welcome:
+            return
+        start = page.project.source_dir or self.settings.workspace_dir or str(Path.home())
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "导入画布数据",
+            start,
+            "表格文件 (*.csv *.xlsx *.xlsm)",
+        )
+        if not path:
+            return
+        try:
+            template = import_canvas_sheet(page.project, page.canvas_data, path)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "导入失败", f"无法导入表格：\n{exc}")
+            return
+        page.active_template_id = template.id
+        self._refresh_project_views(page.project)
+        self._mark_dirty(page)
+
+    def _convert_current_canvas_type(self, target_type: str) -> None:
+        page = self._current_page()
+        if not page or page.is_welcome:
+            return
+        canvas = page.canvas_data
+        target = "data" if target_type == "data" else "normal"
+        if canvas.canvas_type == target:
+            return
+
+        if target == "data":
+            answer = QMessageBox.question(
+                self,
+                "转换为排序画布",
+                "转换后节点将按排序布局管理，连线功能会失效，节点不能再自由摆放。继续吗？",
+            )
+            if answer != QMessageBox.Yes:
+                return
+            canvas.canvas_type = "data"
+            if canvas.data_layout not in {"horizontal", "grid", "table"}:
+                canvas.data_layout = "grid"
+            if page.active_template_id:
+                canvas.template_id = page.active_template_id
+            self._sync_canvas_state(page)
+        else:
+            answer = QMessageBox.question(
+                self,
+                "转换为自由画布",
+                "转换后会恢复自由摆放能力，但之前排序画布的自动排序和表格模式将不再生效。继续吗？",
+            )
+            if answer != QMessageBox.Yes:
+                return
+            canvas.canvas_type = "normal"
+            if canvas.data_layout == "table":
+                canvas.data_layout = "grid"
+
+        self._refresh_project_views(page.project)
         self._mark_dirty(page)
 
     def _copy_selected_nodes(self) -> None:
@@ -1568,7 +1889,7 @@ class GameDesignerApp(QMainWindow):
         offset = 40.0 * (self._paste_serial + 1)
         new_nodes: list[Node] = []
         for raw in self._copied_nodes:
-            node = self._clone_node_for_paste(raw, offset)
+            node = self._clone_node_for_paste(raw, offset, preserve_field_ids=page.canvas_data.is_data_canvas())
             if node.node_type == "画布":
                 node.canvas_id = ""
                 self._ensure_canvas_node_link(page, node, mark_dirty=False)
@@ -1584,20 +1905,23 @@ class GameDesignerApp(QMainWindow):
             new_nodes.append(node)
         for node in new_nodes:
             page.canvas_data.add_node(node)
+        if page.canvas_data.is_data_canvas():
+            self._sync_canvas_state(page)
         self._paste_serial += 1
         page.canvas.rebuild()
         page.canvas.select_nodes({node.id for node in new_nodes})
         page.canvas.refresh_group_membership()
         self._mark_dirty(page)
 
-    def _clone_node_for_paste(self, raw: dict[str, Any], offset: float) -> Node:
+    def _clone_node_for_paste(self, raw: dict[str, Any], offset: float, preserve_field_ids: bool = False) -> Node:
         node = Node.from_dict(copy.deepcopy(raw))
         node.id = new_id("node")
-        remapped_field_ids: dict[str, str] = {}
-        for field in node.fields:
-            remapped_field_ids[field.id] = new_id("field")
-            field.id = remapped_field_ids[field.id]
-        node.title_field_id = remapped_field_ids.get(node.title_field_id, "")
+        if not preserve_field_ids and not node.template_id:
+            remapped_field_ids: dict[str, str] = {}
+            for field in node.fields:
+                remapped_field_ids[field.id] = new_id("field")
+                field.id = remapped_field_ids[field.id]
+            node.title_field_id = remapped_field_ids.get(node.title_field_id, "")
         node.order = 0
         node.x += offset
         node.y += offset
@@ -1652,10 +1976,41 @@ class GameDesignerApp(QMainWindow):
         node = page.canvas_data.find_node(node_id)
         if not node:
             return
-        dialog = NodeEditorDialog(self, node, self.theme, page.project.templates, page.path)
+        dialog = NodeEditorDialog(
+            self,
+            node,
+            self.theme,
+            page.project.templates,
+            page.path,
+            force_template_lock=page.canvas_data.is_data_canvas(),
+        )
         if dialog.exec() != NodeEditorDialog.Accepted or not dialog.result:
             return
         result = dialog.result
+        if page.canvas_data.is_data_canvas():
+            template = page.project.find_template(page.canvas_data.template_id)
+            if template is not None:
+                template.name = result.title
+                template.color = result.color
+                template.icon = result.icon
+                template.icon_from_title = result.icon_from_title
+                template.title_field_id = result.title_field_id
+                template.fields = [NodeField.from_dict(field.to_dict()) for field in result.fields]
+                page.active_template_id = template.id
+                page.canvas_data.template_id = template.id
+            node.color = result.color
+            node.icon = result.icon
+            node.fields = [NodeField.from_dict(field.to_dict()) for field in result.fields]
+            node.icon_from_title = result.icon_from_title
+            node.title_field_id = result.title_field_id
+            if template is not None:
+                apply_template_to_node(node, template, preserve_values=True, force_lock=True)
+                self._sync_canvas_state(page)
+            self._refresh_project_views(page.project)
+            page.canvas.rebuild()
+            page.canvas.select_node(node.id)
+            self._mark_dirty(page)
+            return
         node.title = result.title
         node.color = result.color
         node.icon = result.icon
@@ -1668,6 +2023,8 @@ class GameDesignerApp(QMainWindow):
         node.canvas_id = result.canvas_id
         node.link_path = result.link_path
         node.link_format = result.link_format
+        node.template_id = result.template_id
+        node.template_locked = result.template_locked
         if node.node_type == "画布":
             self._ensure_canvas_node_link(page, node)
         elif node.node_type == "超文本":
@@ -1679,8 +2036,8 @@ class GameDesignerApp(QMainWindow):
                 return
         if dialog.templates_changed and dialog.templates_result is not None:
             page.project.templates = dialog.templates_result
-            for project_page in self._project_pages(page.project):
-                project_page.refresh_active_template()
+        self._sync_project_templates(page.project)
+        self._refresh_project_views(page.project)
         page.canvas.rebuild()
         page.canvas.select_node(node.id)
         self._mark_dirty(page)
@@ -1833,6 +2190,7 @@ class GameDesignerApp(QMainWindow):
         if node.node_type == "画布" and node.canvas_id:
             self._delete_canvas_branch(page, node.canvas_id)
         page.canvas_data.delete_node(node.id)
+        self._sync_canvas_state(page)
         page.canvas.rebuild()
         page.canvas.clear_selection()
         self._mark_dirty(page)
@@ -1851,6 +2209,7 @@ class GameDesignerApp(QMainWindow):
             if node.node_type == "画布" and node.canvas_id:
                 self._delete_canvas_branch(page, node.canvas_id)
         page.canvas_data.delete_nodes({node.id for node in existing})
+        self._sync_canvas_state(page)
         page.canvas.rebuild()
         page.canvas.clear_selection()
         self._mark_dirty(page)
@@ -1903,9 +2262,8 @@ class GameDesignerApp(QMainWindow):
             if not template.id:
                 template.id = new_id("template")
         page.project.templates = dialog.result
-        for project_page in self._project_pages(page.project):
-            project_page.refresh_active_template()
-            project_page.canvas.viewport().update()
+        self._sync_project_templates(page.project)
+        self._refresh_project_views(page.project)
         self._mark_dirty(page)
 
     def _reset_view(self) -> None:
@@ -1989,6 +2347,7 @@ class GameDesignerApp(QMainWindow):
                 self._closing_app = False
                 event.ignore()
                 return
+        save_window_layout(self, "main_window", persist=False)
         save_settings(self.settings)
         event.accept()
 

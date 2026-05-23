@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
+    QScrollArea,
     QSplitter,
     QToolButton,
     QVBoxLayout,
@@ -42,9 +43,23 @@ from PySide6.QtWidgets import (
     QColorDialog,
 )
 
-from .models import DEFAULT_NODE_COLOR, FIELD_EXPORT_PROPS, FIELD_TYPES, NODE_TYPES, Node, NodeField, NodeTemplate, new_id
+from .csv_io import CanvasCsvExportSpec, CSV_SORT_MODE_LABELS, DATA_CANVAS_SORT_LABEL
+from .data_canvas import apply_template_to_node
+from .models import (
+    DEFAULT_NODE_COLOR,
+    FIELD_EXPORT_PROPS,
+    FIELD_TYPES,
+    NODE_TYPES,
+    CanvasData,
+    Node,
+    NodeField,
+    NodeTemplate,
+    ProjectData,
+    new_id,
+)
 from .project_files.linked_documents import import_link_document, read_link_document
 from .qt_theme import palette
+from .window_layouts import restore_window_layout, save_window_layout
 
 
 HEADER_HEIGHT = 52.0
@@ -120,6 +135,7 @@ class ProjectSettingsDialog(QDialog):
         layout.addLayout(form)
         layout.addWidget(buttons)
         self.resize(620, 210)
+        restore_window_layout(self, "project_settings_dialog")
 
     def _path_row(self, edit: QLineEdit, button: QPushButton) -> QWidget:
         row = QWidget()
@@ -167,6 +183,196 @@ class ProjectSettingsDialog(QDialog):
             "copy_link_docs_to_source": self.link_copy_check.isChecked(),
         }
         self.accept()
+
+    def done(self, result: int) -> None:  # type: ignore[override]
+        save_window_layout(self, "project_settings_dialog")
+        super().done(result)
+
+
+class ExportCanvasCsvDialog(QDialog):
+    def __init__(
+        self,
+        parent: QWidget | None,
+        project: ProjectData,
+        default_folder: str,
+        default_sort_mode: str = "created",
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("导出所有画布 CSV")
+        self.setModal(True)
+        self.project = project
+        self.result_data: dict[str, object] | None = None
+        self._default_sort_mode = (
+            default_sort_mode
+            if default_sort_mode in CSV_SORT_MODE_LABELS
+            else "created"
+        )
+        self._canvas_rows: dict[str, tuple[QCheckBox, QComboBox, QLineEdit]] = {}
+
+        self.folder_edit = QLineEdit(default_folder)
+        browse_button = QPushButton("浏览")
+        browse_button.clicked.connect(self._pick_folder)
+
+        folder_form = QFormLayout()
+        folder_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        folder_form.addRow("导出目录", self._path_row(self.folder_edit, browse_button))
+
+        select_all_button = QPushButton("全选")
+        select_all_button.clicked.connect(lambda: self._set_all_enabled(True))
+        clear_all_button = QPushButton("全不选")
+        clear_all_button.clicked.connect(lambda: self._set_all_enabled(False))
+        self.count_label = QLabel()
+        controls = QHBoxLayout()
+        controls.setContentsMargins(0, 0, 0, 0)
+        controls.addWidget(select_all_button)
+        controls.addWidget(clear_all_button)
+        controls.addWidget(self.count_label)
+        controls.addStretch(1)
+
+        list_host = QWidget()
+        self.canvas_list_layout = QVBoxLayout(list_host)
+        self.canvas_list_layout.setContentsMargins(0, 0, 0, 0)
+        self.canvas_list_layout.setSpacing(10)
+        for canvas in self.project.canvases:
+            self._add_canvas_row(canvas)
+        self.canvas_list_layout.addStretch(1)
+
+        list_scroll = QScrollArea()
+        list_scroll.setWidgetResizable(True)
+        list_scroll.setWidget(list_host)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("导出")
+        buttons.button(QDialogButtonBox.Cancel).setText("取消")
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 16)
+        layout.setSpacing(14)
+        layout.addLayout(folder_form)
+        layout.addLayout(controls)
+        layout.addWidget(list_scroll, 1)
+        layout.addWidget(buttons)
+
+        self.resize(720, 440)
+        restore_window_layout(self, "export_canvas_csv_dialog")
+        self._refresh_selected_count()
+
+    def _path_row(self, edit: QLineEdit, button: QPushButton) -> QWidget:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        layout.addWidget(edit, 1)
+        layout.addWidget(button)
+        return row
+
+    def _add_canvas_row(self, canvas: CanvasData) -> None:
+        row = QWidget()
+        row.setStyleSheet("QWidget { background: transparent; }")
+        layout = QVBoxLayout(row)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(8)
+
+        checkbox = QCheckBox(self._canvas_label(canvas))
+        checkbox.setChecked(True)
+        checkbox.toggled.connect(lambda _checked=False: self._refresh_selected_count())
+        checkbox.setStyleSheet("QCheckBox { font-weight: 600; }")
+
+        combo = QComboBox()
+        combo.setMinimumWidth(170)
+        if canvas.is_data_canvas():
+            combo.addItem(DATA_CANVAS_SORT_LABEL, "created")
+            combo.setEnabled(False)
+        else:
+            for mode, label in CSV_SORT_MODE_LABELS.items():
+                combo.addItem(label, mode)
+            combo.setCurrentIndex(max(0, combo.findData(self._default_sort_mode)))
+
+        header = QWidget()
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(12, 10, 12, 0)
+        header_layout.setSpacing(12)
+        header_layout.addWidget(checkbox, 1)
+        header_layout.addWidget(QLabel("排序"), 0)
+        header_layout.addWidget(combo, 0)
+
+        folder_edit = QLineEdit()
+        folder_edit.setPlaceholderText("单独导出目录，留空则使用上方默认目录")
+        folder_button = QPushButton("浏览")
+        folder_button.clicked.connect(lambda _checked=False, edit=folder_edit: self._pick_canvas_folder(edit))
+        folder_row = self._path_row(folder_edit, folder_button)
+        folder_row_host = QWidget()
+        folder_row_layout = QFormLayout(folder_row_host)
+        folder_row_layout.setContentsMargins(12, 0, 12, 10)
+        folder_row_layout.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        folder_row_layout.addRow("单独目录", folder_row)
+
+        layout.addWidget(header)
+        layout.addWidget(folder_row_host)
+        self.canvas_list_layout.addWidget(row)
+        self._canvas_rows[canvas.id] = (checkbox, combo, folder_edit)
+
+    def _canvas_label(self, canvas: CanvasData) -> str:
+        name = canvas.name.strip() or "未命名画布"
+        suffix = "数据画布" if canvas.is_data_canvas() else "自由画布"
+        return f"{name}（{suffix}）"
+
+    def _pick_folder(self) -> None:
+        start = self.folder_edit.text().strip() or str(Path.home())
+        folder = QFileDialog.getExistingDirectory(self, "选择导出目录", start)
+        if folder:
+            self.folder_edit.setText(folder)
+
+    def _pick_canvas_folder(self, edit: QLineEdit) -> None:
+        start = edit.text().strip() or self.folder_edit.text().strip() or str(Path.home())
+        folder = QFileDialog.getExistingDirectory(self, "选择画布导出目录", start)
+        if folder:
+            edit.setText(folder)
+
+    def _set_all_enabled(self, enabled: bool) -> None:
+        for checkbox, _combo, _folder_edit in self._canvas_rows.values():
+            checkbox.setChecked(enabled)
+        self._refresh_selected_count()
+
+    def _refresh_selected_count(self) -> None:
+        total = len(self._canvas_rows)
+        selected = sum(1 for checkbox, _combo, _folder_edit in self._canvas_rows.values() if checkbox.isChecked())
+        self.count_label.setText(f"已选 {selected} / {total}")
+
+    def _accept(self) -> None:
+        folder = self.folder_edit.text().strip()
+        if not folder:
+            QMessageBox.warning(self, "导出目录不能为空", "请选择导出目录。")
+            return
+
+        specs: list[CanvasCsvExportSpec] = []
+        for canvas in self.project.canvases:
+            checkbox, combo, folder_edit = self._canvas_rows[canvas.id]
+            mode = combo.currentData()
+            specs.append(
+                CanvasCsvExportSpec(
+                    canvas_id=canvas.id,
+                    enabled=checkbox.isChecked(),
+                    sort_mode=str(mode or "created"),
+                    target_folder=folder_edit.text().strip(),
+                )
+            )
+
+        if not any(spec.enabled for spec in specs):
+            QMessageBox.warning(self, "没有可导出的画布", "请至少勾选一个画布。")
+            return
+
+        self.result_data = {
+            "folder": folder,
+            "canvas_specs": specs,
+        }
+        self.accept()
+
+    def done(self, result: int) -> None:  # type: ignore[override]
+        save_window_layout(self, "export_canvas_csv_dialog")
+        super().done(result)
 
 
 def _display_field_text(field: NodeField, project_path: str | Path | None = None) -> str:
@@ -619,6 +825,7 @@ class NodeEditorDialog(QDialog):
         theme: str = "dark",
         templates: list[NodeTemplate] | None = None,
         project_path: str | Path | None = None,
+        force_template_lock: bool = False,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("编辑节点")
@@ -638,8 +845,14 @@ class NodeEditorDialog(QDialog):
         self.fields = [copy.deepcopy(field) for field in node.fields]
         self.title_field_id = node.title_field_id if any(field.id == node.title_field_id for field in self.fields) else ""
         self.templates = [copy.deepcopy(template) for template in templates] if templates is not None else None
+        template_ids = {template.id for template in self.templates} if self.templates is not None else set()
+        self._template_id = node.template_id if node.template_id in template_ids or not template_ids else ""
+        self._force_template_lock = force_template_lock
         self.templates_result: list[NodeTemplate] | None = None
         self.templates_changed = False
+        self.import_template_button: QToolButton | None = None
+        self.import_template_menu: QMenu | None = None
+        self.save_template_button: QToolButton | None = None
         self._ensure_visual_layout()
         self._updating = False
 
@@ -647,6 +860,9 @@ class NodeEditorDialog(QDialog):
         self.node_type = QComboBox()
         self.node_type.addItems(NODE_TYPES)
         self.node_type.setCurrentText("超文本" if node.node_type == "超链接" else (node.node_type if node.node_type in NODE_TYPES else "普通"))
+        if self._force_template_lock:
+            self.node_type.setCurrentText("普通")
+            self.node_type.setEnabled(False)
         self.icon_edit = QLineEdit(node.icon)
         self.color_edit = QLineEdit(node.color or DEFAULT_NODE_COLOR)
         self.icon_from_title_button = QToolButton()
@@ -660,6 +876,12 @@ class NodeEditorDialog(QDialog):
         self.title_from_content_button.setText("名称")
         self.title_from_content_button.setCheckable(True)
         self.title_from_content_button.setToolTip("节点名称自动使用当前卡片内容")
+        self.template_lock_button = QToolButton()
+        self.template_lock_button.setObjectName("bindingToolButton")
+        self.template_lock_button.setText("钉")
+        self.template_lock_button.setCheckable(True)
+        self.template_lock_button.setChecked(bool(node.template_locked or self._force_template_lock))
+        self.template_lock_button.setFixedSize(34, 30)
 
         self.field_name = QLineEdit()
         self.field_type = QComboBox()
@@ -711,7 +933,9 @@ class NodeEditorDialog(QDialog):
         layout.addWidget(splitter, 1)
         layout.addWidget(buttons)
         self.resize(1160, 760)
+        restore_window_layout(self, "node_editor_dialog")
         self._connect_changes()
+        self._update_template_lock_controls()
         self._load_selected_props(self.canvas.selected_index if self.canvas.selected_index is not None else -1)
 
     def _side_panel(self) -> QWidget:
@@ -781,10 +1005,12 @@ class NodeEditorDialog(QDialog):
         save_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
         save_button.clicked.connect(self._save_current_template)
 
+        layout.addWidget(self.template_lock_button)
         layout.addWidget(import_button)
         layout.addWidget(save_button)
         self.import_template_button = import_button
         self.import_template_menu = import_menu
+        self.save_template_button = save_button
         return row
 
     def _populate_template_import_menu(self, menu: QMenu) -> None:
@@ -797,6 +1023,143 @@ class NodeEditorDialog(QDialog):
             action = menu.addAction(template.name)
             action.setData(template.id)
             action.triggered.connect(lambda _checked=False, template_id=template.id: self._import_template(template_id))
+
+    def _update_template_lock_controls(self) -> None:
+        if self.templates is None:
+            return
+        has_template = self._find_template(self._template_id) is not None
+        has_templates = bool(self.templates)
+        can_lock = self._force_template_lock or self.node_type.currentText() == "普通"
+        self.template_lock_button.blockSignals(True)
+        if self._force_template_lock:
+            self.template_lock_button.setChecked(True)
+            self.template_lock_button.setEnabled(False)
+            self.template_lock_button.setToolTip("排序画布节点始终跟随当前画布模板")
+        else:
+            self.template_lock_button.setEnabled(can_lock and has_templates)
+            if not can_lock:
+                self.template_lock_button.setChecked(False)
+                self.template_lock_button.setToolTip("只有普通节点支持模板锁定")
+            elif not has_templates:
+                self.template_lock_button.setChecked(False)
+                self.template_lock_button.setToolTip("先保存一个模板，再选择锁定")
+            elif self.template_lock_button.isChecked() and has_template:
+                self.template_lock_button.setToolTip("已锁定到模板，取消后恢复独立编辑")
+            else:
+                self.template_lock_button.setToolTip("点击后选择模板并锁定")
+        self.template_lock_button.blockSignals(False)
+        bound_template = self._uses_bound_template()
+        if self.import_template_button is not None:
+            self.import_template_button.setHidden(bound_template)
+            self.import_template_button.setEnabled(bool(self.templates) and not bound_template)
+        if self.save_template_button is not None:
+            self.save_template_button.setHidden(bound_template)
+
+    def _find_template(self, template_id: str) -> NodeTemplate | None:
+        if self.templates is None:
+            return None
+        return next((template for template in self.templates if template.id == template_id), None)
+
+    def _uses_bound_template(self) -> bool:
+        if self.templates is None:
+            return False
+        if self._force_template_lock:
+            return True
+        return bool(
+            self.node_type.currentText() == "普通"
+            and self.template_lock_button.isChecked()
+            and self._find_template(self._template_id) is not None
+        )
+
+    def _set_template_lock_checked(self, checked: bool) -> None:
+        self.template_lock_button.blockSignals(True)
+        self.template_lock_button.setChecked(checked)
+        self.template_lock_button.blockSignals(False)
+
+    def _select_template_for_lock(self) -> str | None:
+        if not self.templates:
+            QMessageBox.information(self, "暂无模板", "请先保存一个模板，再选择锁定。")
+            return None
+        names = [template.name for template in self.templates]
+        current_index = next(
+            (index for index, template in enumerate(self.templates) if template.id == self._template_id),
+            0,
+        )
+        name, ok = QInputDialog.getItem(self, "选择模板", "锁定到模板", names, current_index, False)
+        if not ok or not name:
+            return None
+        template = next((item for item in self.templates if item.name == name), None)
+        return template.id if template is not None else None
+
+    def _apply_template_to_editor(self, template: NodeTemplate, *, preserve_values: bool) -> None:
+        if preserve_values:
+            working = Node(
+                id=self._node_id,
+                title=self.title_edit.text().strip() or template.name,
+                node_type="普通",
+                x=self._x,
+                y=self._y,
+                width=self._width,
+                height=self._height,
+                color=self.color_edit.text().strip() or DEFAULT_NODE_COLOR,
+                icon=self.icon_edit.text().strip(),
+                icon_from_title=self.icon_from_title_button.isChecked(),
+                title_field_id=self.title_field_id,
+                template_id=self._template_id,
+                fields=[NodeField.from_dict(field.to_dict()) for field in self.fields],
+            )
+            apply_template_to_node(working, template, preserve_values=True)
+            title = working.title
+            icon_from_title = working.icon_from_title
+            icon = working.icon
+            color = working.color
+            fields = [NodeField.from_dict(field.to_dict()) for field in working.fields]
+            title_field_id = working.title_field_id
+        else:
+            title = template.name
+            icon_from_title = template.icon_from_title
+            icon = template.icon
+            color = template.color or DEFAULT_NODE_COLOR
+            fields = [NodeField.from_dict(field.to_dict()) for field in template.fields]
+            title_field_id = template.title_field_id if any(field.id == template.title_field_id for field in fields) else ""
+
+        self._template_id = template.id
+        self.title_edit.setText(title)
+        self.icon_from_title_button.setChecked(icon_from_title)
+        self.icon_edit.setText(icon)
+        self.color_edit.setText(color)
+        self.fields = fields
+        self.title_field_id = title_field_id
+        self._sync_title_from_field()
+        self._sync_icon_from_title()
+        self._ensure_visual_layout()
+        self.canvas.fields = self.fields
+        self.canvas.refresh(0 if self.fields else None)
+        self._update_template_lock_controls()
+        self._load_selected_props(self.canvas.selected_index if self.canvas.selected_index is not None else -1)
+
+    def _on_template_lock_toggled(self, checked: bool) -> None:
+        if self.templates is None:
+            return
+        if self._force_template_lock:
+            self._update_template_lock_controls()
+            return
+        if not checked:
+            self._update_template_lock_controls()
+            return
+        template_id = self._select_template_for_lock()
+        if not template_id:
+            self._set_template_lock_checked(False)
+            self._update_template_lock_controls()
+            return
+        template = self._find_template(template_id)
+        if template is None:
+            self._set_template_lock_checked(False)
+            self._update_template_lock_controls()
+            return
+        self._apply_template_to_editor(template, preserve_values=True)
+        self._set_template_lock_checked(True)
+        self._update_template_lock_controls()
 
     def _labeled_row(self, label: str | QLabel, editor: QWidget) -> QWidget:
         row = QWidget()
@@ -1051,7 +1414,9 @@ class NodeEditorDialog(QDialog):
         ):
             widget.textChanged.connect(self._apply_props)
         self.field_type.currentTextChanged.connect(self._on_field_type_changed)
+        self.node_type.currentTextChanged.connect(lambda _text: self._update_template_lock_controls())
         self.field_value.textChanged.connect(self._apply_props)
+        self.template_lock_button.toggled.connect(self._on_template_lock_toggled)
 
     def _ensure_visual_layout(self) -> None:
         y = 18.0
@@ -1379,26 +1744,18 @@ class NodeEditorDialog(QDialog):
     def _import_template(self, template_id: str) -> None:
         if self.templates is None:
             return
-        template = next((item for item in self.templates if item.id == template_id), None)
+        template = self._find_template(template_id)
         if not template:
             return
-        self.title_edit.setText(template.name)
-        self.icon_from_title_button.setChecked(template.icon_from_title)
-        self.icon_edit.setText(template.icon)
-        self.color_edit.setText(template.color or DEFAULT_NODE_COLOR)
-        self.fields = [NodeField.from_dict(field.to_dict()) for field in template.fields]
-        self.title_field_id = template.title_field_id if any(field.id == template.title_field_id for field in self.fields) else ""
-        self._sync_title_from_field()
-        self._sync_icon_from_title()
-        self._ensure_visual_layout()
-        self.canvas.fields = self.fields
-        self.canvas.refresh(0 if self.fields else None)
-        self._load_selected_props(self.canvas.selected_index if self.canvas.selected_index is not None else -1)
+        self._apply_template_to_editor(template, preserve_values=False)
 
     def _save_current_template(self) -> None:
         if self.templates is None:
             return
         self._apply_props()
+        if self._force_template_lock:
+            QMessageBox.information(self, "排序画布模板", "排序画布使用当前画布自己的模板，不支持在这里导出为通用模板。")
+            return
         default_name = self.title_edit.text().strip() or "节点模板"
         name, ok = QInputDialog.getText(self, "保存模板", "模板名称", text=default_name)
         if not ok:
@@ -1426,12 +1783,14 @@ class NodeEditorDialog(QDialog):
             self.templates[existing_index] = template
         else:
             self.templates.append(template)
+        self._template_id = template.id
         self.templates_changed = True
         self.templates_result = [copy.deepcopy(item) for item in self.templates]
         if hasattr(self, "import_template_menu"):
             self._populate_template_import_menu(self.import_template_menu)
         if hasattr(self, "import_template_button"):
             self.import_template_button.setEnabled(bool(self.templates))
+        self._update_template_lock_controls()
 
     def _pick_node_color(self) -> None:
         self._pick_color(self.color_edit)
@@ -1507,12 +1866,16 @@ class NodeEditorDialog(QDialog):
             QMessageBox.warning(self, "节点名称不能为空", "请输入节点名称。")
             return
         self._apply_props()
+        node_type = self.node_type.currentText() if self.node_type.currentText() in NODE_TYPES else "普通"
+        template_locked = bool(
+            node_type == "普通" and (self._force_template_lock or self.template_lock_button.isChecked())
+        )
         self.result = Node(
             id=self._node_id,
             title=title,
-            node_type=self.node_type.currentText() if self.node_type.currentText() in NODE_TYPES else "普通",
-            canvas_id=self._canvas_id if self.node_type.currentText() == "画布" else "",
-            link_path=self._link_path if self.node_type.currentText() == "超文本" else "",
+            node_type=node_type,
+            canvas_id=self._canvas_id if node_type == "画布" else "",
+            link_path=self._link_path if node_type == "超文本" else "",
             link_format=self._link_format if self._link_format in {"md", "txt"} else "md",
             order=self._order,
             x=self._x,
@@ -1523,9 +1886,15 @@ class NodeEditorDialog(QDialog):
             icon=self.icon_edit.text().strip(),
             icon_from_title=self.icon_from_title_button.isChecked(),
             title_field_id=self.title_field_id,
+            template_id=self._template_id if node_type == "普通" else "",
+            template_locked=template_locked,
             fields=[copy.deepcopy(field) for field in self.fields],
         )
         self.accept()
+
+    def done(self, result: int) -> None:  # type: ignore[override]
+        save_window_layout(self, "node_editor_dialog")
+        super().done(result)
 
 
 class TemplateManagerDialog(QDialog):
@@ -1569,6 +1938,7 @@ class TemplateManagerDialog(QDialog):
         layout.addLayout(body, 1)
         layout.addWidget(buttons)
         self.resize(560, 440)
+        restore_window_layout(self, "template_manager_dialog")
         self._refresh()
 
     def _selected_index(self) -> int | None:
@@ -1643,3 +2013,7 @@ class TemplateManagerDialog(QDialog):
     def _accept(self) -> None:
         self.result = [copy.deepcopy(template) for template in self.templates]
         self.accept()
+
+    def done(self, result: int) -> None:  # type: ignore[override]
+        save_window_layout(self, "template_manager_dialog")
+        super().done(result)

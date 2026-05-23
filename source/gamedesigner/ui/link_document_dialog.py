@@ -25,6 +25,7 @@ from ..project_files.linked_documents import (
     read_link_document,
     write_link_document,
 )
+from ..window_layouts import restore_window_layout, save_window_layout
 
 
 class LinkDocumentDialog(QDialog):
@@ -91,6 +92,7 @@ class LinkDocumentDialog(QDialog):
         layout.addWidget(splitter, 1)
         layout.addLayout(tools)
         self.resize(920, 600)
+        restore_window_layout(self, "link_document_dialog")
         self._update_path_label()
         self._update_preview()
 
@@ -186,3 +188,7 @@ class LinkDocumentDialog(QDialog):
             delete_link_document(self.project_path, self.relative_path)
         self.deleted = True
         self.accept()
+
+    def done(self, result: int) -> None:  # type: ignore[override]
+        save_window_layout(self, "link_document_dialog")
+        super().done(result)

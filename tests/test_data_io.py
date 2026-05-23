@@ -3,8 +3,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from gamedesigner.csv_io import export_all_canvas_csv, export_game_csv
-from gamedesigner.models import BlueprintGroup, Node, NodeField, NodeTemplate, ProjectData, default_templates
+from gamedesigner.csv_io import CanvasCsvExportSpec, export_all_canvas_csv, export_game_csv
+from gamedesigner.canvas_io import import_canvas_sheet
+from gamedesigner.data_canvas import layout_data_canvas
+from gamedesigner.models import CanvasData, BlueprintGroup, Node, NodeField, NodeTemplate, ProjectData, default_templates
 from gamedesigner.project_files.linked_documents import (
     create_link_document,
     delete_link_document,
@@ -171,6 +173,94 @@ class DataIoTests(unittest.TestCase):
             self.assertEqual(self._csv_names(root_csv), ["主入口", "战斗画布"])
             self.assertEqual(self._csv_names(child_csv), ["敌人A", "敌人B"])
 
+    def test_all_canvas_csv_export_respects_canvas_selection_and_canvas_sort_rules(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            tmp_path = Path(folder)
+            project = ProjectData(name="导出设置测试")
+            project.ensure_canvas_structure()
+            root = project.root_canvas()
+
+            free_link = root.add_node(Node(title="自由画布", node_type="画布", x=0, y=0))
+            free_canvas = project.add_canvas("自由画布", parent_canvas_id=root.id, parent_node_id=free_link.id)
+            free_link.canvas_id = free_canvas.id
+            free_canvas.add_node(Node(title="右边", x=300, y=0, fields=[NodeField("值", "文本", "R")]))
+            free_canvas.add_node(Node(title="左边", x=100, y=0, fields=[NodeField("值", "文本", "L")]))
+
+            skipped_link = root.add_node(Node(title="跳过画布", node_type="画布", x=100, y=0))
+            skipped_canvas = project.add_canvas("跳过画布", parent_canvas_id=root.id, parent_node_id=skipped_link.id)
+            skipped_link.canvas_id = skipped_canvas.id
+            skipped_canvas.add_node(Node(title="不会导出"))
+
+            data_link = root.add_node(Node(title="数据画布", node_type="画布", x=200, y=0))
+            data_canvas = project.add_canvas(
+                "数据画布",
+                canvas_type="data",
+                data_layout="horizontal",
+                parent_canvas_id=root.id,
+                parent_node_id=data_link.id,
+            )
+            data_link.canvas_id = data_canvas.id
+            data_canvas.add_node(Node(title="第二行", x=300, y=0, fields=[NodeField("序号", "整数", "2")]))
+            data_canvas.add_node(Node(title="第一行", x=100, y=0, fields=[NodeField("序号", "整数", "1")]))
+
+            outputs = export_all_canvas_csv(
+                project,
+                tmp_path,
+                canvas_specs=[
+                    CanvasCsvExportSpec(canvas_id=free_canvas.id, enabled=True, sort_mode="x"),
+                    CanvasCsvExportSpec(canvas_id=skipped_canvas.id, enabled=False, sort_mode="created"),
+                    CanvasCsvExportSpec(canvas_id=data_canvas.id, enabled=True, sort_mode="x"),
+                ],
+            )
+
+            root_csv = tmp_path / "导出设置测试__主画布.csv"
+            free_csv = tmp_path / "导出设置测试__自由画布.csv"
+            skipped_csv = tmp_path / "导出设置测试__跳过画布.csv"
+            data_csv = tmp_path / "导出设置测试__数据画布.csv"
+
+            self.assertEqual(outputs, [root_csv, free_csv, data_csv])
+            self.assertTrue(root_csv.exists())
+            self.assertTrue(free_csv.exists())
+            self.assertFalse(skipped_csv.exists())
+            self.assertTrue(data_csv.exists())
+            self.assertEqual(self._csv_names(free_csv), ["左边", "右边"])
+            self.assertEqual(self._csv_names(data_csv), ["第二行", "第一行"])
+
+    def test_all_canvas_csv_export_supports_per_canvas_folders(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            tmp_path = Path(folder)
+            project = ProjectData(name="分目录导出")
+            project.ensure_canvas_structure()
+            root = project.root_canvas()
+            root.add_node(Node(title="主入口"))
+
+            free_link = root.add_node(Node(title="自由画布", node_type="画布"))
+            free_canvas = project.add_canvas("自由画布", parent_canvas_id=root.id, parent_node_id=free_link.id)
+            free_link.canvas_id = free_canvas.id
+            free_canvas.add_node(Node(title="节点A"))
+
+            custom_folder = tmp_path / "custom"
+            outputs = export_all_canvas_csv(
+                project,
+                tmp_path,
+                canvas_specs=[
+                    CanvasCsvExportSpec(canvas_id=root.id, enabled=True, sort_mode="created"),
+                    CanvasCsvExportSpec(
+                        canvas_id=free_canvas.id,
+                        enabled=True,
+                        sort_mode="created",
+                        target_folder=str(custom_folder),
+                    ),
+                ],
+            )
+
+            root_csv = tmp_path / "分目录导出__主画布.csv"
+            free_csv = custom_folder / "分目录导出__自由画布.csv"
+
+            self.assertEqual(outputs, [root_csv, free_csv])
+            self.assertTrue(root_csv.exists())
+            self.assertTrue(free_csv.exists())
+
     def test_delete_node_compacts_creation_order(self) -> None:
         project = ProjectData(name="删除排序")
         project.ensure_canvas_structure()
@@ -236,6 +326,101 @@ class DataIoTests(unittest.TestCase):
             self.assertEqual(loaded_child.parent_canvas_id, loaded_root.id)
             self.assertEqual(loaded_child.parent_node_id, loaded_link.id)
             self.assertEqual(loaded_child.nodes[0].title, "敌人配置")
+
+    def test_data_canvas_metadata_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            tmp_path = Path(folder)
+            name_field = NodeField("名称", "文本", "第一行")
+            template = NodeTemplate(
+                name="数据模板",
+                color="#DDEEFF",
+                icon="数",
+                title_field_id=name_field.id,
+                fields=[name_field, NodeField("数值", "整数", "7")],
+            )
+            project = ProjectData(name="数据画布项目", templates=[template])
+            project.ensure_canvas_structure()
+            root = project.root_canvas()
+            entry = root.add_node(Node(title="数据画布", node_type="画布", icon="数"))
+            data_canvas = project.add_canvas(
+                "数据画布",
+                canvas_type="data",
+                data_layout="horizontal",
+                template_id=template.id,
+                parent_canvas_id=root.id,
+                parent_node_id=entry.id,
+            )
+            entry.canvas_id = data_canvas.id
+            row = template.create_node(0, 0)
+            row.template_locked = True
+            row.fields[0].value = "第一行"
+            row.fields[1].value = "7"
+            data_canvas.add_node(row)
+
+            path = tmp_path / "data_canvas.gdc"
+            save_project(project, path)
+            loaded = load_project(path)
+            loaded_canvas = next(canvas for canvas in loaded.canvases if canvas.id == data_canvas.id)
+            loaded_row = loaded_canvas.nodes[0]
+
+            self.assertEqual(loaded_canvas.canvas_type, "data")
+            self.assertEqual(loaded_canvas.data_layout, "horizontal")
+            self.assertEqual(loaded_canvas.template_id, template.id)
+            self.assertEqual(loaded_row.template_id, template.id)
+            self.assertTrue(loaded_row.template_locked)
+            self.assertEqual(loaded_row.fields[0].value, "第一行")
+
+    def test_import_canvas_sheet_rebuilds_template_and_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            tmp_path = Path(folder)
+            source = tmp_path / "table.csv"
+            source.write_text("名字,数值\n火球,12\n冰墙,8\n", encoding="utf-8")
+
+            project = ProjectData(name="导入测试")
+            project.ensure_canvas_structure()
+            canvas = project.add_canvas("排序画布", canvas_type="data", data_layout="horizontal")
+
+            template = import_canvas_sheet(project, canvas, source)
+
+            self.assertEqual(template.name, "排序画布 模板")
+            self.assertEqual([field.name for field in template.fields], ["名字", "数值"])
+            self.assertEqual(canvas.template_id, template.id)
+            self.assertEqual([node.title for node in sorted(canvas.nodes, key=lambda node: node.order)], ["火球", "冰墙"])
+            self.assertTrue(all(node.template_locked for node in canvas.nodes))
+            self.assertEqual(canvas.nodes[0].fields[1].value, "12")
+            self.assertEqual(canvas.nodes[1].fields[1].value, "8")
+
+    def test_import_canvas_sheet_into_normal_canvas_rebuilds_nodes(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            tmp_path = Path(folder)
+            source = tmp_path / "normal.csv"
+            source.write_text("名字,描述\n节点A,说明A\n节点B,说明B\n", encoding="utf-8")
+
+            project = ProjectData(name="自由导入测试")
+            project.ensure_canvas_structure()
+            canvas = project.root_canvas()
+
+            template = import_canvas_sheet(project, canvas, source)
+
+            self.assertEqual(template.name, "主画布 模板")
+            self.assertEqual(canvas.template_id, template.id)
+            self.assertEqual([node.title for node in sorted(canvas.nodes, key=lambda node: node.order)], ["节点A", "节点B"])
+            self.assertTrue(all(not node.template_locked for node in canvas.nodes))
+
+    def test_data_canvas_grid_rows_layout_wraps_by_row_limit(self) -> None:
+        canvas = CanvasData(name="数据", canvas_type="data", data_layout="grid", data_grid_rows=2)
+        canvas.add_node(Node(title="A", width=300, height=100))
+        canvas.add_node(Node(title="B", width=300, height=100))
+        canvas.add_node(Node(title="C", width=300, height=100))
+        canvas.add_node(Node(title="D", width=300, height=100))
+
+        layout_data_canvas(canvas)
+
+        ordered = sorted(canvas.nodes, key=lambda node: node.order)
+        self.assertEqual(ordered[0].x, ordered[1].x)
+        self.assertLess(ordered[0].y, ordered[1].y)
+        self.assertGreater(ordered[2].x, ordered[0].x)
+        self.assertEqual(ordered[2].y, ordered[0].y)
 
     def test_delete_canvas_tree_removes_descendants(self) -> None:
         project = ProjectData(name="删画布树")

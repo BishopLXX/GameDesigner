@@ -10,6 +10,12 @@ from .models import FIELD_EXPORT_PROPS, CanvasData, Node, NodeField, ProjectData
 
 
 CSV_SORT_MODES = {"created", "x", "y"}
+CSV_SORT_MODE_LABELS = {
+    "created": "按创建顺序",
+    "x": "按 X 往右排序",
+    "y": "按 Y 往下排序",
+}
+DATA_CANVAS_SORT_LABEL = "按画布顺序"
 
 
 BASE_COLUMNS = [
@@ -45,6 +51,14 @@ class Column:
     getter: Callable[[Node], str]
 
 
+@dataclass(frozen=True)
+class CanvasCsvExportSpec:
+    canvas_id: str
+    enabled: bool = True
+    sort_mode: str = "created"
+    target_folder: str = ""
+
+
 def export_game_csv(
     project: ProjectData,
     target: str | Path,
@@ -65,6 +79,7 @@ def export_all_canvas_csv(
     project: ProjectData,
     target: str | Path,
     sort_mode: str = "created",
+    canvas_specs: list[CanvasCsvExportSpec] | None = None,
 ) -> list[Path]:
     project.ensure_canvas_structure()
     folder = Path(target)
@@ -72,17 +87,25 @@ def export_all_canvas_csv(
         folder = folder.parent
     folder.mkdir(parents=True, exist_ok=True)
 
-    used_names: dict[str, int] = {}
+    used_names_by_folder: dict[Path, dict[str, int]] = {}
     paths: list[Path] = []
-    for canvas in project.canvases:
-        path = folder / _canvas_csv_filename(project, canvas, used_names)
-        paths.append(_write_canvas_csv(path, canvas, sort_mode))
+    export_specs = _resolved_canvas_specs(project, sort_mode, canvas_specs)
+    for canvas, spec in export_specs:
+        if not spec.enabled:
+            continue
+        export_folder = Path(spec.target_folder.strip()) if spec.target_folder.strip() else folder
+        if export_folder.suffix.lower() == ".csv":
+            export_folder = export_folder.parent
+        export_folder.mkdir(parents=True, exist_ok=True)
+        used_names = used_names_by_folder.setdefault(export_folder, {})
+        path = export_folder / _canvas_csv_filename(project, canvas, used_names)
+        paths.append(_write_canvas_csv(path, canvas, spec.sort_mode))
     return paths
 
 
 def _write_canvas_csv(path: Path, source_canvas: CanvasData, sort_mode: str) -> Path:
     source_canvas.normalize_node_order()
-    nodes = _sorted_nodes(source_canvas.nodes, sort_mode)
+    nodes = _sorted_nodes(source_canvas.nodes, _resolved_sort_mode(source_canvas, sort_mode))
     columns = _build_columns(nodes)
     with path.open("w", encoding="utf-8-sig", newline="") as file:
         writer = csv.writer(file)
@@ -136,6 +159,37 @@ def _sorted_nodes(nodes: list[Node], sort_mode: str) -> list[Node]:
     if mode == "y":
         return sorted(nodes, key=lambda node: (node.y, node.x, node.order))
     return sorted(nodes, key=lambda node: (node.order, node.x, node.y))
+
+
+def _resolved_sort_mode(canvas: CanvasData, sort_mode: str) -> str:
+    if canvas.is_data_canvas():
+        return "created"
+    return sort_mode if sort_mode in CSV_SORT_MODES else "created"
+
+
+def _resolved_canvas_specs(
+    project: ProjectData,
+    default_sort_mode: str,
+    canvas_specs: list[CanvasCsvExportSpec] | None,
+) -> list[tuple[CanvasData, CanvasCsvExportSpec]]:
+    requested = {spec.canvas_id: spec for spec in (canvas_specs or [])}
+    result: list[tuple[CanvasData, CanvasCsvExportSpec]] = []
+    for canvas in project.canvases:
+        spec = requested.get(canvas.id)
+        if spec is None:
+            spec = CanvasCsvExportSpec(canvas_id=canvas.id, enabled=True, sort_mode=default_sort_mode)
+        result.append(
+            (
+                canvas,
+                CanvasCsvExportSpec(
+                    canvas_id=canvas.id,
+                    enabled=bool(spec.enabled),
+                    sort_mode=_resolved_sort_mode(canvas, spec.sort_mode),
+                    target_folder=str(spec.target_folder or ""),
+                ),
+            )
+        )
+    return result
 
 
 def _field_keys(node: Node) -> list[tuple[str, NodeField]]:

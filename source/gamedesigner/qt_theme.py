@@ -289,6 +289,38 @@ def stylesheet(name: str) -> str:
         border: 1px solid {colors["hairline"]};
         border-radius: 10px;
     }}
+    QWidget#canvasFunctionBar {{
+        background: {colors["window"]};
+        border-bottom: 1px solid {colors["hairline"]};
+        min-height: 34px;
+    }}
+    QLabel#canvasFunctionLabel {{
+        color: {colors["text_muted"]};
+        padding-right: 6px;
+        font-size: 9pt;
+    }}
+    QToolButton#canvasFunctionButton, QToolButton#canvasFunctionToggle {{
+        background: transparent;
+        color: {colors["text_muted"]};
+        border: 1px solid transparent;
+        border-radius: 8px;
+        padding: 4px 10px;
+    }}
+    QToolButton#canvasFunctionButton:hover, QToolButton#canvasFunctionToggle:hover {{
+        background: {colors["control_hover"]};
+        color: {colors["text"]};
+        border-color: {colors["hairline"]};
+    }}
+    QToolButton#canvasFunctionToggle:checked {{
+        background: {colors["control"]};
+        color: {colors["text"]};
+        border-color: {colors["accent"]};
+    }}
+    QSpinBox#canvasFunctionSpin {{
+        min-width: 88px;
+        max-width: 112px;
+        padding-right: 18px;
+    }}
     QToolButton#canvasNavButton {{
         background: transparent;
         color: {colors["text"]};

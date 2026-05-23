@@ -8,7 +8,8 @@ from PySide6.QtCore import QPoint, QPointF, Qt
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QApplication
 
-from gamedesigner.models import Node, ProjectData
+from gamedesigner.data_canvas import layout_data_canvas
+from gamedesigner.models import BlueprintGroup, CanvasData, Node, NodeField, ProjectData
 from gamedesigner.qt_canvas import NodeGraphView
 
 
@@ -83,6 +84,18 @@ class QtCanvasTests(unittest.TestCase):
         self.assertEqual(view.viewport().cursor().shape(), Qt.ArrowCursor)
         view.deleteLater()
 
+    def test_show_event_resets_stale_hand_cursor_to_arrow(self) -> None:
+        view = NodeGraphView(ProjectData(nodes=[Node(title="Current")]))
+        view.setCursor(Qt.OpenHandCursor)
+        view.viewport().setCursor(Qt.OpenHandCursor)
+
+        view.show()
+        self.app.processEvents()
+
+        self.assertEqual(view.cursor().shape(), Qt.ArrowCursor)
+        self.assertEqual(view.viewport().cursor().shape(), Qt.ArrowCursor)
+        view.deleteLater()
+
     def test_read_only_draggable_node_can_resize_from_handle(self) -> None:
         project = ProjectData(nodes=[Node(title="Recent", width=350, height=156)])
         view = NodeGraphView(project, read_only=True, allow_node_drag=True)
@@ -96,6 +109,99 @@ class QtCanvasTests(unittest.TestCase):
 
         self.assertEqual(node.width, 398)
         self.assertEqual(node.height, 188)
+        view.deleteLater()
+
+    def test_data_canvas_allows_node_move_but_not_resize(self) -> None:
+        canvas = CanvasData(name="数据", canvas_type="data")
+        canvas.add_node(Node(title="条目"))
+        view = NodeGraphView(canvas)
+
+        self.assertTrue(view.can_move_nodes())
+        self.assertFalse(view.can_resize_nodes())
+        view.deleteLater()
+
+    def test_data_canvas_drag_reorders_nodes(self) -> None:
+        canvas = CanvasData(name="数据", canvas_type="data", data_layout="horizontal")
+        first = canvas.add_node(Node(title="第一", width=320, height=180))
+        second = canvas.add_node(Node(title="第二", width=320, height=180))
+        third = canvas.add_node(Node(title="第三", width=320, height=180))
+        layout_data_canvas(canvas)
+
+        view = NodeGraphView(canvas)
+        second_item = view.node_items[second.id]
+        first_item = view.node_items[first.id]
+
+        second_item.setPos(QPointF(second_item.pos().x(), first_item.pos().y() - 48))
+        changed = view.commit_data_canvas_node_reorder(second.id)
+
+        self.assertTrue(changed)
+        self.assertEqual(
+            [node.title for node in sorted(canvas.nodes, key=lambda node: node.order)],
+            ["第二", "第一", "第三"],
+        )
+        self.assertLess(canvas.find_node(second.id).y, canvas.find_node(first.id).y)
+        view.deleteLater()
+
+    def test_horizontal_data_canvas_node_uses_single_row_layout(self) -> None:
+        horizontal_canvas = CanvasData(name="数据", canvas_type="data", data_layout="horizontal")
+        horizontal_node = horizontal_canvas.add_node(
+            Node(
+                title="横向",
+                fields=[
+                    NodeField(name="姓名", value="小明"),
+                    NodeField(name="职业", value="策划"),
+                    NodeField(name="城市", value="上海"),
+                ],
+            )
+        )
+        horizontal_view = NodeGraphView(horizontal_canvas)
+        horizontal_item = horizontal_view.node_items[horizontal_node.id]
+
+        vertical_canvas = CanvasData(name="数据", canvas_type="data", data_layout="grid")
+        vertical_node = vertical_canvas.add_node(
+            Node(
+                title="纵向",
+                fields=[
+                    NodeField(name="姓名", value="小明"),
+                    NodeField(name="职业", value="策划"),
+                    NodeField(name="城市", value="上海"),
+                ],
+            )
+        )
+        vertical_view = NodeGraphView(vertical_canvas)
+        vertical_item = vertical_view.node_items[vertical_node.id]
+
+        self.assertGreater(horizontal_item.width, vertical_item.width)
+        self.assertLess(horizontal_item.height, vertical_item.height)
+        self.assertEqual(horizontal_node.width, horizontal_item.width)
+        self.assertEqual(horizontal_node.height, horizontal_item.height)
+        self.assertEqual(horizontal_node.y, 72.0)
+
+        horizontal_view.deleteLater()
+        vertical_view.deleteLater()
+
+    def test_blueprint_group_snaps_to_grid(self) -> None:
+        canvas = CanvasData(name="主画布")
+        group = canvas.add_group(BlueprintGroup(title="蓝图组", x=83, y=118, width=320, height=220))
+        view = NodeGraphView(canvas)
+        item = view.group_items[group.id]
+
+        snapped = view.snap_position(item, QPointF(83, 118))
+
+        self.assertEqual(snapped, QPointF(80, 120))
+        view.deleteLater()
+
+    def test_blueprint_group_snaps_to_node_alignment(self) -> None:
+        canvas = CanvasData(name="主画布")
+        canvas.add_node(Node(title="节点", x=103, y=100))
+        group = canvas.add_group(BlueprintGroup(title="蓝图组", x=280, y=220, width=320, height=220))
+        view = NodeGraphView(canvas)
+        item = view.group_items[group.id]
+
+        snapped = view.snap_position(item, QPointF(108, 153))
+
+        self.assertEqual(snapped.x(), 103)
+        self.assertTrue(any(guide.kind == "align" and guide.axis == "x" for guide in view.snap_guides))
         view.deleteLater()
 
     def test_right_click_without_drag_opens_context_menu(self) -> None:
@@ -133,6 +239,22 @@ class QtCanvasTests(unittest.TestCase):
         self.assertNotEqual(view.horizontalScrollBar().value(), start_horizontal)
         self.assertNotEqual(view.verticalScrollBar().value(), start_vertical)
         self.assertFalse(view._panning)
+        view.deleteLater()
+
+    def test_first_right_press_clears_stale_hand_cursor_before_drag(self) -> None:
+        view = NodeGraphView(ProjectData(nodes=[Node(title="Current")]))
+        view.resize(800, 600)
+        view.setCursor(Qt.OpenHandCursor)
+        view.viewport().setCursor(Qt.OpenHandCursor)
+        view.show()
+        self.app.processEvents()
+
+        press = _ViewMouseEvent(Qt.RightButton, QPoint(220, 200))
+        view.mousePressEvent(press)
+
+        self.assertTrue(view._right_drag_pending)
+        self.assertEqual(view.cursor().shape(), Qt.ArrowCursor)
+        self.assertEqual(view.viewport().cursor().shape(), Qt.ArrowCursor)
         view.deleteLater()
 
     def test_right_drag_release_suppresses_followup_context_menu_event(self) -> None:

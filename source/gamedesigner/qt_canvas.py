@@ -26,9 +26,11 @@ from PySide6.QtWidgets import (
     QGraphicsPathItem,
     QGraphicsScene,
     QGraphicsView,
+    QInputDialog,
     QMenu,
 )
 
+from .data_canvas import layout_data_canvas, reorder_data_canvas_node
 from .models import BlueprintGroup, CanvasData, Edge, Node, NodeField, NodeTemplate, ProjectData
 from .qt_theme import palette
 
@@ -37,6 +39,7 @@ NODE_DEFAULT_WIDTH = 310.0
 NODE_MIN_WIDTH = 260.0
 NODE_MIN_HEIGHT = 92.0
 NODE_MAX_NATURAL_WIDTH = 680.0
+HORIZONTAL_DATA_NODE_MAX_NATURAL_WIDTH = 2400.0
 HEADER_HEIGHT = 52.0
 ROW_GAP = 7.0
 ROW_TOP = HEADER_HEIGHT + 6.0
@@ -108,7 +111,7 @@ class BlueprintGroupItem(QGraphicsObject):
         self._last_pos = QPointF(group.x, group.y)
         self.setPos(group.x, group.y)
         flags = QGraphicsItem.ItemIsSelectable
-        if self.view.can_move_nodes():
+        if self.view.can_move_groups():
             flags |= QGraphicsItem.ItemIsMovable | QGraphicsItem.ItemSendsGeometryChanges
         self.setFlags(flags)
         self.setAcceptHoverEvents(True)
@@ -192,12 +195,20 @@ class BlueprintGroupItem(QGraphicsObject):
         changed = self._resizing or self.pos() != self._last_pos
         self._resizing = False
         self.setCursor(Qt.OpenHandCursor)
+        self.view.snap_guides.clear()
+        self.view.viewport().update()
         if changed:
             self.view.refresh_group_membership()
             self.view.projectChanged.emit()
         super().mouseReleaseEvent(event)
 
     def itemChange(self, change: QGraphicsItem.GraphicsItemChange, value):  # type: ignore[override]
+        if change == QGraphicsItem.ItemPositionChange and self.scene() and not self.view.rebuilding:
+            pos = value
+            if QApplication.keyboardModifiers() & Qt.ControlModifier:
+                self.view.snap_guides.clear()
+                return pos
+            return self.view.snap_position(self, pos)
         if change == QGraphicsItem.ItemPositionHasChanged and not self.view.rebuilding:
             new_pos = self.pos()
             delta = new_pos - self._last_pos
@@ -292,14 +303,14 @@ class NodeItem(QGraphicsObject):
         painter.drawText(badge, Qt.AlignCenter, text)
 
     def _paint_icon_mode(self, painter: QPainter, colors: dict[str, str], rect: QRectF, zoom: float) -> None:
-        fallback = "画" if self.node.node_type == "画布" else "链" if self.node.node_type == "超链接" else self.node.title
+        fallback = "画" if self.node.node_type == "画布" else "链" if self.node.node_type == "超文本" else self.node.title
         text = (self.node.display_icon() or fallback or "节").strip()[:8]
         painter.setPen(QColor(colors["accent"]))
         text_rect = rect.adjusted(12, 22, -12, -8)
         self._draw_adaptive_center_text(painter, text_rect, text, zoom, 20, 84)
 
     def _paint_compact_mode(self, painter: QPainter, colors: dict[str, str], rect: QRectF, zoom: float) -> None:
-        fallback = "画" if self.node.node_type == "画布" else "链" if self.node.node_type == "超链接" else self.node.title[:1]
+        fallback = "画" if self.node.node_type == "画布" else "链" if self.node.node_type == "超文本" else self.node.title[:1]
         icon = (self.node.display_icon() or fallback or "节").strip()[:2]
         painter.setPen(QColor(colors["accent"]))
         icon_rect = QRectF(18, 28, 58, max(28, rect.height() - 42))
@@ -312,7 +323,7 @@ class NodeItem(QGraphicsObject):
         self._draw_adaptive_center_text(painter, title_rect, self.node.title, zoom, 13, 42)
 
     def _paint_detail_mode(self, painter: QPainter, colors: dict[str, str], rect: QRectF) -> None:
-        icon = self.node.display_icon() or ("画" if self.node.node_type == "画布" else "链" if self.node.node_type == "超链接" else "")
+        icon = self.node.display_icon() or ("画" if self.node.node_type == "画布" else "链" if self.node.node_type == "超文本" else "")
         title = f"{icon}  {self.node.title}" if icon else self.node.title
         painter.setPen(QColor(colors["node_text"]))
         title_font = _font(12, True)
@@ -324,7 +335,7 @@ class NodeItem(QGraphicsObject):
             "画布"
             if self.node.node_type == "画布"
             else self.node.link_format.upper()
-            if self.node.node_type == "超链接"
+            if self.node.node_type == "超文本"
             else f"{len(self.node.fields)} 项"
         )
         painter.drawText(QRectF(rect.width() - 72, 30, 54, 18), Qt.AlignRight | Qt.AlignVCenter, meta)
@@ -333,6 +344,10 @@ class NodeItem(QGraphicsObject):
             painter.setPen(QColor(colors["node_muted"]))
             painter.setFont(_font(10))
             painter.drawText(QRectF(18, HEADER_HEIGHT + 18, rect.width() - 36, 24), Qt.AlignLeft, "暂无数据字段")
+            return
+
+        if self._uses_horizontal_data_row():
+            self._paint_horizontal_data_row(painter, colors)
             return
 
         visual_fields = [field for field in self.node.fields if field.has_visual_layout()]
@@ -377,6 +392,46 @@ class NodeItem(QGraphicsObject):
                 field.value or " ",
             )
             y += row_h + ROW_GAP
+
+    def _paint_horizontal_data_row(self, painter: QPainter, colors: dict[str, str]) -> None:
+        segments = self._horizontal_data_segments()
+        if not segments:
+            return
+        name_font = _font(8, True)
+        value_font = _font(9)
+        name_metrics = QFontMetrics(name_font)
+        value_metrics = QFontMetrics(value_font)
+        x = 10.0
+        y = ROW_TOP
+        row_h = 42.0
+        for field, label_w, segment_w in segments:
+            row = QRectF(x, y, segment_w, row_h)
+            row_path = QPainterPath()
+            row_path.addRoundedRect(row, 8, 8)
+            painter.fillPath(row_path, QColor("#FAFAFC"))
+            painter.setPen(QPen(QColor("#E5E5EA"), 1))
+            painter.drawPath(row_path)
+
+            label_x = row.x() + 10
+            label_rect = QRectF(label_x, row.y() + 8, label_w, row.height() - 16)
+            painter.setPen(QColor(colors["node_muted"]))
+            painter.setFont(name_font)
+            painter.drawText(
+                label_rect,
+                Qt.AlignLeft | Qt.AlignVCenter | Qt.TextSingleLine,
+                name_metrics.elidedText(field.name, Qt.ElideRight, max(1, int(label_rect.width()))),
+            )
+
+            value_x = label_rect.right() + 8
+            value_rect = QRectF(value_x, row.y() + 8, row.right() - value_x - 10, row.height() - 16)
+            painter.setPen(QColor(colors["node_text"]))
+            painter.setFont(value_font)
+            painter.drawText(
+                value_rect,
+                Qt.AlignLeft | Qt.AlignVCenter | Qt.TextSingleLine,
+                value_metrics.elidedText(self._horizontal_field_value(field), Qt.ElideRight, max(1, int(value_rect.width()))),
+            )
+            x += segment_w + ROW_GAP
 
     def _paint_visual_fields(self, painter: QPainter, colors: dict[str, str], fields: list[NodeField]) -> None:
         content_w = max([field.x + field.width for field in fields] + [self.width - 28]) + 20
@@ -543,13 +598,19 @@ class NodeItem(QGraphicsObject):
         self.view.snap_guides.clear()
         self.view.viewport().update()
         if self._moved:
-            self.view.refresh_group_membership()
+            if self.view.is_data_canvas():
+                self.view.commit_data_canvas_node_reorder(self.node.id)
+            else:
+                self.view.refresh_group_membership()
             self.view.projectChanged.emit()
         super().mouseReleaseEvent(event)
 
     def itemChange(self, change: QGraphicsItem.GraphicsItemChange, value):  # type: ignore[override]
         if change == QGraphicsItem.ItemPositionChange and self.scene() and not self.view.rebuilding:
             pos = value
+            if self.view.is_data_canvas():
+                self.view.snap_guides.clear()
+                return pos
             if self.view._moving_group:
                 return pos
             if self.view.has_multi_node_selection():
@@ -571,14 +632,28 @@ class NodeItem(QGraphicsObject):
         self.update()
 
     def _sync_size(self) -> None:
+        use_natural_size = self.view.is_data_canvas()
         visual_fields = [field for field in self.node.fields if field.has_visual_layout()]
-        if visual_fields:
+        if visual_fields and not self._uses_horizontal_data_row():
             natural_w = max([field.x + field.width for field in visual_fields] + [NODE_DEFAULT_WIDTH]) + 34
             natural_h = HEADER_HEIGHT + max([field.y + field.height for field in visual_fields] + [120]) + 24
-            self.width = max(NODE_MIN_WIDTH, self.node.width if self.node.width > 0 else min(NODE_MAX_NATURAL_WIDTH, natural_w))
-            self.height = max(NODE_MIN_HEIGHT, self.node.height if self.node.height > 0 else natural_h)
+            if use_natural_size:
+                self.width = max(NODE_MIN_WIDTH, min(NODE_MAX_NATURAL_WIDTH, natural_w))
+                self.height = max(NODE_MIN_HEIGHT, natural_h)
+                self.node.width = self.width
+                self.node.height = self.height
+            else:
+                self.width = max(NODE_MIN_WIDTH, self.node.width if self.node.width > 0 else min(NODE_MAX_NATURAL_WIDTH, natural_w))
+                self.height = max(NODE_MIN_HEIGHT, self.node.height if self.node.height > 0 else natural_h)
             return
         natural_width = self._natural_detail_width()
+        if use_natural_size:
+            self.width = max(NODE_MIN_WIDTH, natural_width)
+            natural_height = self._natural_detail_height(self.width)
+            self.height = max(NODE_MIN_HEIGHT, natural_height)
+            self.node.width = self.width
+            self.node.height = self.height
+            return
         self.width = max(NODE_MIN_WIDTH, self.node.width if self.node.width > 0 else natural_width)
         natural_height = self._natural_detail_height(self.width)
         self.height = max(NODE_MIN_HEIGHT, self.node.height if self.node.height > 0 else natural_height)
@@ -586,6 +661,11 @@ class NodeItem(QGraphicsObject):
     def _natural_detail_width(self) -> float:
         title = f"{self.node.icon}  {self.node.title}" if self.node.icon else self.node.title
         title_width = QFontMetrics(_font(12, True)).horizontalAdvance(title) + 118
+        if self._uses_horizontal_data_row():
+            content_width = sum(segment_w for _field, _label_w, segment_w in self._horizontal_data_segments())
+            content_width += max(0, len(self.node.fields) - 1) * ROW_GAP + 20
+            natural = max(NODE_DEFAULT_WIDTH, title_width, content_width)
+            return min(HORIZONTAL_DATA_NODE_MAX_NATURAL_WIDTH, natural)
         name_w, type_w = self._row_column_widths()
         value_font = QFontMetrics(_font(9))
         value_widths = [
@@ -599,12 +679,35 @@ class NodeItem(QGraphicsObject):
     def _natural_detail_height(self, width: float) -> float:
         if not self.node.fields:
             return HEADER_HEIGHT + 66
+        if self._uses_horizontal_data_row():
+            return ROW_TOP + 42.0 + 10
         name_w, type_w = self._row_column_widths()
         content_height = sum(
             self._row_height(field, width, name_w, type_w) + ROW_GAP
             for field in self.node.fields
         )
         return ROW_TOP + content_height + 10
+
+    def _uses_horizontal_data_row(self) -> bool:
+        canvas = self.view.active_canvas()
+        return bool(canvas and canvas.is_data_canvas() and canvas.data_layout == "horizontal")
+
+    def _horizontal_data_segments(self) -> list[tuple[NodeField, float, float]]:
+        name_metrics = QFontMetrics(_font(8, True))
+        value_metrics = QFontMetrics(_font(9))
+        segments: list[tuple[NodeField, float, float]] = []
+        for field in self.node.fields:
+            label_w = min(140.0, max(46.0, float(name_metrics.horizontalAdvance(field.name) + 4)))
+            value_w = min(360.0, max(44.0, float(value_metrics.horizontalAdvance(self._horizontal_field_value(field) or " ") + 6)))
+            segment_w = max(140.0, min(320.0, label_w + value_w + 28.0))
+            segments.append((field, label_w, segment_w))
+        return segments
+
+    def _horizontal_field_value(self, field: NodeField) -> str:
+        if field.data_type == "图片":
+            path = field.image_path.replace("\\", "/").rsplit("/", 1)[-1]
+            return path or "图片"
+        return field.value or " "
 
     def _row_column_widths(self) -> tuple[float, float]:
         name_metrics = QFontMetrics(_font(9, True))
@@ -812,9 +915,14 @@ class NodeGraphView(QGraphicsView):
     edgeCreated = Signal(str, str)
     createNodeRequested = Signal(float, float)
     createCanvasNodeRequested = Signal(float, float)
+    createDataCanvasRequested = Signal(float, float)
     createLinkNodeRequested = Signal(float, float, str)
     createGroupRequested = Signal(float, float)
     createTemplateNodeRequested = Signal(float, float, str)
+    dataCanvasLayoutRequested = Signal(str)
+    dataCanvasGridRowsRequested = Signal(int)
+    dataCanvasTemplateRequested = Signal(str)
+    dataCanvasImportRequested = Signal()
     templateManagerRequested = Signal()
     openProjectRequested = Signal()
 
@@ -863,6 +971,9 @@ class NodeGraphView(QGraphicsView):
         self._interaction_preview_timer = QTimer(self)
         self._interaction_preview_timer.setSingleShot(True)
         self._interaction_preview_timer.timeout.connect(self._end_interaction_preview)
+        self._cursor_sync_timer = QTimer(self)
+        self._cursor_sync_timer.setSingleShot(True)
+        self._cursor_sync_timer.timeout.connect(self._apply_scheduled_cursor_sync)
         self._source_pixmap_cache: OrderedDict[str, QPixmap | None] = OrderedDict()
         self._scaled_pixmap_cache: OrderedDict[tuple[str, int, int], QPixmap | None] = OrderedDict()
 
@@ -885,7 +996,21 @@ class NodeGraphView(QGraphicsView):
         return not self.read_only or self.allow_node_drag
 
     def can_resize_nodes(self) -> bool:
+        if self.is_data_canvas():
+            return False
         return self.can_move_nodes()
+
+    def can_move_groups(self) -> bool:
+        if self.is_data_canvas():
+            return False
+        return self.can_move_nodes()
+
+    def active_canvas(self) -> CanvasData | None:
+        return self.project if isinstance(self.project, CanvasData) else None
+
+    def is_data_canvas(self) -> bool:
+        canvas = self.active_canvas()
+        return bool(canvas and canvas.is_data_canvas())
 
     def eventFilter(self, _watched, event) -> bool:  # type: ignore[override]
         if event.type() in (QEvent.ApplicationDeactivate, QEvent.WindowDeactivate):
@@ -912,6 +1037,20 @@ class NodeGraphView(QGraphicsView):
         event.accept()
         return True
 
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        self._schedule_cursor_sync()
+
+    def focusInEvent(self, event) -> None:  # type: ignore[override]
+        super().focusInEvent(event)
+        self._schedule_cursor_sync()
+
+    def viewportEvent(self, event) -> bool:  # type: ignore[override]
+        handled = super().viewportEvent(event)
+        if event.type() in (QEvent.Enter, QEvent.Show, QEvent.FocusIn):
+            self._schedule_cursor_sync()
+        return handled
+
     def _should_handle_space_pan(self) -> bool:
         if QApplication.activeModalWidget():
             return False
@@ -936,6 +1075,15 @@ class NodeGraphView(QGraphicsView):
         self.hover_node_id = None
         self._refresh_interaction_cursor()
         self.viewport().update()
+
+    def _schedule_cursor_sync(self) -> None:
+        if not self._cursor_sync_timer.isActive():
+            self._cursor_sync_timer.start(0)
+
+    def _apply_scheduled_cursor_sync(self) -> None:
+        if not self.isVisible():
+            return
+        self.sync_interaction_cursor()
 
     def _set_pan_cursor(self, shape: Qt.CursorShape) -> None:
         cursor = QCursor(shape)
@@ -989,6 +1137,13 @@ class NodeGraphView(QGraphicsView):
             self.scene_obj.addItem(item)
             item.setSelected(node.id in self.selected_node_ids)
             self.node_items[node.id] = item
+        if self.is_data_canvas():
+            canvas = self.active_canvas()
+            if canvas is not None and layout_data_canvas(canvas):
+                for node in canvas.nodes:
+                    item = self.node_items.get(node.id)
+                    if item is not None:
+                        item.setPos(node.x, node.y)
         for edge in self.project.valid_edges():
             source = self._endpoint_item(edge.source)
             target = self._endpoint_item(edge.target)
@@ -1001,6 +1156,19 @@ class NodeGraphView(QGraphicsView):
         self._refresh_interaction_cursor()
 
     def _update_scene_rect(self) -> None:
+        if self.is_data_canvas():
+            item_rects = [
+                item.sceneBoundingRect().adjusted(-200, -120, 200, 120)
+                for item in [*self.group_items.values(), *self.node_items.values()]
+            ]
+            if not item_rects:
+                self.scene_obj.setSceneRect(QRectF(-120, -120, 1280, 960))
+                return
+            rect = item_rects[0]
+            for item_rect in item_rects[1:]:
+                rect = rect.united(item_rect)
+            self.scene_obj.setSceneRect(rect)
+            return
         rect = QRectF(-SCENE_EXTENT, -SCENE_EXTENT, SCENE_EXTENT * 2, SCENE_EXTENT * 2)
         for item in self.group_items.values():
             rect = rect.united(item.sceneBoundingRect().adjusted(-SCENE_MARGIN, -SCENE_MARGIN, SCENE_MARGIN, SCENE_MARGIN))
@@ -1018,7 +1186,10 @@ class NodeGraphView(QGraphicsView):
 
     def reset_view(self) -> None:
         self.resetTransform()
-        self.centerOn(0, 0)
+        if self.is_data_canvas():
+            self.centerOn(self.sceneRect().center())
+        else:
+            self.centerOn(0, 0)
         self.viewport().update()
 
     def is_interaction_preview(self) -> bool:
@@ -1222,6 +1393,35 @@ class NodeGraphView(QGraphicsView):
         if changed:
             self.viewport().update()
 
+    def commit_data_canvas_node_reorder(self, node_id: str) -> bool:
+        canvas = self.active_canvas()
+        if canvas is None or not canvas.is_data_canvas():
+            return False
+        node = canvas.find_node(node_id)
+        if node is None:
+            return False
+        changed = reorder_data_canvas_node(canvas, node_id, node.x, node.y)
+        self._sync_data_canvas_items()
+        return changed
+
+    def _sync_data_canvas_items(self) -> None:
+        if not self.is_data_canvas():
+            return
+        self.rebuilding = True
+        try:
+            for node in self.project.nodes:
+                item = self.node_items.get(node.id)
+                if item is None:
+                    continue
+                item.setPos(node.x, node.y)
+                item.update()
+            for edge_item in self.edge_items.values():
+                edge_item.update_path()
+        finally:
+            self.rebuilding = False
+        self._update_scene_rect()
+        self.viewport().update()
+
     def group_id_at_scene_pos(self, point: QPointF) -> str:
         return self._containing_group_id(point)
 
@@ -1236,15 +1436,16 @@ class NodeGraphView(QGraphicsView):
                 best = (area, group_id)
         return best[1] if best else ""
 
-    def snap_position(self, moving: NodeItem, target: QPointF) -> QPointF:
+    def snap_position(self, moving: QGraphicsItem, target: QPointF) -> QPointF:
         scale = max(0.001, self.transform().m11())
         snapped = QPointF(target)
         guides: list[SnapGuide] = []
+        target_rect = self._snap_rect_for_item(moving, target)
 
         x_result = self._best_grid_snap(target.x(), "x", scale)
         y_result = self._best_grid_snap(target.y(), "y", scale)
-        align_x = self._best_align_snap(moving, target, "x", scale)
-        align_y = self._best_align_snap(moving, target, "y", scale)
+        align_x = self._best_align_snap(moving, target_rect, "x", scale)
+        align_y = self._best_align_snap(moving, target_rect, "y", scale)
         if align_x and (not x_result or align_x[1] <= x_result[1]):
             x_result = align_x
         if align_y and (not y_result or align_y[1] <= y_result[1]):
@@ -1271,23 +1472,29 @@ class NodeGraphView(QGraphicsView):
         )
 
     def _best_align_snap(
-        self, moving: NodeItem, target: QPointF, axis: str, scale: float
+        self, moving: QGraphicsItem, target_rect: QRectF, axis: str, scale: float
     ) -> tuple[float, float, SnapGuide] | None:
-        moving_w = moving.width
-        moving_h = moving.height
-        moving_x = {"左": target.x(), "中": target.x() + moving_w / 2, "右": target.x() + moving_w}
-        moving_y = {"上": target.y(), "中": target.y() + moving_h / 2, "下": target.y() + moving_h}
+        moving_values = self._snap_axis_values(target_rect, axis)
         best: tuple[float, float, SnapGuide] | None = None
-        for other in self.node_items.values():
+        for other in self._alignment_targets_for(moving):
             if other is moving:
                 continue
-            other_x = {"左": other.pos().x(), "中": other.pos().x() + other.width / 2, "右": other.pos().x() + other.width}
-            other_y = {"上": other.pos().y(), "中": other.pos().y() + other.height / 2, "下": other.pos().y() + other.height}
+            other_rect = other.sceneBoundingRect()
+            other_values = self._snap_axis_values(other_rect, axis)
             if axis == "x":
-                if self._screen_gap(target.y(), target.y() + moving_h, other.pos().y(), other.pos().y() + other.height, scale) > ALIGN_PROXIMITY:
+                if (
+                    self._screen_gap(
+                        target_rect.top(),
+                        target_rect.bottom(),
+                        other_rect.top(),
+                        other_rect.bottom(),
+                        scale,
+                    )
+                    > ALIGN_PROXIMITY
+                ):
                     continue
-                for moving_label, moving_value in moving_x.items():
-                    for other_label, other_value in other_x.items():
+                for moving_label, moving_value in moving_values.items():
+                    for other_label, other_value in other_values.items():
                         distance = abs(other_value - moving_value) * scale
                         if distance <= ALIGN_SNAP_THRESHOLD:
                             delta = other_value - moving_value
@@ -1295,10 +1502,19 @@ class NodeGraphView(QGraphicsView):
                             if best is None or distance < best[1]:
                                 best = (delta, distance, guide)
             else:
-                if self._screen_gap(target.x(), target.x() + moving_w, other.pos().x(), other.pos().x() + other.width, scale) > ALIGN_PROXIMITY:
+                if (
+                    self._screen_gap(
+                        target_rect.left(),
+                        target_rect.right(),
+                        other_rect.left(),
+                        other_rect.right(),
+                        scale,
+                    )
+                    > ALIGN_PROXIMITY
+                ):
                     continue
-                for moving_label, moving_value in moving_y.items():
-                    for other_label, other_value in other_y.items():
+                for moving_label, moving_value in moving_values.items():
+                    for other_label, other_value in other_values.items():
                         distance = abs(other_value - moving_value) * scale
                         if distance <= ALIGN_SNAP_THRESHOLD:
                             delta = other_value - moving_value
@@ -1306,6 +1522,28 @@ class NodeGraphView(QGraphicsView):
                             if best is None or distance < best[1]:
                                 best = (delta, distance, guide)
         return best
+
+    def _snap_rect_for_item(self, item: QGraphicsItem, target: QPointF) -> QRectF:
+        rect = item.boundingRect()
+        return QRectF(target.x(), target.y(), rect.width(), rect.height())
+
+    def _snap_axis_values(self, rect: QRectF, axis: str) -> dict[str, float]:
+        if axis == "x":
+            return {"左": rect.left(), "中": rect.center().x(), "右": rect.right()}
+        return {"上": rect.top(), "中": rect.center().y(), "下": rect.bottom()}
+
+    def _alignment_targets_for(self, moving: QGraphicsItem) -> list[QGraphicsItem]:
+        if isinstance(moving, NodeItem):
+            return [*self.node_items.values()]
+
+        targets: list[QGraphicsItem] = [*self.node_items.values(), *self.group_items.values()]
+        if isinstance(moving, BlueprintGroupItem):
+            return [
+                item
+                for item in targets
+                if not (isinstance(item, NodeItem) and item.node.group_id == moving.group.id)
+            ]
+        return targets
 
     def _screen_gap(self, start_a: float, end_a: float, start_b: float, end_b: float, scale: float) -> float:
         if end_a < start_b:
@@ -1396,6 +1634,7 @@ class NodeGraphView(QGraphicsView):
         if event.button() == Qt.RightButton:
             self._right_drag_pending = True
             self._right_press_pos = event.position().toPoint()
+            self._refresh_interaction_cursor()
             event.accept()
             return
         if (
@@ -1593,10 +1832,10 @@ class NodeGraphView(QGraphicsView):
             open_link = None
             if node.node.node_type == "画布":
                 open_canvas = menu.addAction("打开画布")
-            elif node.node.node_type == "超链接":
+            elif node.node.node_type == "超文本":
                 open_link = menu.addAction("打开文档")
             edit = menu.addAction("编辑节点")
-            connect = menu.addAction("连接")
+            connect = None if self.is_data_canvas() else menu.addAction("连接")
             menu.addSeparator()
             delete = menu.addAction("删除节点")
             action = menu.exec(global_pos)
@@ -1606,7 +1845,7 @@ class NodeGraphView(QGraphicsView):
                 self.nodeActivated.emit(node.node.id)
             elif action == edit:
                 self.nodeEditRequested.emit(node.node.id)
-            elif action == connect:
+            elif connect and action == connect:
                 self.start_connection(node.node.id)
             elif action == delete:
                 self.nodeDeleteRequested.emit(node.node.id)
@@ -1639,7 +1878,7 @@ class NodeGraphView(QGraphicsView):
         if group_body:
             create_menu, create_actions = self._build_create_menu(menu)
             edit_group = menu.addAction("重命名蓝图组")
-            connect_group = menu.addAction("连接")
+            connect_group = None if self.is_data_canvas() else menu.addAction("连接")
             menu.addSeparator()
             delete_group = menu.addAction("删除蓝图组")
             action = menu.exec(global_pos)
@@ -1647,20 +1886,20 @@ class NodeGraphView(QGraphicsView):
                 return
             if action == edit_group:
                 self.groupEditRequested.emit(group_body.group.id)
-            elif action == connect_group:
+            elif connect_group and action == connect_group:
                 self.start_connection(group_body.group.id)
             elif action == delete_group:
                 self.groupDeleteRequested.emit(group_body.group.id)
             return
         if group:
             edit_group = menu.addAction("重命名蓝图组")
-            connect_group = menu.addAction("连接")
+            connect_group = None if self.is_data_canvas() else menu.addAction("连接")
             menu.addSeparator()
             delete_group = menu.addAction("删除蓝图组")
             action = menu.exec(global_pos)
             if action == edit_group:
                 self.groupEditRequested.emit(group.group.id)
-            elif action == connect_group:
+            elif connect_group and action == connect_group:
                 self.start_connection(group.group.id)
             elif action == delete_group:
                 self.groupDeleteRequested.emit(group.group.id)
@@ -1683,10 +1922,60 @@ class NodeGraphView(QGraphicsView):
 
     def _build_create_menu(self, menu: QMenu) -> tuple[QMenu, dict[str, object]]:
         create_menu = menu.addMenu("创建")
-        create = create_menu.addAction("节点")
+        actions: dict[str, object] = {
+            "create": create_menu.addAction("数据节点" if self.is_data_canvas() else "节点"),
+        }
+        if self.is_data_canvas():
+            layout_menu = menu.addMenu("排序")
+            horizontal = layout_menu.addAction("水平")
+            horizontal.setCheckable(True)
+            horizontal.setChecked(bool(self.active_canvas() and self.active_canvas().data_layout == "horizontal"))
+            grid = layout_menu.addAction("网格")
+            grid.setCheckable(True)
+            grid.setChecked(bool(self.active_canvas() and self.active_canvas().data_layout == "grid"))
+            table = layout_menu.addAction("表格")
+            table.setCheckable(True)
+            table.setChecked(bool(self.active_canvas() and self.active_canvas().data_layout == "table"))
+            grid_rows = layout_menu.addAction(
+                f"网格行数：{self.active_canvas().data_grid_rows or '自动'}"
+                if self.active_canvas()
+                else "网格行数：自动"
+            )
+
+            data_template_menu = menu.addMenu("节点模板")
+            if self.templates:
+                for template in self.templates:
+                    action = QAction(template.name, data_template_menu)
+                    action.setData(template.id)
+                    action.setCheckable(True)
+                    action.setChecked(bool(self.active_canvas() and self.active_canvas().template_id == template.id))
+                    data_template_menu.addAction(action)
+                data_template_menu.addSeparator()
+            else:
+                empty = data_template_menu.addAction("暂无模板")
+                empty.setEnabled(False)
+                data_template_menu.addSeparator()
+            manage_templates = data_template_menu.addAction("管理模板...")
+            import_sheet = menu.addAction("导入 CSV/Excel...")
+            create_group = create_menu.addAction("蓝图组")
+            actions.update(
+                {
+                    "layout_horizontal": horizontal,
+                    "layout_grid": grid,
+                    "layout_table": table,
+                    "grid_rows": grid_rows,
+                    "create_group": create_group,
+                    "import_sheet": import_sheet,
+                    "data_template_menu": data_template_menu,
+                    "manage_templates": manage_templates,
+                }
+            )
+            return create_menu, actions
+
         create_canvas = create_menu.addAction("画布节点")
+        create_data_canvas = create_menu.addAction("数据画布")
         create_group = create_menu.addAction("蓝图组")
-        link_menu = create_menu.addMenu("超链接")
+        link_menu = create_menu.addMenu("超文本")
         create_md = link_menu.addAction("Markdown (.md)")
         create_txt = link_menu.addAction("文本 (.txt)")
         template_menu = create_menu.addMenu("按模板创建")
@@ -1698,32 +1987,71 @@ class NodeGraphView(QGraphicsView):
         else:
             empty = template_menu.addAction("暂无模板")
             empty.setEnabled(False)
-        return create_menu, {
-            "create": create,
-            "create_canvas": create_canvas,
-            "create_group": create_group,
-            "create_md": create_md,
-            "create_txt": create_txt,
-            "template_menu": template_menu,
-        }
+        actions.update(
+            {
+                "create_canvas": create_canvas,
+                "create_data_canvas": create_data_canvas,
+                "create_group": create_group,
+                "create_md": create_md,
+                "create_txt": create_txt,
+                "template_menu": template_menu,
+            }
+        )
+        return create_menu, actions
 
     def _handle_create_action(self, action, create_actions: dict[str, object], scene_pos: QPointF) -> bool:
         if action == create_actions["create"]:
             self.createNodeRequested.emit(scene_pos.x(), scene_pos.y())
             return True
-        if action == create_actions["create_canvas"]:
+        if action == create_actions.get("create_canvas"):
             self.createCanvasNodeRequested.emit(scene_pos.x(), scene_pos.y())
             return True
-        if action == create_actions["create_group"]:
+        if action == create_actions.get("create_data_canvas"):
+            self.createDataCanvasRequested.emit(scene_pos.x(), scene_pos.y())
+            return True
+        if action == create_actions.get("create_group"):
             self.createGroupRequested.emit(scene_pos.x(), scene_pos.y())
             return True
-        if action == create_actions["create_md"]:
+        if action == create_actions.get("create_md"):
             self.createLinkNodeRequested.emit(scene_pos.x(), scene_pos.y(), "md")
             return True
-        if action == create_actions["create_txt"]:
+        if action == create_actions.get("create_txt"):
             self.createLinkNodeRequested.emit(scene_pos.x(), scene_pos.y(), "txt")
             return True
-        template_menu = create_actions["template_menu"]
+        if action == create_actions.get("layout_horizontal"):
+            self.dataCanvasLayoutRequested.emit("horizontal")
+            return True
+        if action == create_actions.get("layout_grid"):
+            self.dataCanvasLayoutRequested.emit("grid")
+            return True
+        if action == create_actions.get("layout_table"):
+            self.dataCanvasLayoutRequested.emit("table")
+            return True
+        if action == create_actions.get("grid_rows"):
+            current = self.active_canvas().data_grid_rows if self.active_canvas() else 0
+            rows, ok = QInputDialog.getInt(
+                self,
+                "网格行数",
+                "每列行数（0 为自动）",
+                current,
+                0,
+                999,
+                1,
+            )
+            if ok:
+                self.dataCanvasGridRowsRequested.emit(rows)
+            return True
+        if action == create_actions.get("import_sheet"):
+            self.dataCanvasImportRequested.emit()
+            return True
+        if action == create_actions.get("manage_templates"):
+            self.templateManagerRequested.emit()
+            return True
+        data_template_menu = create_actions.get("data_template_menu")
+        if action and data_template_menu and action.parent() is data_template_menu and action.data():
+            self.dataCanvasTemplateRequested.emit(str(action.data()))
+            return True
+        template_menu = create_actions.get("template_menu")
         if action and action.parent() is template_menu and action.data():
             self.createTemplateNodeRequested.emit(scene_pos.x(), scene_pos.y(), str(action.data()))
             return True

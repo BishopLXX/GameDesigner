@@ -6,10 +6,12 @@ from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
 
 from gamedesigner.app import GameDesignerApp
-from gamedesigner.models import BlueprintGroup, Node, NodeField, ProjectData
+from gamedesigner.canvas_io import import_canvas_sheet
+from gamedesigner.qt_dialogs import NodeEditorDialog
+from gamedesigner.models import BlueprintGroup, Node, NodeField, NodeTemplate, ProjectData
 from gamedesigner.storage import AppSettings, load_project, save_project, save_settings
 from gamedesigner.ui.link_document_dialog import LinkDocumentDialog
 
@@ -67,6 +69,373 @@ class AppEditingTests(unittest.TestCase):
 
         created = project.root_canvas().nodes[-1]
         self.assertEqual(created.group_id, group.id)
+        window.deleteLater()
+
+    def test_add_data_canvas_creates_templated_child_canvas(self) -> None:
+        window = GameDesignerApp()
+        template = NodeTemplate(name="数据模板", fields=[NodeField("名称", "文本", "数据项")])
+        project = ProjectData(name="数据画布测试", templates=[template])
+        project.ensure_canvas_structure()
+        page = window._add_page(project, None, dirty=False, canvas_data=project.root_canvas())
+        window.tabs.setCurrentWidget(page)
+        page.active_template_id = template.id
+
+        window._add_data_canvas_node_at(260, 180)
+
+        node = project.root_canvas().nodes[-1]
+        canvas = project.find_canvas(node.canvas_id)
+        self.assertIsNotNone(canvas)
+        self.assertEqual(node.node_type, "画布")
+        self.assertEqual(node.icon, "数")
+        self.assertEqual(canvas.canvas_type, "data")
+        self.assertEqual(canvas.data_layout, "grid")
+        self.assertEqual(canvas.template_id, template.id)
+        window.deleteLater()
+
+    def test_add_node_in_data_canvas_uses_canvas_template_and_forces_lock(self) -> None:
+        window = GameDesignerApp()
+        title_field = NodeField("名称", "文本", "条目")
+        template = NodeTemplate(
+            name="数据模板",
+            icon="数",
+            title_field_id=title_field.id,
+            fields=[title_field, NodeField("数值", "整数", "0")],
+        )
+        project = ProjectData(name="数据项测试", templates=[template])
+        project.ensure_canvas_structure()
+        data_canvas = project.add_canvas(
+            "数据画布",
+            canvas_type="data",
+            data_layout="horizontal",
+            template_id=template.id,
+            parent_canvas_id=project.root_canvas_id,
+            parent_node_id="node_parent",
+        )
+        page = window._add_page(project, None, dirty=False, canvas_data=data_canvas)
+        window.tabs.setCurrentWidget(page)
+
+        window._add_node_at(200, 160)
+        window._add_node_at(320, 240)
+
+        self.assertEqual(len(data_canvas.nodes), 2)
+        self.assertTrue(all(node.template_locked for node in data_canvas.nodes))
+        self.assertTrue(all(node.template_id == template.id for node in data_canvas.nodes))
+        self.assertTrue(all(node.node_type == "普通" for node in data_canvas.nodes))
+        self.assertEqual(data_canvas.nodes[0].x, data_canvas.nodes[1].x)
+        self.assertLess(data_canvas.nodes[0].y, data_canvas.nodes[1].y)
+        window.deleteLater()
+
+    def test_data_canvas_table_mode_refreshes_page_view(self) -> None:
+        window = GameDesignerApp()
+        template = NodeTemplate(name="数据模板", fields=[NodeField("名称", "文本", "条目")])
+        project = ProjectData(name="表格模式测试", templates=[template])
+        project.ensure_canvas_structure()
+        data_canvas = project.add_canvas(
+            "排序画布",
+            canvas_type="data",
+            data_layout="table",
+            template_id=template.id,
+            parent_canvas_id=project.root_canvas_id,
+            parent_node_id="node_parent",
+        )
+        data_canvas.add_node(template.create_node(0, 0))
+        page = window._add_page(project, None, dirty=False, canvas_data=data_canvas)
+        window.tabs.setCurrentWidget(page)
+        page.show()
+        window.show()
+        self.app.processEvents()
+
+        page.refresh_canvas_mode()
+
+        self.assertFalse(page.canvas.isVisible())
+        self.assertFalse(page.table_view.isHidden())
+        self.assertTrue(page.function_bar.isVisible())
+        self.assertTrue(page.table_layout_button.isVisible())
+        self.assertTrue(page.table_layout_button.isChecked())
+        self.assertEqual(page.table_view.rowCount(), 1)
+        self.assertEqual(page.table_view.columnCount(), 1)
+        window.deleteLater()
+
+    def test_normal_canvas_function_bar_shows_reset_only(self) -> None:
+        window = GameDesignerApp()
+        project = ProjectData(name="自由画布功能栏")
+        project.ensure_canvas_structure()
+        page = window._add_page(project, None, dirty=False, canvas_data=project.root_canvas())
+        window.tabs.setCurrentWidget(page)
+        page.show()
+        window.show()
+        self.app.processEvents()
+
+        page.refresh_canvas_mode()
+
+        self.assertTrue(page.function_bar.isVisible())
+        self.assertTrue(page.reset_view_button.isVisible())
+        self.assertFalse(page.horizontal_layout_button.isVisible())
+        self.assertFalse(page.grid_layout_button.isVisible())
+        self.assertFalse(page.table_layout_button.isVisible())
+        self.assertFalse(page.grid_rows_spin.isVisible())
+        window.deleteLater()
+
+    def test_data_canvas_function_bar_switches_layout_and_rows(self) -> None:
+        window = GameDesignerApp()
+        template = NodeTemplate(name="数据模板", fields=[NodeField("名称", "文本", "条目")])
+        project = ProjectData(name="排序画布功能栏", templates=[template])
+        project.ensure_canvas_structure()
+        data_canvas = project.add_canvas(
+            "排序画布",
+            canvas_type="data",
+            data_layout="grid",
+            data_grid_rows=3,
+            template_id=template.id,
+            parent_canvas_id=project.root_canvas_id,
+            parent_node_id="node_parent",
+        )
+        page = window._add_page(project, None, dirty=False, canvas_data=data_canvas)
+        window.tabs.setCurrentWidget(page)
+        page.show()
+        window.show()
+        self.app.processEvents()
+
+        page.refresh_canvas_mode()
+
+        self.assertTrue(page.horizontal_layout_button.isVisible())
+        self.assertTrue(page.grid_layout_button.isVisible())
+        self.assertTrue(page.table_layout_button.isVisible())
+        self.assertTrue(page.grid_layout_button.isChecked())
+        self.assertTrue(page.grid_rows_spin.isVisible())
+        self.assertEqual(page.grid_rows_spin.value(), 3)
+
+        page.table_layout_button.click()
+        self.app.processEvents()
+        self.assertEqual(data_canvas.data_layout, "table")
+        self.assertFalse(page.canvas.isVisible())
+        self.assertTrue(page.table_view.isVisible())
+
+        page.horizontal_layout_button.click()
+        self.app.processEvents()
+        self.assertEqual(data_canvas.data_layout, "horizontal")
+        self.assertTrue(page.canvas.isVisible())
+        self.assertFalse(page.table_view.isVisible())
+
+        page.grid_layout_button.click()
+        self.app.processEvents()
+        self.assertEqual(data_canvas.data_layout, "grid")
+        page.grid_rows_spin.setValue(5)
+        self.app.processEvents()
+        self.assertEqual(data_canvas.data_grid_rows, 5)
+        window.deleteLater()
+
+    def test_import_canvas_sheet_marks_project_dirty_and_refreshes_table(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            csv_path = Path(folder) / "rows.csv"
+            csv_path.write_text("名称,数值\nA,1\nB,2\n", encoding="utf-8")
+
+            window = GameDesignerApp()
+            project = ProjectData(name="导入刷新测试")
+            project.ensure_canvas_structure()
+            data_canvas = project.add_canvas(
+                "排序画布",
+                canvas_type="data",
+                data_layout="table",
+                parent_canvas_id=project.root_canvas_id,
+                parent_node_id="node_parent",
+            )
+            page = window._add_page(project, None, dirty=False, canvas_data=data_canvas)
+            window.tabs.setCurrentWidget(page)
+
+            import_canvas_sheet(project, data_canvas, csv_path)
+            window._refresh_project_views(project)
+
+            self.assertEqual(page.table_view.rowCount(), 2)
+            self.assertEqual(page.table_view.columnCount(), 2)
+            self.assertEqual(page.table_view.item(0, 0).text(), "A")
+            self.assertEqual(page.table_view.item(1, 1).text(), "2")
+            window.deleteLater()
+
+    def test_export_canvas_csv_dialog_collects_per_canvas_folder(self) -> None:
+        from gamedesigner.qt_dialogs import ExportCanvasCsvDialog
+
+        project = ProjectData(name="导出目录测试")
+        project.ensure_canvas_structure()
+        root = project.root_canvas()
+        link = root.add_node(Node(title="自由画布", node_type="画布"))
+        child = project.add_canvas("自由画布", parent_canvas_id=root.id, parent_node_id=link.id)
+        link.canvas_id = child.id
+
+        dialog = ExportCanvasCsvDialog(None, project, "D:/default")
+        checkbox, combo, folder_edit = dialog._canvas_rows[child.id]
+        self.assertIn("自由画布", checkbox.text())
+        folder_edit.setText("D:/custom")
+        dialog._accept()
+
+        self.assertIsNotNone(dialog.result_data)
+        specs = dialog.result_data["canvas_specs"]
+        child_spec = next(spec for spec in specs if spec.canvas_id == child.id)
+        self.assertEqual(child_spec.target_folder, "D:/custom")
+        dialog.deleteLater()
+
+    def test_convert_canvas_type_switches_between_normal_and_data(self) -> None:
+        window = GameDesignerApp()
+        project = ProjectData(name="转换测试")
+        project.ensure_canvas_structure()
+        canvas = project.root_canvas()
+        canvas.add_node(Node(title="节点A"))
+        page = window._add_page(project, None, dirty=False, canvas_data=canvas)
+        window.tabs.setCurrentWidget(page)
+
+        with mock.patch("gamedesigner.app.QMessageBox.question", return_value=QMessageBox.Yes):
+            window._convert_current_canvas_type("data")
+            self.assertEqual(canvas.canvas_type, "data")
+            window._convert_current_canvas_type("normal")
+            self.assertEqual(canvas.canvas_type, "normal")
+        window.deleteLater()
+
+    def test_sync_project_templates_updates_locked_nodes_only(self) -> None:
+        window = GameDesignerApp()
+        title_field = NodeField("名称", "文本", "默认名称")
+        template = NodeTemplate(
+            name="通用模板",
+            color="#AACCEE",
+            icon="模",
+            title_field_id=title_field.id,
+            fields=[title_field, NodeField("说明", "文本", "默认说明")],
+        )
+        project = ProjectData(name="模板同步测试", templates=[template])
+        project.ensure_canvas_structure()
+        canvas = project.root_canvas()
+
+        locked = template.create_node(0, 0)
+        locked.template_locked = True
+        locked.fields[0].value = "锁定节点"
+        unlocked = template.create_node(0, 0)
+        unlocked.template_locked = False
+        unlocked.fields[0].value = "未锁定节点"
+        canvas.add_node(locked)
+        canvas.add_node(unlocked)
+
+        template.color = "#334455"
+        template.icon = "新"
+        template.fields[0].name = "主名称"
+        template.fields.append(NodeField("新增字段", "文本", "默认新增"))
+
+        window._sync_project_templates(project)
+
+        self.assertEqual(locked.color, "#334455")
+        self.assertEqual(locked.icon, "新")
+        self.assertEqual(locked.fields[0].name, "主名称")
+        self.assertEqual(locked.fields[0].value, "锁定节点")
+        self.assertEqual(len(locked.fields), 3)
+        self.assertEqual(unlocked.color, "#AACCEE")
+        self.assertEqual(unlocked.icon, "模")
+        self.assertEqual(unlocked.fields[0].name, "名称")
+        self.assertEqual(len(unlocked.fields), 2)
+        window.deleteLater()
+
+    def test_free_canvas_locked_template_can_unlock_and_restore_template_buttons(self) -> None:
+        template = NodeTemplate(name="通用模板", fields=[NodeField("名称", "文本", "条目")])
+        node = template.create_node(0, 0)
+        node.template_locked = True
+
+        dialog = NodeEditorDialog(None, node, templates=[template])
+
+        self.assertTrue(dialog.template_lock_button.isChecked())
+        self.assertIsNotNone(dialog.import_template_button)
+        self.assertIsNotNone(dialog.save_template_button)
+        self.assertTrue(dialog.import_template_button.isHidden())
+        self.assertTrue(dialog.save_template_button.isHidden())
+
+        dialog.template_lock_button.click()
+
+        self.assertFalse(dialog.template_lock_button.isChecked())
+        self.assertFalse(dialog.import_template_button.isHidden())
+        self.assertFalse(dialog.save_template_button.isHidden())
+        dialog.deleteLater()
+
+    def test_edit_data_canvas_node_updates_canvas_template_and_syncs_all_nodes(self) -> None:
+        window = GameDesignerApp()
+        title_field = NodeField("名称", "文本", "条目")
+        template = NodeTemplate(
+            name="数据模板",
+            icon="数",
+            title_field_id=title_field.id,
+            fields=[title_field, NodeField("说明", "长文本", "默认说明")],
+        )
+        project = ProjectData(name="数据模板同步", templates=[template])
+        project.ensure_canvas_structure()
+        data_canvas = project.add_canvas(
+            "排序画布",
+            canvas_type="data",
+            data_layout="horizontal",
+            template_id=template.id,
+            parent_canvas_id=project.root_canvas_id,
+            parent_node_id="node_parent",
+        )
+        first = template.create_node(0, 0)
+        first.fields[0].value = "第一项"
+        second = template.create_node(0, 0)
+        second.fields[0].value = "第二项"
+        data_canvas.add_node(first)
+        data_canvas.add_node(second)
+        page = window._add_page(project, None, dirty=False, canvas_data=data_canvas)
+        window.tabs.setCurrentWidget(page)
+
+        updated = Node(
+            id=first.id,
+            title="新模板标题",
+            node_type="普通",
+            color="#CCE4FF",
+            icon="新",
+            icon_from_title=False,
+            title_field_id=first.fields[0].id,
+            template_id=template.id,
+            template_locked=True,
+            fields=[
+                NodeField(
+                    id=first.fields[0].id,
+                    name="名称",
+                    data_type="文本",
+                    value="第一项",
+                    x=20,
+                    y=18,
+                    width=340,
+                    height=78,
+                ),
+                NodeField(
+                    name="职业",
+                    data_type="文本",
+                    value="策划",
+                    x=20,
+                    y=108,
+                    width=340,
+                    height=78,
+                ),
+            ],
+        )
+
+        class _FakeDialog:
+            Accepted = 1
+
+            def __init__(self, *_args, **_kwargs) -> None:
+                self.result = updated
+                self.templates_changed = False
+                self.templates_result = None
+
+            def exec(self) -> int:
+                return self.Accepted
+
+        with mock.patch("gamedesigner.qt_dialogs.NodeEditorDialog", _FakeDialog):
+            window._edit_node(first.id)
+
+        synced_template = project.find_template(template.id)
+        self.assertIsNotNone(synced_template)
+        self.assertEqual(synced_template.icon, "新")
+        self.assertEqual(synced_template.color, "#CCE4FF")
+        self.assertEqual([field.name for field in synced_template.fields], ["名称", "职业"])
+        self.assertTrue(all(node.template_locked for node in data_canvas.nodes))
+        self.assertEqual([field.name for field in data_canvas.nodes[0].fields], ["名称", "职业"])
+        self.assertEqual([field.name for field in data_canvas.nodes[1].fields], ["名称", "职业"])
+        self.assertEqual(data_canvas.nodes[0].fields[0].value, "第一项")
+        self.assertEqual(data_canvas.nodes[1].fields[0].value, "第二项")
         window.deleteLater()
 
     def test_delete_canvas_branch_closes_canvas_tabs(self) -> None:
@@ -305,6 +674,62 @@ class AppEditingTests(unittest.TestCase):
             self.assertEqual(dialog.relative_path, "linked_docs/预览文档.md")
             self.assertTrue((project_path.parent / f"{project_path.name}.files" / "linked_docs" / "预览文档.md").exists())
             dialog.deleteLater()
+
+    def test_link_document_dialog_restores_saved_window_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            tmp_path = Path(folder)
+            project_path = tmp_path / "LayoutProject.gdc"
+            settings = AppSettings(
+                workspace_dir=folder,
+                export_dir=str(tmp_path / "exports"),
+                window_layouts={
+                    "link_document_dialog": {"x": 80, "y": 96, "width": 980, "height": 640},
+                },
+            )
+            parent = QWidget()
+            parent.settings = settings  # type: ignore[attr-defined]
+            with mock.patch.dict(os.environ, {"APPDATA": folder}):
+                dialog = LinkDocumentDialog(parent, project_path, "", "布局文档", "md")
+                self.assertEqual(dialog.width(), 980)
+                self.assertEqual(dialog.height(), 640)
+
+                dialog.resize(1040, 720)
+                dialog.done(0)
+
+                self.assertEqual(settings.window_layouts["link_document_dialog"]["width"], 1040.0)
+                self.assertEqual(settings.window_layouts["link_document_dialog"]["height"], 720.0)
+
+                reopened = LinkDocumentDialog(parent, project_path, "", "布局文档", "md")
+                self.assertEqual(reopened.width(), 1040)
+                self.assertEqual(reopened.height(), 720)
+                reopened.deleteLater()
+            dialog.deleteLater()
+            parent.deleteLater()
+
+    def test_main_window_restores_saved_window_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            tmp_path = Path(folder)
+            settings = AppSettings(
+                workspace_dir=folder,
+                export_dir=str(tmp_path / "exports"),
+                window_layouts={
+                    "main_window": {"x": 64, "y": 72, "width": 1480, "height": 920},
+                },
+            )
+            with mock.patch.dict(os.environ, {"APPDATA": folder}):
+                save_settings(settings)
+
+                window = GameDesignerApp()
+                self.assertEqual(window.width(), 1480)
+                self.assertEqual(window.height(), 920)
+
+                window.resize(1520, 960)
+                window.close()
+
+                reopened = GameDesignerApp()
+                self.assertEqual(reopened.width(), 1520)
+                self.assertEqual(reopened.height(), 960)
+                reopened.deleteLater()
 
 
 if __name__ == "__main__":
