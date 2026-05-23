@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from PySide6.QtCore import QByteArray
 from PySide6.QtWidgets import QWidget
 
 from .storage import AppSettings, save_settings
@@ -12,11 +13,18 @@ def restore_window_layout(widget: QWidget, key: str) -> None:
     layout = settings.window_layouts.get(key)
     if not layout:
         return
+    geometry = str(layout.get("geometry") or "")
+    restored_geometry = False
+    if geometry:
+        try:
+            restored_geometry = widget.restoreGeometry(QByteArray.fromBase64(geometry.encode("ascii")))
+        except (TypeError, ValueError):
+            pass
     width = max(180, int(layout.get("width", 0)))
     height = max(120, int(layout.get("height", 0)))
     if width > 0 and height > 0:
         widget.resize(width, height)
-    if "x" in layout and "y" in layout:
+    if "x" in layout and "y" in layout and not restored_geometry:
         widget.move(int(layout["x"]), int(layout["y"]))
 
 
@@ -30,6 +38,7 @@ def save_window_layout(widget: QWidget, key: str, *, persist: bool = True) -> No
         "y": float(geometry.y()),
         "width": float(geometry.width()),
         "height": float(geometry.height()),
+        "geometry": bytes(widget.saveGeometry().toBase64()).decode("ascii"),
     }
     if persist:
         save_settings(settings)

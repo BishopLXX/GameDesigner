@@ -424,6 +424,18 @@ class AppEditingTests(unittest.TestCase):
         self.assertTrue(dialog.result.fields[0].show_label)
         dialog.deleteLater()
 
+    def test_node_editor_canvas_resize_sets_node_size(self) -> None:
+        node = Node(title="模块", fields=[NodeField("名称", "文本", "攻击模块", x=20, y=18, width=180, height=40)])
+        dialog = NodeEditorDialog(None, node, templates=[])
+
+        dialog.canvas._on_frame_resized(640, 360)
+        dialog._accept()
+
+        self.assertIsNotNone(dialog.result)
+        self.assertEqual(dialog.result.width, 640)
+        self.assertEqual(dialog.result.height, 360)
+        dialog.deleteLater()
+
     def test_edit_data_canvas_node_updates_canvas_template_and_syncs_all_nodes(self) -> None:
         window = GameDesignerApp()
         title_field = NodeField("名称", "文本", "条目")

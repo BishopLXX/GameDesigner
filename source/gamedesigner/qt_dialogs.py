@@ -465,7 +465,9 @@ def _draw_field_display_text(
     painter.drawText(rect, _field_text_flags(field), text)
 
 
-class NodeFrameItem(QGraphicsItem):
+class NodeFrameItem(QGraphicsObject):
+    resized = Signal(float, float)
+
     def __init__(
         self,
         title: str,
@@ -482,7 +484,11 @@ class NodeFrameItem(QGraphicsItem):
         self.height = height
         self.theme = theme
         self.node_color = node_color
+        self._resizing = False
+        self._press_pos = QPointF()
+        self._origin_size = (width, height)
         self.setZValue(-10)
+        self.setAcceptHoverEvents(True)
 
     def boundingRect(self) -> QRectF:
         return QRectF(0, 0, self.width, self.height)
@@ -509,6 +515,50 @@ class NodeFrameItem(QGraphicsItem):
         font.setBold(True)
         painter.setFont(font)
         painter.drawText(QRectF(18, 26, rect.width() - 36, 22), Qt.AlignVCenter | Qt.AlignLeft, title)
+        painter.setPen(QPen(QColor(colors["blue"]), 1.4))
+        for offset in (6, 11, 16):
+            painter.drawLine(
+                QPointF(rect.right() - offset, rect.bottom() - 4),
+                QPointF(rect.right() - 4, rect.bottom() - offset),
+            )
+
+    def hoverMoveEvent(self, event) -> None:  # type: ignore[override]
+        self.setCursor(Qt.SizeFDiagCursor if self._on_handle(event.pos()) else Qt.ArrowCursor)
+        super().hoverMoveEvent(event)
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.LeftButton and self._on_handle(event.pos()):
+            self._resizing = True
+            self._press_pos = event.scenePos()
+            self._origin_size = (self.width, self.height)
+            self.setCursor(Qt.SizeFDiagCursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
+        if self._resizing:
+            delta = event.scenePos() - self._press_pos
+            self.prepareGeometryChange()
+            self.width = max(220.0, self._origin_size[0] + delta.x())
+            self.height = max(140.0, self._origin_size[1] + delta.y())
+            self.resized.emit(self.width, self.height)
+            self.update()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        if self._resizing:
+            self._resizing = False
+            self.resized.emit(self.width, self.height)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def _on_handle(self, pos: QPointF) -> bool:
+        rect = self.boundingRect()
+        return pos.x() >= rect.right() - FIELD_HANDLE and pos.y() >= rect.bottom() - FIELD_HANDLE
 
 
 class EditorFieldItem(QGraphicsObject):
@@ -649,14 +699,24 @@ class FieldCanvas(QGraphicsView):
     fieldActivated = Signal(int)
     fieldContentEdited = Signal(int)
     fieldChanged = Signal()
+    nodeSizeChanged = Signal(float, float)
     cardAddRequested = Signal(str, float, float)
     cardDeleteRequested = Signal(int)
 
-    def __init__(self, fields: list[NodeField], theme: str, project_path: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        fields: list[NodeField],
+        theme: str,
+        project_path: str | Path | None = None,
+        node_width: float = 0.0,
+        node_height: float = 0.0,
+    ) -> None:
         super().__init__()
         self.fields = fields
         self.theme = theme
         self.project_path = Path(project_path) if project_path else None
+        self.node_width = max(0.0, float(node_width))
+        self.node_height = max(0.0, float(node_height))
         self.title = ""
         self.icon = ""
         self.node_color = "#FFFFFF"
@@ -714,6 +774,7 @@ class FieldCanvas(QGraphicsView):
         self.selected_index = selected_index if selected_index is not None else self.selected_index
         width, height = self._card_size()
         frame = NodeFrameItem(self.title, self.icon, width, height, self.theme, self.node_color)
+        frame.resized.connect(self._on_frame_resized)
         self.scene_obj.addItem(frame)
         for index, field in enumerate(self.fields):
             item = EditorFieldItem(index, field, self.theme, self.project_path)
@@ -723,6 +784,12 @@ class FieldCanvas(QGraphicsView):
             item.setSelected(index == self.selected_index)
             self.scene_obj.addItem(item)
         self.scene_obj.setSceneRect(QRectF(-80, -80, width + 160, height + 160))
+
+    def _on_frame_resized(self, width: float, height: float) -> None:
+        self.node_width = max(220.0, float(width))
+        self.node_height = max(140.0, float(height))
+        self.scene_obj.setSceneRect(QRectF(-80, -80, self.node_width + 160, self.node_height + 160))
+        self.nodeSizeChanged.emit(self.node_width, self.node_height)
 
     def wheelEvent(self, event) -> None:  # type: ignore[override]
         factor = 1.12 if event.angleDelta().y() > 0 else 1 / 1.12
@@ -872,9 +939,11 @@ class FieldCanvas(QGraphicsView):
         return None
 
     def _card_size(self) -> tuple[float, float]:
-        width = max([field.x + field.width + 24 for field in self.fields] + [430])
-        height = max([HEADER_HEIGHT + field.y + field.height + 24 for field in self.fields] + [300])
-        return max(430.0, width), max(300.0, height)
+        natural_width = max([field.x + field.width + 24 for field in self.fields] + [430])
+        natural_height = max([HEADER_HEIGHT + field.y + field.height + 24 for field in self.fields] + [300])
+        if self.node_width > 0 and self.node_height > 0:
+            return max(220.0, self.node_width), max(140.0, self.node_height)
+        return max(430.0, natural_width), max(300.0, natural_height)
 
 
 class NodeEditorDialog(QDialog):
@@ -982,7 +1051,7 @@ class NodeEditorDialog(QDialog):
         self.v_align_buttons: dict[str, QToolButton] = {}
         self.pin_buttons: dict[str, QToolButton] = {}
 
-        self.canvas = FieldCanvas(self.fields, theme, self.project_path)
+        self.canvas = FieldCanvas(self.fields, theme, self.project_path, self._width, self._height)
         self._sync_title_from_field()
         self._sync_icon_from_title()
         self.canvas.set_header(self.title_edit.text(), self._display_icon(), self.color_edit.text())
@@ -990,6 +1059,7 @@ class NodeEditorDialog(QDialog):
         self.canvas.fieldActivated.connect(self._focus_field_value)
         self.canvas.fieldContentEdited.connect(self._on_canvas_field_content_edited)
         self.canvas.fieldChanged.connect(self._on_field_changed)
+        self.canvas.nodeSizeChanged.connect(self._on_canvas_node_size_changed)
         self.canvas.cardAddRequested.connect(self._add_card_at)
         self.canvas.cardDeleteRequested.connect(self._delete_card_at)
 
@@ -1008,11 +1078,35 @@ class NodeEditorDialog(QDialog):
         layout.setContentsMargins(14, 14, 14, 14)
         layout.addWidget(splitter, 1)
         layout.addWidget(buttons)
+        self._restoring_window_layout = True
+        self._layout_save_timer = QTimer(self)
+        self._layout_save_timer.setSingleShot(True)
+        self._layout_save_timer.timeout.connect(lambda: save_window_layout(self, "node_editor_dialog"))
         self.resize(1160, 760)
         restore_window_layout(self, "node_editor_dialog")
+        QTimer.singleShot(0, lambda: setattr(self, "_restoring_window_layout", False))
         self._connect_changes()
         self._update_template_lock_controls()
         self._load_selected_props(self.canvas.selected_index if self.canvas.selected_index is not None else -1)
+
+    def moveEvent(self, event) -> None:  # type: ignore[override]
+        super().moveEvent(event)
+        self._schedule_layout_save()
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self._schedule_layout_save()
+
+    def _schedule_layout_save(self) -> None:
+        if getattr(self, "_restoring_window_layout", False) or not self.isVisible():
+            return
+        timer = getattr(self, "_layout_save_timer", None)
+        if isinstance(timer, QTimer):
+            timer.start(350)
+
+    def _on_canvas_node_size_changed(self, width: float, height: float) -> None:
+        self._width = max(0.0, float(width))
+        self._height = max(0.0, float(height))
 
     def _side_panel(self) -> QWidget:
         panel = QWidget()
