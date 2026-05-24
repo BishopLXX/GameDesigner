@@ -121,10 +121,12 @@ class ProjectSettingsDialog(QDialog):
         source_dir: str,
         output_dir: str,
         copy_link_docs_to_source: bool = False,
+        project_path: str | Path | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setModal(True)
+        self.project_path = Path(project_path) if project_path else None
         self.result_data: dict[str, object] | None = None
 
         self.name_edit = QLineEdit(project_name)
@@ -218,10 +220,12 @@ class ExportCanvasCsvDialog(QDialog):
         project: ProjectData,
         default_folder: str,
         default_sort_mode: str = "created",
+        project_path: str | Path | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("导出所有画布 CSV")
         self.setModal(True)
+        self.project_path = Path(project_path) if project_path else None
         self.project = project
         self.result_data: dict[str, object] | None = None
         self._default_sort_mode = (
@@ -2380,10 +2384,17 @@ class NodeEditorDialog(QDialog):
 
 
 class TemplateManagerDialog(QDialog):
-    def __init__(self, parent: QWidget | None, templates: list[NodeTemplate], theme: str = "dark") -> None:
+    def __init__(
+        self,
+        parent: QWidget | None,
+        templates: list[NodeTemplate],
+        theme: str = "dark",
+        project_path: str | Path | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("节点模板")
         self.setModal(True)
+        self.project_path = Path(project_path) if project_path else None
         self.theme = theme
         self.templates = [copy.deepcopy(template) for template in templates]
         self.result: list[NodeTemplate] | None = None

@@ -426,6 +426,7 @@ class GameDesignerApp(QMainWindow):
         self._restoring_history = False
         self._project_histories: dict[int, ProjectHistory] = {}
         self._copied_nodes: list[dict[str, Any]] = []
+        self._copied_groups: list[dict[str, Any]] = []
         self._paste_serial = 0
         self._last_edge_style = self.settings.last_edge_style if self.settings.last_edge_style in EDGE_STYLES else "curve"
         self._report_startup_progress(48, "准备字体和主题...")
@@ -509,13 +510,17 @@ class GameDesignerApp(QMainWindow):
         self.delete_action.setShortcut(QKeySequence.Delete)
         self.delete_action.triggered.connect(self._delete_selected)
 
-        self.copy_action = QAction("复制节点", self)
+        self.copy_action = QAction("复制选中项", self)
         self.copy_action.setShortcut(QKeySequence.Copy)
         self.copy_action.triggered.connect(self._copy_selected_nodes)
 
-        self.paste_action = QAction("粘贴节点", self)
+        self.paste_action = QAction("粘贴选中项", self)
         self.paste_action.setShortcut(QKeySequence.Paste)
         self.paste_action.triggered.connect(self._paste_nodes)
+
+        self.duplicate_action = QAction("复制一份", self)
+        self.duplicate_action.setShortcut(QKeySequence("Ctrl+D"))
+        self.duplicate_action.triggered.connect(self._duplicate_selected)
 
         self.undo_action = QAction("撤销", self)
         self.undo_action.setShortcut(QKeySequence.Undo)
@@ -568,6 +573,7 @@ class GameDesignerApp(QMainWindow):
         self.edit_menu.addSeparator()
         self.edit_menu.addAction(self.copy_action)
         self.edit_menu.addAction(self.paste_action)
+        self.edit_menu.addAction(self.duplicate_action)
         self.edit_menu.addSeparator()
         self.edit_menu.addAction(self.add_node_action)
         self.edit_menu.addAction(self.edit_action)
@@ -1537,6 +1543,7 @@ class GameDesignerApp(QMainWindow):
             page.project.source_dir,
             page.project.output_dir,
             page.project.copy_link_docs_to_source,
+            page.path,
         )
         if dialog.exec() != ProjectSettingsDialog.Accepted or not dialog.result_data:
             return
@@ -1573,6 +1580,7 @@ class GameDesignerApp(QMainWindow):
             page.project,
             str(Path(default_folder)),
             default_sort_mode=sort_mode,
+            project_path=page.path,
         )
         if dialog.exec() != ExportCanvasCsvDialog.Accepted or not dialog.result_data:
             return
@@ -1911,22 +1919,51 @@ class GameDesignerApp(QMainWindow):
         selected_ids = list(page.canvas.selected_node_ids)
         if not selected_ids and page.selected_node_id:
             selected_ids = [page.selected_node_id]
+        selected_group_ids = list(page.canvas.selected_group_ids)
+        selected_groups = [page.canvas_data.find_group(group_id) for group_id in selected_group_ids]
+        copied_groups = [group.to_dict() for group in selected_groups if group is not None]
+        group_node_ids = {
+            node.id
+            for node in page.canvas_data.nodes
+            if node.group_id in selected_group_ids
+        }
+        selected_ids = list(dict.fromkeys([*selected_ids, *group_node_ids]))
         nodes = [page.canvas_data.find_node(node_id) for node_id in selected_ids]
         copied = [node.to_dict() for node in nodes if node is not None]
-        if not copied:
+        if not copied and not copied_groups:
             return
         self._copied_nodes = copied
+        self._copied_groups = copied_groups
         self._paste_serial = 0
-        self.status.showMessage(f"已复制 {len(copied)} 个节点", 2000)
+        if copied_groups and copied:
+            self.status.showMessage(f"已复制 {len(copied_groups)} 个蓝图组和 {len(copied)} 个节点", 2000)
+        elif copied_groups:
+            self.status.showMessage(f"已复制 {len(copied_groups)} 个蓝图组", 2000)
+        else:
+            self.status.showMessage(f"已复制 {len(copied)} 个节点", 2000)
 
     def _paste_nodes(self) -> None:
         page = self._current_page()
-        if not page or page.is_welcome or not self._copied_nodes:
+        if not page or page.is_welcome or (not self._copied_nodes and not self._copied_groups):
             return
         offset = 40.0 * (self._paste_serial + 1)
+        group_id_map: dict[str, str] = {}
+        new_groups: list[BlueprintGroup] = []
+        if not page.canvas_data.is_data_canvas():
+            for raw in self._copied_groups:
+                group = self._clone_group_for_paste(raw, offset)
+                group_id_map[str(raw.get("id") or "")] = group.id
+                new_groups.append(group)
         new_nodes: list[Node] = []
+        forced_group_memberships: dict[str, str] = {}
         for raw in self._copied_nodes:
             node = self._clone_node_for_paste(raw, offset, preserve_field_ids=page.canvas_data.is_data_canvas())
+            source_group_id = str(raw.get("group_id") or "")
+            if source_group_id in group_id_map:
+                node.group_id = group_id_map[source_group_id]
+                forced_group_memberships[node.id] = node.group_id
+            elif page.canvas_data.is_data_canvas():
+                node.group_id = ""
             if node.node_type == "画布":
                 node.canvas_id = ""
                 self._ensure_canvas_node_link(page, node, mark_dirty=False)
@@ -1940,15 +1977,37 @@ class GameDesignerApp(QMainWindow):
                 node.canvas_id = ""
                 node.link_path = ""
             new_nodes.append(node)
+        for group in new_groups:
+            page.canvas_data.add_group(group)
         for node in new_nodes:
             page.canvas_data.add_node(node)
         if page.canvas_data.is_data_canvas():
             self._sync_canvas_state(page)
         self._paste_serial += 1
         page.canvas.rebuild()
-        page.canvas.select_nodes({node.id for node in new_nodes})
+        if new_groups:
+            page.canvas.select_group(new_groups[0].id)
+        elif new_nodes:
+            page.canvas.select_nodes({node.id for node in new_nodes})
         page.canvas.refresh_group_membership()
+        for node in new_nodes:
+            if node.id in forced_group_memberships:
+                node.group_id = forced_group_memberships[node.id]
         self._mark_dirty(page)
+
+    def _duplicate_selected(self) -> None:
+        page = self._current_page()
+        if not page or page.is_welcome:
+            return
+        self._copy_selected_nodes()
+        self._paste_nodes()
+
+    def _clone_group_for_paste(self, raw: dict[str, Any], offset: float) -> BlueprintGroup:
+        group = BlueprintGroup.from_dict(copy.deepcopy(raw))
+        group.id = new_id("group")
+        group.x += offset
+        group.y += offset
+        return group
 
     def _clone_node_for_paste(self, raw: dict[str, Any], offset: float, preserve_field_ids: bool = False) -> Node:
         node = Node.from_dict(copy.deepcopy(raw))
@@ -2304,7 +2363,7 @@ class GameDesignerApp(QMainWindow):
         page = self._current_page()
         if not page or page.is_welcome:
             return
-        dialog = TemplateManagerDialog(self, page.project.templates, self.theme)
+        dialog = TemplateManagerDialog(self, page.project.templates, self.theme, page.path)
         if dialog.exec() != TemplateManagerDialog.Accepted or dialog.result is None:
             return
         for template in dialog.result:

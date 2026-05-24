@@ -15,6 +15,7 @@ LEGACY_PROJECT_SUFFIX = ".gdesigner.json"
 PROJECT_BUNDLE_SUFFIX = ".files"
 CANVASES_DIR = "canvases"
 TEMPLATES_FILE = "templates.json"
+WINDOW_LAYOUTS_FILE = "window_layouts.json"
 
 
 @dataclass
@@ -27,7 +28,7 @@ class AppSettings:
     recent_projects: list[str] = field(default_factory=list)
     welcome_layout: dict[str, dict[str, float]] = field(default_factory=dict)
     welcome_recent_layouts: dict[str, dict[str, float]] = field(default_factory=dict)
-    window_layouts: dict[str, dict[str, float]] = field(default_factory=dict)
+    window_layouts: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -59,7 +60,7 @@ class AppSettings:
             recent_projects=[str(item) for item in recent if item],
             welcome_layout=_coerce_layout_map(raw.get("welcome_layout")),
             welcome_recent_layouts=_coerce_layout_map(raw.get("welcome_recent_layouts")),
-            window_layouts=_coerce_layout_map(raw.get("window_layouts")),
+            window_layouts=_coerce_layout_map(raw.get("window_layouts"), include_geometry=True),
         )
 
 
@@ -118,25 +119,28 @@ def _dedupe_existing(paths: list[str]) -> list[str]:
     return result[:8]
 
 
-def _coerce_layout_map(raw: Any) -> dict[str, dict[str, float]]:
+def _coerce_layout_map(raw: Any, *, include_geometry: bool = False) -> dict[str, dict[str, Any]]:
     if not isinstance(raw, dict):
         return {}
-    result: dict[str, dict[str, float]] = {}
+    result: dict[str, dict[str, Any]] = {}
     for key, value in raw.items():
         if not isinstance(key, str) or not isinstance(value, dict):
             continue
-        layout = _coerce_layout(value)
+        layout = _coerce_layout(value, include_geometry=include_geometry)
         if layout:
             result[key] = layout
     return result
 
 
-def _coerce_layout(raw: dict[str, Any]) -> dict[str, float]:
-    result: dict[str, float] = {}
+def _coerce_layout(raw: dict[str, Any], *, include_geometry: bool = False) -> dict[str, Any]:
+    result: dict[str, Any] = {}
     for name in ("x", "y", "width", "height"):
         value = raw.get(name)
         if isinstance(value, int | float):
             result[name] = float(value)
+    geometry = raw.get("geometry")
+    if include_geometry and isinstance(geometry, str) and geometry:
+        result["geometry"] = geometry
     return result
 
 
@@ -182,6 +186,28 @@ def default_project_path(workspace_dir: str | Path) -> Path:
 def project_bundle_dir(project_path: str | Path) -> Path:
     path = Path(project_path)
     return path.parent / f"{path.name}{PROJECT_BUNDLE_SUFFIX}"
+
+
+def project_window_layouts_path(project_path: str | Path) -> Path:
+    return project_bundle_dir(project_path) / WINDOW_LAYOUTS_FILE
+
+
+def load_project_window_layouts(project_path: str | Path) -> dict[str, dict[str, Any]]:
+    path = project_window_layouts_path(project_path)
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            raw = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return _coerce_layout_map(raw, include_geometry=True)
+
+
+def save_project_window_layouts(project_path: str | Path, layouts: dict[str, dict[str, Any]]) -> None:
+    path = project_window_layouts_path(project_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cleaned = _coerce_layout_map(layouts, include_geometry=True)
+    with path.open("w", encoding="utf-8") as file:
+        json.dump(cleaned, file, ensure_ascii=False, indent=2)
 
 
 def _project_manifest(project: ProjectData, project_path: Path) -> dict[str, Any]:

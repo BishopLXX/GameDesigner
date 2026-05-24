@@ -13,7 +13,14 @@ from gamedesigner.app import GameDesignerApp
 from gamedesigner.canvas_io import import_canvas_sheet
 from gamedesigner.qt_dialogs import HEADER_HEIGHT, NodeEditorDialog
 from gamedesigner.models import BlueprintGroup, Node, NodeField, NodeTemplate, ProjectData
-from gamedesigner.storage import AppSettings, load_project, save_project, save_settings
+from gamedesigner.storage import (
+    AppSettings,
+    load_project,
+    load_project_window_layouts,
+    save_project,
+    save_project_window_layouts,
+    save_settings,
+)
 from gamedesigner.ui.link_document_dialog import LinkDocumentDialog
 
 
@@ -56,6 +63,53 @@ class AppEditingTests(unittest.TestCase):
 
         window._redo()
         self.assertEqual(len(project.root_canvas().nodes), 2)
+        window.deleteLater()
+
+    def test_copy_paste_selected_blueprint_group_duplicates_group_and_members(self) -> None:
+        window = GameDesignerApp()
+        project = ProjectData(name="蓝图复制测试")
+        project.ensure_canvas_structure()
+        canvas = project.root_canvas()
+        group = canvas.add_group(BlueprintGroup(title="流程组", x=100, y=120, width=520, height=260))
+        inside = canvas.add_node(Node(title="组内节点", x=160, y=180, group_id=group.id))
+        outside = canvas.add_node(Node(title="组外节点", x=720, y=180))
+        page = window._add_page(project, None, dirty=False, canvas_data=canvas)
+        window.tabs.setCurrentWidget(page)
+        page.canvas.select_group(group.id)
+
+        window._copy_selected_nodes()
+        window._paste_nodes()
+
+        self.assertEqual(len(canvas.groups), 2)
+        pasted_group = next(item for item in canvas.groups if item.id != group.id)
+        self.assertEqual(pasted_group.title, group.title)
+        self.assertEqual(pasted_group.x, group.x + 40)
+        self.assertEqual(pasted_group.y, group.y + 40)
+        pasted_inside = next(node for node in canvas.nodes if node.title == inside.title and node.id != inside.id)
+        self.assertEqual(pasted_inside.group_id, pasted_group.id)
+        self.assertEqual(pasted_inside.x, inside.x + 40)
+        self.assertEqual(pasted_inside.y, inside.y + 40)
+        self.assertIsNone(next((node for node in canvas.nodes if node.title == outside.title and node.id != outside.id), None))
+        self.assertEqual(page.canvas.selected_group_ids, {pasted_group.id})
+        window.deleteLater()
+
+    def test_duplicate_selected_node_copies_and_pastes_immediately(self) -> None:
+        window = GameDesignerApp()
+        project = ProjectData(name="直接复制测试")
+        project.ensure_canvas_structure()
+        source = project.root_canvas().add_node(Node(title="原节点", x=20, y=30))
+        page = window._add_page(project, None, dirty=False, canvas_data=project.root_canvas())
+        window.tabs.setCurrentWidget(page)
+        page.canvas.select_node(source.id)
+
+        window._duplicate_selected()
+
+        nodes = project.root_canvas().nodes
+        self.assertEqual(len(nodes), 2)
+        pasted = next(node for node in nodes if node.id != source.id)
+        self.assertEqual(pasted.title, source.title)
+        self.assertEqual(pasted.x, source.x + 40)
+        self.assertEqual(pasted.y, source.y + 40)
         window.deleteLater()
 
     def test_add_node_inside_group_assigns_group_membership(self) -> None:
@@ -869,15 +923,53 @@ class AppEditingTests(unittest.TestCase):
             self.assertTrue((project_path.parent / f"{project_path.name}.files" / "linked_docs" / "预览文档.md").exists())
             dialog.deleteLater()
 
+    def test_node_editor_dialog_restores_project_window_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "EditorLayout.gdc"
+            save_project_window_layouts(
+                project_path,
+                {
+                    "node_editor_dialog": {
+                        "x": 120,
+                        "y": 140,
+                        "width": 1220,
+                        "height": 820,
+                    },
+                },
+            )
+            node = Node(title="编辑节点", fields=[NodeField("内容", "长文本", "测试")])
+            dialog = NodeEditorDialog(None, node, project_path=project_path)
+            self.assertEqual(dialog.width(), 1220)
+            self.assertEqual(dialog.height(), 820)
+
+            dialog.resize(1280, 860)
+            dialog.done(0)
+
+            saved_layouts = load_project_window_layouts(project_path)
+            self.assertEqual(saved_layouts["node_editor_dialog"]["width"], 1280.0)
+            self.assertEqual(saved_layouts["node_editor_dialog"]["height"], 860.0)
+            dialog.deleteLater()
+
     def test_link_document_dialog_restores_saved_window_layout(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             tmp_path = Path(folder)
             project_path = tmp_path / "LayoutProject.gdc"
+            save_project_window_layouts(
+                project_path,
+                {
+                    "link_document_dialog": {
+                        "x": 80,
+                        "y": 96,
+                        "width": 980,
+                        "height": 640,
+                    },
+                },
+            )
             settings = AppSettings(
                 workspace_dir=folder,
                 export_dir=str(tmp_path / "exports"),
                 window_layouts={
-                    "link_document_dialog": {"x": 80, "y": 96, "width": 980, "height": 640},
+                    "link_document_dialog": {"x": 11, "y": 22, "width": 760, "height": 480},
                 },
             )
             parent = QWidget()
@@ -890,8 +982,10 @@ class AppEditingTests(unittest.TestCase):
                 dialog.resize(1040, 720)
                 dialog.done(0)
 
-                self.assertEqual(settings.window_layouts["link_document_dialog"]["width"], 1040.0)
-                self.assertEqual(settings.window_layouts["link_document_dialog"]["height"], 720.0)
+                saved_layouts = load_project_window_layouts(project_path)
+                self.assertEqual(saved_layouts["link_document_dialog"]["width"], 1040.0)
+                self.assertEqual(saved_layouts["link_document_dialog"]["height"], 720.0)
+                self.assertEqual(settings.window_layouts["link_document_dialog"]["width"], 760)
 
                 reopened = LinkDocumentDialog(parent, project_path, "", "布局文档", "md")
                 self.assertEqual(reopened.width(), 1040)

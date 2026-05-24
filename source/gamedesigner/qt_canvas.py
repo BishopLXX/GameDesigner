@@ -88,8 +88,16 @@ _MISSING_PIXMAP = object()
 class InlineNodeFieldEditor(QPlainTextEdit):
     editingFinished = Signal(bool)
 
+    def __init__(self, single_line: bool = False) -> None:
+        super().__init__()
+        self.single_line = single_line
+        if single_line:
+            self.setLineWrapMode(QPlainTextEdit.NoWrap)
+
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
-        if event.key() in (Qt.Key_Return, Qt.Key_Enter) and event.modifiers() & Qt.ControlModifier:
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter) and (
+            self.single_line or event.modifiers() & Qt.ControlModifier
+        ):
             self.editingFinished.emit(True)
             event.accept()
             return
@@ -289,6 +297,7 @@ class NodeItem(QGraphicsObject):
         self._pressed_pos = QPointF()
         self._moved = False
         self._inline_candidate_field: NodeField | None = None
+        self._inline_candidate_part = ""
         self._inline_candidate_rect = QRectF()
         self._sync_size()
         self.setPos(node.x, node.y)
@@ -364,24 +373,26 @@ class NodeItem(QGraphicsObject):
         fallback = "画" if self.node.node_type == "画布" else "链" if self.node.node_type == "超文本" else self.node.title[:1]
         icon = (self.node.display_icon() or fallback or "节").strip()[:2]
         painter.setPen(QColor(colors["accent"]))
-        icon_rect = QRectF(18, 28, 58, max(28, rect.height() - 42))
+        icon_rect, title_rect = self._compact_header_rects(rect)
         icon_font_size = self._fit_font_size(icon, icon_rect, int(18 / max(zoom, 0.18)), 12, 52)
         font = _font(icon_font_size, True)
         painter.setFont(font)
         painter.drawText(icon_rect, Qt.AlignCenter, icon)
         painter.setPen(QColor(colors["node_text"]))
-        title_rect = QRectF(84, 28, rect.width() - 102, max(28, rect.height() - 42))
         self._draw_adaptive_center_text(painter, title_rect, self.node.title, zoom, 13, 42)
 
     def _paint_detail_mode(self, painter: QPainter, colors: dict[str, str], rect: QRectF) -> None:
         visual_fields = [field for field in self.node.fields if field.has_visual_layout()]
-        icon = self.node.display_icon() or ("画" if self.node.node_type == "画布" else "链" if self.node.node_type == "超文本" else "")
-        title = f"{icon}  {self.node.title}" if icon else self.node.title
         painter.setPen(QColor(colors["node_text"]))
         title_font = _font(12, True)
         painter.setFont(title_font)
-        title_right_padding = 36 if visual_fields else 92
-        painter.drawText(QRectF(18, 28, rect.width() - title_right_padding, 22), Qt.AlignLeft | Qt.AlignVCenter, title)
+        icon = self._detail_header_icon()
+        icon_rect, title_rect = self._detail_header_rects(rect, bool(visual_fields))
+        if icon:
+            painter.setPen(QColor(colors["accent"]))
+            painter.drawText(icon_rect, Qt.AlignCenter, icon)
+        painter.setPen(QColor(colors["node_text"]))
+        painter.drawText(title_rect, Qt.AlignLeft | Qt.AlignVCenter, self.node.title)
         if not visual_fields:
             painter.setPen(QColor(colors["node_muted"]))
             painter.setFont(_font(8))
@@ -652,6 +663,11 @@ class NodeItem(QGraphicsObject):
             self.update()
             super().hoverMoveEvent(event)
             return
+        if self._editable_node_text_at(event.pos()) or self._editable_field_at(event.pos()):
+            self.setCursor(Qt.IBeamCursor)
+            self.update()
+            super().hoverMoveEvent(event)
+            return
         if not self.view.can_resize_nodes():
             self.setCursor(Qt.OpenHandCursor if self.view.can_move_nodes() else Qt.PointingHandCursor)
             self.update()
@@ -695,9 +711,16 @@ class NodeItem(QGraphicsObject):
                 self.setCursor(Qt.SizeFDiagCursor)
                 event.accept()
                 return
-            field_hit = self._editable_field_at(event.pos())
-            self._inline_candidate_field = field_hit[0] if field_hit else None
-            self._inline_candidate_rect = field_hit[1] if field_hit else QRectF()
+            node_text_hit = self._editable_node_text_at(event.pos())
+            if node_text_hit:
+                self._inline_candidate_part = node_text_hit[0]
+                self._inline_candidate_rect = node_text_hit[1]
+                self._inline_candidate_field = None
+            else:
+                field_hit = self._editable_field_at(event.pos())
+                self._inline_candidate_field = field_hit[0] if field_hit else None
+                self._inline_candidate_part = ""
+                self._inline_candidate_rect = field_hit[1] if field_hit else QRectF()
         super().mousePressEvent(event)
 
     def mouseDoubleClickEvent(self, event) -> None:  # type: ignore[override]
@@ -738,6 +761,7 @@ class NodeItem(QGraphicsObject):
         if (event.scenePos() - self._pressed_pos).manhattanLength() > 1:
             self._moved = True
             self._inline_candidate_field = None
+            self._inline_candidate_part = ""
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
@@ -764,15 +788,20 @@ class NodeItem(QGraphicsObject):
                 self.view.projectChanged.emit()
         elif (
             event.button() == Qt.LeftButton
-            and self._inline_candidate_field is not None
+            and (self._inline_candidate_field is not None or self._inline_candidate_part)
             and not was_resizing
         ):
-            self.view.start_inline_field_edit(self, self._inline_candidate_field, self._inline_candidate_rect)
+            if self._inline_candidate_field is not None:
+                self.view.start_inline_field_edit(self, self._inline_candidate_field, self._inline_candidate_rect)
+            else:
+                self.view.start_inline_node_text_edit(self, self._inline_candidate_part, self._inline_candidate_rect)
             event.accept()
             self._inline_candidate_field = None
+            self._inline_candidate_part = ""
             self._inline_candidate_rect = QRectF()
             return
         self._inline_candidate_field = None
+        self._inline_candidate_part = ""
         self._inline_candidate_rect = QRectF()
         super().mouseReleaseEvent(event)
 
@@ -941,6 +970,55 @@ class NodeItem(QGraphicsObject):
     def _on_resize_handle(self, pos: QPointF) -> bool:
         rect = self.boundingRect()
         return pos.x() >= rect.right() - RESIZE_HANDLE and pos.y() >= rect.bottom() - RESIZE_HANDLE
+
+    def _editable_node_text_at(self, pos: QPointF) -> tuple[str, QRectF] | None:
+        if self.view.read_only or self.view.is_inline_field_editing() or self._uses_horizontal_thumbnail_row():
+            return None
+        for part, rect in self._editable_node_text_rects():
+            if rect.contains(pos):
+                return part, rect
+        return None
+
+    def _editable_node_text_rects(self) -> list[tuple[str, QRectF]]:
+        rect = self.boundingRect()
+        zoom = self.view.transform().m11()
+        if zoom < 0.36:
+            return [("icon", self._icon_mode_header_rect(rect))]
+        if zoom < 0.62:
+            icon_rect, title_rect = self._compact_header_rects(rect)
+            return [("icon", icon_rect), ("title", title_rect)]
+        icon_rect, title_rect = self._detail_header_rects(rect, self._has_visual_fields())
+        result = [("title", title_rect)]
+        if icon_rect.isValid() and icon_rect.width() > 0:
+            result.insert(0, ("icon", icon_rect))
+        return result
+
+    def _icon_mode_header_rect(self, rect: QRectF) -> QRectF:
+        return rect.adjusted(12, 22, -12, -8)
+
+    def _compact_header_rects(self, rect: QRectF) -> tuple[QRectF, QRectF]:
+        return (
+            QRectF(18, 28, 58, max(28, rect.height() - 42)),
+            QRectF(84, 28, rect.width() - 102, max(28, rect.height() - 42)),
+        )
+
+    def _detail_header_icon(self) -> str:
+        return self.node.display_icon() or ("画" if self.node.node_type == "画布" else "链" if self.node.node_type == "超文本" else "")
+
+    def _detail_header_rects(self, rect: QRectF, has_visual_fields: bool) -> tuple[QRectF, QRectF]:
+        title_right_padding = 36 if has_visual_fields else 92
+        icon = self._detail_header_icon()
+        title_right = max(24.0, rect.width() - title_right_padding)
+        if not icon:
+            return QRectF(), QRectF(18, 28, max(24.0, title_right - 18), 22)
+        metrics = QFontMetrics(_font(12, True))
+        icon_width = max(22.0, min(54.0, float(metrics.horizontalAdvance(icon) + 10)))
+        icon_rect = QRectF(16, 28, icon_width, 22)
+        title_x = icon_rect.right() + 6
+        return icon_rect, QRectF(title_x, 28, max(24.0, title_right - title_x), 22)
+
+    def _has_visual_fields(self) -> bool:
+        return any(field.has_visual_layout() for field in self.node.fields)
 
     def field_scene_rect(self, field: NodeField) -> QRectF:
         for candidate, rect in self._editable_field_rects():
@@ -1767,6 +1845,8 @@ class NodeGraphView(QGraphicsView):
         self._inline_proxy: QGraphicsProxyWidget | None = None
         self._inline_editor: InlineNodeFieldEditor | None = None
         self._inline_field: NodeField | None = None
+        self._inline_node: Node | None = None
+        self._inline_node_part = ""
         self._inline_original_value = ""
         self.mouse_scene = QPointF()
         self.hover_node_id: str | None = None
@@ -1862,19 +1942,85 @@ class NodeGraphView(QGraphicsView):
         self._inline_proxy = proxy
         self._inline_editor = editor
         self._inline_field = field
+        self._inline_node = None
+        self._inline_node_part = ""
         self._inline_original_value = field.value
         editor.setFocus()
         editor.selectAll()
+
+    def start_inline_node_text_edit(self, item: NodeItem, part: str, local_rect: QRectF | None = None) -> None:
+        if self.read_only or part not in {"title", "icon"}:
+            return
+        self._close_inline_field_editor(commit=True)
+        self.select_node(item.node.id)
+        if local_rect is None or not local_rect.isValid():
+            matches = [rect for candidate, rect in item._editable_node_text_rects() if candidate == part]
+            local_rect = matches[0] if matches else QRectF()
+        rect = item.mapRectToScene(local_rect)
+        if not rect.isValid() or rect.width() <= 0 or rect.height() <= 0:
+            return
+        initial_value = item.node.title if part == "title" else self._editable_icon_value(item.node)
+        editor = InlineNodeFieldEditor(single_line=True)
+        editor.setObjectName("inlineCanvasFieldEditor")
+        editor.setPlainText(initial_value)
+        editor.setStyleSheet(
+            "QPlainTextEdit#inlineCanvasFieldEditor {"
+            "border: 2px solid #0A84FF;"
+            "border-radius: 8px;"
+            "padding: 4px 6px;"
+            "color: #1D1D1F;"
+            "background: #FFFFFF;"
+            "}"
+        )
+        font = editor.font()
+        font.setPointSize(12)
+        font.setBold(True)
+        editor.setFont(font)
+        if part == "icon":
+            option = editor.document().defaultTextOption()
+            option.setAlignment(Qt.AlignCenter)
+            editor.document().setDefaultTextOption(option)
+        editor.editingFinished.connect(self._close_inline_field_editor)
+
+        proxy = QGraphicsProxyWidget()
+        proxy.setWidget(editor)
+        proxy.setZValue(2000)
+        proxy.setPos(rect.topLeft())
+        proxy.resize(max(34.0, rect.width()), max(28.0, rect.height()))
+        self.scene_obj.addItem(proxy)
+        self._inline_proxy = proxy
+        self._inline_editor = editor
+        self._inline_field = None
+        self._inline_node = item.node
+        self._inline_node_part = part
+        self._inline_original_value = initial_value
+        editor.setFocus()
+        editor.selectAll()
+
+    def _editable_icon_value(self, node: Node) -> str:
+        if node.icon_from_title:
+            return node.display_icon()
+        if node.icon:
+            return node.icon
+        if node.node_type == "画布":
+            return "画"
+        if node.node_type == "超文本":
+            return "链"
+        return ""
 
     def _close_inline_field_editor(self, commit: bool = True) -> None:
         proxy = self._inline_proxy
         editor = self._inline_editor
         field = self._inline_field
+        node = self._inline_node
+        node_part = self._inline_node_part
         if proxy is None:
             return
         self._inline_proxy = None
         self._inline_editor = None
         self._inline_field = None
+        self._inline_node = None
+        self._inline_node_part = ""
         self.scene_obj.removeItem(proxy)
         proxy.deleteLater()
         changed = False
@@ -1883,6 +2029,21 @@ class NodeGraphView(QGraphicsView):
             if field.value != new_value:
                 field.value = new_value
                 changed = True
+        elif node is not None and node_part:
+            raw_value = editor.toPlainText() if editor is not None and commit else self._inline_original_value
+            new_value = raw_value.replace("\r", " ").replace("\n", " ").strip()
+            if node_part == "title":
+                new_value = new_value or self._inline_original_value or "新节点"
+                if node.title != new_value:
+                    node.title = new_value
+                    changed = True
+            elif node_part == "icon":
+                if node.icon != new_value or node.icon_from_title:
+                    node.icon = new_value
+                    node.icon_from_title = False
+                    changed = True
+            if changed and node.id in self.node_items:
+                self.node_items[node.id].refresh()
         self._inline_original_value = ""
         self.viewport().update()
         if changed:

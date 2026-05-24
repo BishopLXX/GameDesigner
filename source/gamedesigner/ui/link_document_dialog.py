@@ -48,7 +48,7 @@ class LinkDocumentDialog(QDialog):
         self.deleted = False
         self.saved = False
 
-        initial_content = read_link_document(self.project_path, self.relative_path)
+        initial_content = read_link_document(self.project_path, self.relative_path) if self.relative_path else ""
         if not initial_content and not self.relative_path:
             initial_content = self._default_content()
 

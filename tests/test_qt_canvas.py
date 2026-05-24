@@ -430,6 +430,44 @@ class QtCanvasTests(unittest.TestCase):
         self.assertEqual(changed, [])
         view.deleteLater()
 
+    def test_inline_edit_node_title_updates_title_and_emits_change(self) -> None:
+        canvas = CanvasData(name="主画布")
+        node = canvas.add_node(Node(title="旧名称", icon="旧", width=320, height=180))
+        view = NodeGraphView(canvas)
+        item = view.node_items[node.id]
+        changed: list[bool] = []
+        view.projectChanged.connect(lambda: changed.append(True))
+        title_rect = next(rect for part, rect in item._editable_node_text_rects() if part == "title")
+
+        view.start_inline_node_text_edit(item, "title", title_rect)
+        self.assertTrue(view.is_inline_field_editing())
+        self.assertIsNotNone(view._inline_editor)
+        view._inline_editor.setPlainText("新名称")
+        view._close_inline_field_editor(commit=True)
+
+        self.assertEqual(node.title, "新名称")
+        self.assertEqual(changed, [True])
+        view.deleteLater()
+
+    def test_inline_edit_node_icon_updates_icon_and_emits_change(self) -> None:
+        canvas = CanvasData(name="主画布")
+        node = canvas.add_node(Node(title="节点", icon="旧", icon_from_title=True, width=320, height=180))
+        view = NodeGraphView(canvas)
+        item = view.node_items[node.id]
+        changed: list[bool] = []
+        view.projectChanged.connect(lambda: changed.append(True))
+        icon_rect = next(rect for part, rect in item._editable_node_text_rects() if part == "icon")
+
+        view.start_inline_node_text_edit(item, "icon", icon_rect)
+        self.assertIsNotNone(view._inline_editor)
+        view._inline_editor.setPlainText("新")
+        view._close_inline_field_editor(commit=True)
+
+        self.assertEqual(node.icon, "新")
+        self.assertFalse(node.icon_from_title)
+        self.assertEqual(changed, [True])
+        view.deleteLater()
+
     def test_left_click_blank_canvas_commits_inline_edit(self) -> None:
         canvas = CanvasData(name="主画布")
         field = NodeField("数值", "文本", "5", x=20, y=10, width=120, height=40)

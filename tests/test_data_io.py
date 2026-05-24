@@ -18,10 +18,40 @@ from gamedesigner.project_files.linked_documents import (
     sync_link_document_copy,
     write_link_document,
 )
-from gamedesigner.storage import load_project, project_bundle_dir, save_project
+from gamedesigner.storage import (
+    load_project,
+    load_project_window_layouts,
+    project_bundle_dir,
+    project_window_layouts_path,
+    save_project,
+    save_project_window_layouts,
+)
 
 
 class DataIoTests(unittest.TestCase):
+    def test_project_window_layouts_are_saved_in_project_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "LayoutProject.gdc"
+
+            save_project_window_layouts(
+                project_path,
+                {
+                    "node_editor_dialog": {
+                        "x": 100,
+                        "y": 120,
+                        "width": 1160,
+                        "height": 760,
+                        "geometry": "AAAA",
+                    },
+                },
+            )
+
+            self.assertTrue(project_window_layouts_path(project_path).exists())
+            self.assertEqual(
+                load_project_window_layouts(project_path)["node_editor_dialog"]["width"],
+                1160.0,
+            )
+
     def test_project_gdc_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             tmp_path = Path(folder)
