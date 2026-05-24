@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .models import ProjectData, default_project
+from .models import EDGE_STYLES, ProjectData, default_project
 
 
 APP_NAME = "GameDesigner"
@@ -23,6 +23,7 @@ class AppSettings:
     export_dir: str = ""
     last_project: str = ""
     theme: str = "dark"
+    last_edge_style: str = "curve"
     recent_projects: list[str] = field(default_factory=list)
     welcome_layout: dict[str, dict[str, float]] = field(default_factory=dict)
     welcome_recent_layouts: dict[str, dict[str, float]] = field(default_factory=dict)
@@ -34,6 +35,7 @@ class AppSettings:
             "export_dir": self.export_dir,
             "last_project": self.last_project,
             "theme": self.theme,
+            "last_edge_style": self.last_edge_style,
             "recent_projects": self.recent_projects,
             "welcome_layout": self.welcome_layout,
             "welcome_recent_layouts": self.welcome_recent_layouts,
@@ -45,11 +47,15 @@ class AppSettings:
         recent = raw.get("recent_projects", [])
         if not isinstance(recent, list):
             recent = []
+        last_edge_style = str(raw.get("last_edge_style", "curve") or "curve")
+        if last_edge_style not in EDGE_STYLES:
+            last_edge_style = "curve"
         return cls(
             workspace_dir=str(raw.get("workspace_dir", "")),
             export_dir=str(raw.get("export_dir", "")),
             last_project=str(raw.get("last_project", "")),
             theme=str(raw.get("theme", "dark") or "dark"),
+            last_edge_style=last_edge_style,
             recent_projects=[str(item) for item in recent if item],
             welcome_layout=_coerce_layout_map(raw.get("welcome_layout")),
             welcome_recent_layouts=_coerce_layout_map(raw.get("welcome_recent_layouts")),
@@ -93,6 +99,8 @@ def load_settings() -> AppSettings:
         settings.export_dir = str(Path(settings.workspace_dir) / "exports")
     if settings.theme not in {"dark", "light"}:
         settings.theme = "dark"
+    if settings.last_edge_style not in EDGE_STYLES:
+        settings.last_edge_style = "curve"
     settings.recent_projects = _dedupe_existing(settings.recent_projects)
     return settings
 

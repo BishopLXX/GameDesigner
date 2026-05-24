@@ -42,7 +42,17 @@ from PySide6.QtWidgets import (
 
 from .canvas_io import import_canvas_sheet
 from .data_canvas import apply_template_to_node, data_canvas_template, sync_data_canvas, sync_locked_template_nodes
-from .models import BlueprintGroup, CanvasData, Node, NodeField, ProjectData, default_project, default_tech_tree_node, new_id
+from .models import (
+    EDGE_STYLES,
+    BlueprintGroup,
+    CanvasData,
+    Node,
+    NodeField,
+    ProjectData,
+    default_project,
+    default_tech_tree_node,
+    new_id,
+)
 from .project_history import ProjectHistory, ProjectSnapshot
 from .qt_canvas import NodeGraphView
 from .qt_fonts import configure_fonts
@@ -417,7 +427,7 @@ class GameDesignerApp(QMainWindow):
         self._project_histories: dict[int, ProjectHistory] = {}
         self._copied_nodes: list[dict[str, Any]] = []
         self._paste_serial = 0
-        self._last_edge_style = "curve"
+        self._last_edge_style = self.settings.last_edge_style if self.settings.last_edge_style in EDGE_STYLES else "curve"
         self._report_startup_progress(48, "准备字体和主题...")
         configure_fonts()
         self.setWindowTitle("GameDesigner - 游戏设计师")
@@ -2107,9 +2117,9 @@ class GameDesignerApp(QMainWindow):
         page = self._current_page()
         if not page or page.is_welcome:
             return
-        if style not in {"curve", "straight", "orthogonal"}:
+        if style not in EDGE_STYLES:
             return
-        self._last_edge_style = style
+        self._remember_last_edge_style(style)
         edge = next((item for item in page.canvas_data.edges if item.id == edge_id), None)
         if not edge or edge.style == style:
             return
@@ -2275,11 +2285,18 @@ class GameDesignerApp(QMainWindow):
         edge = page.canvas_data.add_edge(source, target)
         if not edge:
             return
-        if existing is None and self._last_edge_style in {"curve", "straight", "orthogonal"}:
+        if existing is None and self._last_edge_style in EDGE_STYLES:
             edge.style = self._last_edge_style
         page.canvas.rebuild()
         page.canvas.select_edge(edge.id)
         self._mark_dirty(page)
+
+    def _remember_last_edge_style(self, style: str) -> None:
+        if style not in EDGE_STYLES or self._last_edge_style == style:
+            return
+        self._last_edge_style = style
+        self.settings.last_edge_style = style
+        save_settings(self.settings)
 
     def _manage_templates(self) -> None:
         from .qt_dialogs import TemplateManagerDialog

@@ -73,24 +73,68 @@ class AppEditingTests(unittest.TestCase):
         window.deleteLater()
 
     def test_new_edges_use_last_selected_edge_style(self) -> None:
-        window = GameDesignerApp()
-        project = ProjectData(name="连线样式记忆")
-        project.ensure_canvas_structure()
-        canvas = project.root_canvas()
-        first = canvas.add_node(Node(title="A"))
-        second = canvas.add_node(Node(title="B", x=420))
-        third = canvas.add_node(Node(title="C", y=260))
-        existing = canvas.add_edge(first.id, second.id)
-        page = window._add_page(project, None, dirty=False, canvas_data=canvas)
-        window.tabs.setCurrentWidget(page)
+        with tempfile.TemporaryDirectory() as folder:
+            tmp_path = Path(folder)
+            settings = AppSettings(workspace_dir=folder, export_dir=str(tmp_path / "exports"))
+            with mock.patch.dict(os.environ, {"APPDATA": folder}):
+                save_settings(settings)
+                window = GameDesignerApp()
+                project = ProjectData(name="连线样式记忆")
+                project.ensure_canvas_structure()
+                canvas = project.root_canvas()
+                first = canvas.add_node(Node(title="A"))
+                second = canvas.add_node(Node(title="B", x=420))
+                third = canvas.add_node(Node(title="C", y=260))
+                existing = canvas.add_edge(first.id, second.id)
+                page = window._add_page(project, None, dirty=False, canvas_data=canvas)
+                window.tabs.setCurrentWidget(page)
 
-        window._set_edge_style(existing.id, "straight")
-        window._create_edge(first.id, third.id)
+                window._set_edge_style(existing.id, "straight")
+                window._create_edge(first.id, third.id)
 
-        created = next(edge for edge in canvas.edges if edge.target == third.id)
-        self.assertEqual(existing.style, "straight")
-        self.assertEqual(created.style, "straight")
-        window.deleteLater()
+                created = next(edge for edge in canvas.edges if edge.target == third.id)
+                self.assertEqual(existing.style, "straight")
+                self.assertEqual(created.style, "straight")
+                window.deleteLater()
+
+    def test_last_selected_edge_style_persists_between_app_launches(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            tmp_path = Path(folder)
+            settings = AppSettings(workspace_dir=folder, export_dir=str(tmp_path / "exports"))
+            with mock.patch.dict(os.environ, {"APPDATA": folder}):
+                save_settings(settings)
+                first_window = GameDesignerApp()
+                first_project = ProjectData(name="连线样式持久化")
+                first_project.ensure_canvas_structure()
+                first_canvas = first_project.root_canvas()
+                first = first_canvas.add_node(Node(title="A"))
+                second = first_canvas.add_node(Node(title="B", x=420))
+                existing = first_canvas.add_edge(first.id, second.id)
+                first_page = first_window._add_page(first_project, None, dirty=False, canvas_data=first_canvas)
+                first_window.tabs.setCurrentWidget(first_page)
+
+                first_window._set_edge_style(existing.id, "orthogonal")
+                first_window.deleteLater()
+
+                reopened = GameDesignerApp()
+                reopened_project = ProjectData(name="新窗口沿用连线样式")
+                reopened_project.ensure_canvas_structure()
+                reopened_canvas = reopened_project.root_canvas()
+                source = reopened_canvas.add_node(Node(title="A"))
+                target = reopened_canvas.add_node(Node(title="B", x=420))
+                reopened_page = reopened._add_page(
+                    reopened_project,
+                    None,
+                    dirty=False,
+                    canvas_data=reopened_canvas,
+                )
+                reopened.tabs.setCurrentWidget(reopened_page)
+
+                reopened._create_edge(source.id, target.id)
+
+                self.assertEqual(reopened.settings.last_edge_style, "orthogonal")
+                self.assertEqual(reopened_canvas.edges[0].style, "orthogonal")
+                reopened.deleteLater()
 
     def test_add_data_canvas_creates_templated_child_canvas(self) -> None:
         window = GameDesignerApp()
