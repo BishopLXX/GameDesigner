@@ -3,15 +3,21 @@ import unittest
 from pathlib import Path
 
 from gamedesigner.ai_tools import (
+    AI_ACTION_BLOCK_END,
+    AI_ACTION_BLOCK_START,
+    AiCanvasFieldChange,
     AiChatMessage,
     build_ai_cli_invocation,
+    build_ai_assistant_prompt,
     build_project_chat_context,
     build_project_chat_prompt,
     invocation_with_last_message_output,
     load_project_chat_history,
+    parse_ai_canvas_actions,
     project_chat_history_path,
     qprocess_command,
     save_project_chat_history,
+    split_ai_canvas_action_response,
 )
 from gamedesigner.models import BlueprintGroup, CanvasData, Edge, Node, NodeField, ProjectData
 from gamedesigner.storage import AppSettings
@@ -126,6 +132,77 @@ class AiToolsTests(unittest.TestCase):
         self.assertIn("上一问", prompt)
         self.assertIn("上一答", prompt)
         self.assertIn("怎么优化？", prompt)
+
+    def test_ai_assistant_prompt_includes_canvas_action_protocol(self) -> None:
+        prompt = build_ai_assistant_prompt("当前画布: 主画布", "帮我创建节点")
+
+        self.assertIn("当前画布与当前选中对象最高", prompt)
+        self.assertIn(AI_ACTION_BLOCK_START, prompt)
+        self.assertIn("create_node", prompt)
+        self.assertIn("update_node", prompt)
+        self.assertIn("create_group", prompt)
+        self.assertIn("自动应用到当前画布", prompt)
+
+    def test_parse_ai_canvas_actions_supports_create_update_and_group(self) -> None:
+        actions = parse_ai_canvas_actions(
+            """
+            {
+              "actions": [
+                {
+                  "type": "create_node",
+                  "title": "冲刺技能",
+                  "icon": "冲",
+                  "template_id": "template_skill",
+                  "fields": [
+                    {"name": "内容信息", "data_type": "长文本", "value": "向前突进"}
+                  ]
+                },
+                {
+                  "type": "create_group",
+                  "title": "冲刺流派",
+                  "nodes": [
+                    {
+                      "type": "create_node",
+                      "title": "冲刺强化",
+                      "fields": [
+                        {"name": "内容信息", "data_type": "长文本", "value": "冲刺后增伤"}
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "update_node",
+                  "node_id": "node_a",
+                  "title": "基础攻击",
+                  "fields": [
+                    {"name": "伤害", "data_type": "数字", "value": "12"}
+                  ]
+                }
+              ]
+            }
+            """
+        )
+
+        self.assertEqual([action.type for action in actions], ["create_node", "create_group", "update_node"])
+        self.assertEqual(actions[0].title, "冲刺技能")
+        self.assertEqual(actions[0].template_id, "template_skill")
+        self.assertEqual(actions[0].fields[0], AiCanvasFieldChange("内容信息", "长文本", "向前突进"))
+        self.assertEqual(actions[1].title, "冲刺流派")
+        self.assertEqual(actions[1].nodes[0].title, "冲刺强化")
+        self.assertEqual(actions[2].node_id, "node_a")
+
+    def test_split_ai_canvas_action_response_hides_action_block(self) -> None:
+        visible, actions, error = split_ai_canvas_action_response(
+            "我建议先补一个节点。\n"
+            f"{AI_ACTION_BLOCK_START}\n"
+            '{"actions":[{"type":"create_node","title":"Boss一阶段"}]}\n'
+            f"{AI_ACTION_BLOCK_END}"
+        )
+
+        self.assertEqual(error, "")
+        self.assertEqual(visible, "我建议先补一个节点。")
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].title, "Boss一阶段")
 
     def test_project_chat_history_roundtrip_uses_project_bundle(self) -> None:
         project_path = Path(self._testMethodName) / "MemoryProject.gdc"

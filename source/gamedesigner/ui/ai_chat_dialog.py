@@ -5,7 +5,7 @@ import tempfile
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QProcess, Qt
+from PySide6.QtCore import QProcess, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -17,25 +17,31 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QTextBrowser,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from ..ai_tools import (
     AI_MODEL_PRESETS,
+    AiCanvasAction,
     AiChatMessage,
     build_ai_cli_invocation,
-    build_project_chat_prompt,
+    build_ai_assistant_prompt,
+    describe_ai_canvas_actions,
     invocation_with_last_message_output,
     load_project_chat_history,
     process_environment,
     qprocess_command,
     save_project_chat_history,
+    split_ai_canvas_action_response,
 )
 from ..storage import AppSettings, save_settings
 from ..window_layouts import restore_window_layout, save_window_layout
+from .submit_text_edit import SubmitPlainTextEdit
 
 
 class AiSettingsDialog(QDialog):
@@ -153,18 +159,21 @@ class AiSettingsDialog(QDialog):
         super().done(result)
 
 
-class AiChatDialog(QDialog):
+class AiChatPanel(QWidget):
+    collapseRequested = Signal()
+
     def __init__(
         self,
         parent: QWidget | None,
         settings: AppSettings,
         context_provider: Callable[[], tuple[str, Path, Path]],
+        action_applier: Callable[[list[AiCanvasAction]], str] | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("AI 工程聊天")
-        self.setModal(False)
+        self.setObjectName("aiAssistantPanel")
         self.settings = settings
         self.context_provider = context_provider
+        self.action_applier = action_applier
         self._process: QProcess | None = None
         self._history: list[AiChatMessage] = []
         self._history_project_path: Path | None = None
@@ -172,27 +181,63 @@ class AiChatDialog(QDialog):
         self._pending_output_chunks: list[str] = []
         self._pending_error_chunks: list[str] = []
         self._pending_output_file: Path | None = None
+        self._pending_actions: list[AiCanvasAction] = []
+        self._iteration_mode = False
+        self._activity_base = "就绪"
+        self._activity_step = 0
+        self._activity_log_lines: list[str] = []
+
+        title_label = QLabel("AI 助手")
+        title_label.setObjectName("aiAssistantTitle")
+        collapse_button = QToolButton(self)
+        collapse_button.setObjectName("aiAssistantCollapseButton")
+        collapse_button.setText("收起")
+        collapse_button.setToolTip("收起 AI 助手")
+        collapse_button.clicked.connect(self.collapseRequested.emit)
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.addWidget(title_label)
+        title_row.addStretch(1)
+        title_row.addWidget(collapse_button)
 
         self.header_label = QLabel()
         self.header_label.setObjectName("mutedLabel")
+        self.activity_label = QLabel("就绪")
+        self.activity_label.setObjectName("aiAssistantActivityLabel")
+        self.busy_bar = QProgressBar()
+        self.busy_bar.setObjectName("aiAssistantBusyBar")
+        self.busy_bar.setRange(0, 0)
+        self.busy_bar.setTextVisible(False)
+        self.busy_bar.setFixedHeight(4)
+        self.busy_bar.hide()
+        self.activity_timer = QTimer(self)
+        self.activity_timer.setInterval(420)
+        self.activity_timer.timeout.connect(self._tick_activity)
+        self.activity_log = QPlainTextEdit()
+        self.activity_log.setObjectName("aiAssistantActivityLog")
+        self.activity_log.setReadOnly(True)
+        self.activity_log.setFixedHeight(118)
+        self.activity_log.setPlaceholderText("运行日志会显示在这里，并自动保留最近的内容。")
         self.transcript = QTextBrowser()
         self.transcript.setOpenExternalLinks(True)
-        self.input = QPlainTextEdit()
+        self.input = SubmitPlainTextEdit()
         self.input.setPlaceholderText("询问当前工程，例如：帮我检查当前科技树节奏、给选中节点补字段、分析蓝图结构。")
         self.input.setFixedHeight(94)
+        self.input.submitted.connect(self._send)
 
         self.settings_button = QPushButton("AI 设置")
         self.settings_button.clicked.connect(self._open_settings)
-        self.clear_button = QPushButton("清空记忆")
-        self.clear_button.clicked.connect(self._clear_history)
+        self.clear_button = QPushButton("清空屏幕")
+        self.clear_button.setToolTip("只清空当前显示，不删除本项目的 AI 会话记忆")
+        self.clear_button.clicked.connect(self._clear_screen)
         self.send_button = QPushButton("发送")
         self.send_button.setObjectName("accentButton")
         self.send_button.clicked.connect(self._send)
         self.cancel_button = QPushButton("停止")
         self.cancel_button.clicked.connect(self._cancel)
         self.cancel_button.setEnabled(False)
-        close_button = QPushButton("关闭")
-        close_button.clicked.connect(self.close)
+        close_button = QPushButton("收起")
+        close_button.clicked.connect(self.collapseRequested.emit)
 
         tools = QHBoxLayout()
         tools.addWidget(self.settings_button)
@@ -203,29 +248,64 @@ class AiChatDialog(QDialog):
         tools.addWidget(close_button)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 16, 16, 14)
+        layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(10)
+        layout.addLayout(title_row)
         layout.addWidget(self.header_label)
+        layout.addWidget(self.activity_label)
+        layout.addWidget(self.busy_bar)
+        layout.addWidget(self.activity_log)
         layout.addWidget(self.transcript, 1)
         layout.addWidget(self.input)
         layout.addLayout(tools)
-        self.resize(820, 640)
-        restore_window_layout(self, "ai_chat_dialog")
-        self._append_system("聊天会自动带上当前打开工程、当前画布和选中对象的概要，并记住本项目的历史对话。")
+        self._append_system("AI 助手会带上当前工程、当前画布、选中对象和低权重参考文档；需要改画布时会自动把可执行操作应用到当前画布。")
         self._refresh_header()
         self._ensure_history_loaded()
 
     def _refresh_header(self) -> None:
         self.header_label.setText(f"工具: {self.settings.ai_provider}    模型: {self.settings.ai_model or '未设置'}")
 
+    def _start_activity(self, text: str) -> None:
+        self._activity_base = text.strip() or "正在思考"
+        self._activity_step = 0
+        self.activity_label.setText(self._activity_base)
+        self.busy_bar.show()
+        if not self.activity_timer.isActive():
+            self.activity_timer.start()
+
+    def _tick_activity(self) -> None:
+        self._activity_step = (self._activity_step + 1) % 4
+        dots = "." * self._activity_step
+        self.activity_label.setText(f"{self._activity_base}{dots}")
+
+    def _stop_activity(self, text: str = "就绪") -> None:
+        self.activity_timer.stop()
+        self._activity_base = text.strip() or "就绪"
+        self.activity_label.setText(self._activity_base)
+        self.busy_bar.hide()
+
+    def enter_iteration_mode(self) -> None:
+        self._iteration_mode = True
+        self.input.setPlaceholderText("迭代当前选中节点或蓝图组，例如：基于它继续做 3 个同模板节点，或参考这个蓝图组做一个新蓝图组。")
+        self.input.setPlainText("基于当前选中对象继续迭代，直接在当前画布创建新的节点或蓝图组。")
+        self.input.selectAll()
+        self._append_system("已进入迭代助手：会优先参考当前选中节点/蓝图组；如果生成画布动作，会自动创建到当前画布。")
+
     def _append_system(self, text: str) -> None:
         self.transcript.append(f"<p style='color:#8E8E93;'>{self._html(text)}</p>")
+        self._scroll_transcript_to_bottom()
 
     def _append_user(self, text: str) -> None:
         self.transcript.append(f"<p><b>你</b><br>{self._html(text).replace(chr(10), '<br>')}</p>")
+        self._scroll_transcript_to_bottom()
 
     def _append_ai(self, text: str) -> None:
         self.transcript.append(f"<p><b>AI</b><br>{self._html(text).replace(chr(10), '<br>')}</p>")
+        self._scroll_transcript_to_bottom()
+
+    def _scroll_transcript_to_bottom(self) -> None:
+        bar = self.transcript.verticalScrollBar()
+        bar.setValue(bar.maximum())
 
     def _send(self) -> None:
         message = self.input.toPlainText().strip()
@@ -237,7 +317,8 @@ class AiChatDialog(QDialog):
             QMessageBox.information(self, "没有可用工程", str(exc))
             return
         self._ensure_history_loaded(project_path)
-        prompt = build_project_chat_prompt(context, message, self._history)
+        prompt_message = self._iteration_prompt(message) if self._iteration_mode else message
+        prompt = build_ai_assistant_prompt(context, prompt_message, self._history)
         invocation = build_ai_cli_invocation(self.settings, prompt, cwd)
         output_file = self._new_output_file() if invocation.program == "codex" else None
         if output_file is not None:
@@ -256,16 +337,28 @@ class AiChatDialog(QDialog):
         self._pending_output_chunks = []
         self._pending_error_chunks = []
         self._pending_output_file = output_file
+        self._pending_actions = []
+        self._clear_activity_log()
         self._append_user(message)
         self.input.clear()
         self.send_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
+        self._start_activity(f"{invocation.program} 正在思考")
         self._append_system(f"正在调用 {invocation.program}...")
+        self._append_activity_lines(
+            [
+                f"已启动 {invocation.program} CLI",
+                f"工作目录: {invocation.cwd}",
+                f"模型: {self.settings.ai_model or '未设置'}",
+            ],
+            "运行状态",
+        )
         process.start()
         if not process.waitForStarted(1500):
             self._process = None
             self.send_button.setEnabled(True)
             self.cancel_button.setEnabled(False)
+            self._stop_activity("启动失败")
             QMessageBox.warning(self, "AI 启动失败", f"无法启动 {invocation.program}。请确认 CLI 已安装并可在 PATH 中使用。")
             self._cleanup_pending_output_file()
             return
@@ -278,6 +371,10 @@ class AiChatDialog(QDialog):
         text = bytes(self._process.readAllStandardOutput()).decode("utf-8", errors="replace")
         if text:
             self._pending_output_chunks.append(text)
+            if self._pending_output_file is not None:
+                self._append_activity_from_chunk(text, "输出")
+            else:
+                self._start_activity("AI 正在输出回复")
 
     def _read_stderr(self) -> None:
         if self._process is None:
@@ -285,16 +382,25 @@ class AiChatDialog(QDialog):
         text = bytes(self._process.readAllStandardError()).decode("utf-8", errors="replace")
         if text:
             self._pending_error_chunks.append(text)
+            self._append_activity_from_chunk(text, "运行日志")
 
     def _process_finished(self, exit_code: int, _status: QProcess.ExitStatus) -> None:
         ai_text = self._read_pending_output_file()
         if not ai_text:
             ai_text = self._clean_cli_output("".join(self._pending_output_chunks))
-        if ai_text:
-            self._append_ai(ai_text)
-        if self._pending_user_message and ai_text:
+        visible_text, actions, action_error = split_ai_canvas_action_response(ai_text) if ai_text else ("", [], "")
+        if visible_text:
+            self._append_ai(visible_text)
+        if action_error:
+            self._append_system(action_error)
+        if actions:
+            self._auto_apply_actions(actions)
+        history_ai_text = visible_text.strip()
+        if not history_ai_text and actions:
+            history_ai_text = "已生成画布操作：\n" + "\n".join(f"- {line}" for line in describe_ai_canvas_actions(actions))
+        if self._pending_user_message and history_ai_text:
             self._history.append(AiChatMessage("user", self._pending_user_message))
-            self._history.append(AiChatMessage("assistant", ai_text))
+            self._history.append(AiChatMessage("assistant", history_ai_text))
             self._trim_history()
             self._save_history()
         elif exit_code != 0:
@@ -303,7 +409,7 @@ class AiChatDialog(QDialog):
                 self._append_system(f"AI 进程失败，日志如下：\n{error_text}")
             else:
                 self._append_system(f"AI 进程失败，退出码 {exit_code}。")
-        elif not ai_text:
+        elif not visible_text and not actions:
             self._append_system("AI 没有返回可显示的内容。")
         self._pending_user_message = ""
         self._pending_output_chunks = []
@@ -312,10 +418,91 @@ class AiChatDialog(QDialog):
         self._process = None
         self.send_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
+        self._stop_activity("就绪")
         self._append_system("回复结束。")
+
+    def _append_activity_from_chunk(self, text: str, title: str) -> None:
+        lines = self._activity_lines_from_chunk(text)
+        if lines:
+            self._append_activity_lines(lines, title)
+        elif text.strip():
+            self._start_activity("AI 仍在运行")
+
+    def _activity_lines_from_chunk(self, text: str) -> list[str]:
+        keywords = (
+            "thinking",
+            "reasoning",
+            "running",
+            "exec",
+            "command",
+            "tool",
+            "mcp",
+            "error",
+            "warning",
+            "deprecated",
+            "tokens used",
+            "codex",
+            "claude",
+            "正在",
+            "运行",
+            "思考",
+            "调用",
+            "读取",
+            "写入",
+            "失败",
+            "错误",
+            "警告",
+        )
+        hidden_prefixes = (
+            "user ",
+            "system ",
+            "developer ",
+            "assistant ",
+            "【当前工程上下文】",
+            "【历史对话】",
+            "【用户问题】",
+        )
+        lines: list[str] = []
+        for raw_line in text.replace("\r", "\n").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith(hidden_prefixes):
+                continue
+            if len(line) > 360:
+                line = f"{line[:357]}..."
+            lowered = line.lower()
+            if any(keyword in lowered for keyword in keywords):
+                lines.append(line)
+            if len(lines) >= 10:
+                break
+        return lines
+
+    def _append_activity_lines(self, lines: list[str], title: str) -> None:
+        if not lines:
+            return
+        self._activity_log_lines.append(f"[{title}]")
+        self._activity_log_lines.extend(lines)
+        self._activity_log_lines = self._activity_log_lines[-48:]
+        self.activity_log.setPlainText("\n".join(self._activity_log_lines))
+        bar = self.activity_log.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+    def _clear_activity_log(self) -> None:
+        self._activity_log_lines = []
+        self.activity_log.clear()
+
+    def _iteration_prompt(self, message: str) -> str:
+        return (
+            "【迭代助手模式】\n"
+            "用户是从当前画布的节点或蓝图组右键进入的。请优先基于当前选中对象迭代新内容。\n"
+            "如果选中节点有模板，新建节点必须沿用相同模板和字段结构；如果选中蓝图组，请可以参考其成员结构创建新的蓝图组和组内节点。\n"
+            "请在自然语言后输出动作块，让 GameDesigner 自动创建或更新画布内容。\n\n"
+            f"用户输入：{message.strip()}"
+        )
 
     def _cancel(self) -> None:
         if self._process is not None:
+            self._append_system("正在停止 AI...")
+            self._start_activity("正在停止 AI")
             self._process.kill()
 
     def _open_settings(self) -> None:
@@ -337,7 +524,7 @@ class AiChatDialog(QDialog):
 
     def _render_history(self) -> None:
         self.transcript.clear()
-        self._append_system("聊天会自动带上当前打开工程、当前画布和选中对象的概要，并记住本项目的历史对话。")
+        self._append_system("AI 助手会带上当前工程、当前画布、选中对象和低权重参考文档；需要改画布时会自动把可执行操作应用到当前画布。")
         if not self._history:
             self._append_system("当前项目还没有历史对话。")
             return
@@ -355,12 +542,11 @@ class AiChatDialog(QDialog):
         if self._history_project_path is not None:
             save_project_chat_history(self._history_project_path, self._history)
 
-    def _clear_history(self) -> None:
-        self._ensure_history_loaded()
-        self._history.clear()
-        self._save_history()
+    def _clear_screen(self) -> None:
         self.transcript.clear()
-        self._append_system("已清空当前项目的 AI 会话记忆。")
+        self._clear_activity_log()
+        self._append_system("已清空当前屏幕显示，项目 AI 会话记忆仍保留。")
+        self._pending_actions = []
 
     def _html(self, text: str) -> str:
         return (
@@ -403,9 +589,35 @@ class AiChatDialog(QDialog):
             return text.removeprefix("codex ").strip()
         return text
 
+    def _append_action_preview(self, actions: list[AiCanvasAction]) -> None:
+        lines = describe_ai_canvas_actions(actions)
+        if not lines:
+            return
+        html_lines = "<br>".join(self._html(f"- {line}") for line in lines)
+        self.transcript.append(
+            "<p style='color:#5E8FD6;'><b>已识别画布操作</b><br>"
+            f"{html_lines}</p>"
+        )
+        self._scroll_transcript_to_bottom()
+
+    def _auto_apply_actions(self, actions: list[AiCanvasAction]) -> None:
+        if not actions:
+            return
+        self._pending_actions = list(actions)
+        self._append_action_preview(actions)
+        if self.action_applier is None:
+            QMessageBox.information(self, "无法应用", "当前窗口没有连接到画布操作器。")
+            return
+        try:
+            message = self.action_applier(list(actions))
+        except ValueError as exc:
+            QMessageBox.warning(self, "无法应用", str(exc))
+            return
+        self._append_system(message)
+        self._pending_actions = []
+
     def closeEvent(self, event) -> None:  # type: ignore[override]
         if self._process is not None:
             self._process.kill()
         self._cleanup_pending_output_file()
-        save_window_layout(self, "ai_chat_dialog")
         super().closeEvent(event)

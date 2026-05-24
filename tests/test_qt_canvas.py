@@ -5,13 +5,13 @@ from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QPoint, QPointF, Qt
-from PySide6.QtGui import QImage, QPainter, QPixmap
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
+from PySide6.QtGui import QAction, QImage, QKeyEvent, QPainter, QPixmap, QTextCursor
+from PySide6.QtWidgets import QApplication, QMenu
 
 from gamedesigner.data_canvas import layout_data_canvas
 from gamedesigner.models import BlueprintGroup, CanvasData, Node, NodeField, NodeTemplate, ProjectData
-from gamedesigner.qt_canvas import NodeGraphView
+from gamedesigner.qt_canvas import InlineNodeFieldEditor, NodeGraphView
 
 
 class _ScenePointerEvent:
@@ -82,6 +82,14 @@ class _KeyEvent:
 
     def accept(self) -> None:
         self.accepted = True
+
+
+def _iter_menu_actions(menu: QMenu):
+    for action in menu.actions():
+        yield action
+        submenu = action.menu()
+        if submenu is not None:
+            yield from _iter_menu_actions(submenu)
 
 
 class QtCanvasTests(unittest.TestCase):
@@ -429,6 +437,26 @@ class QtCanvasTests(unittest.TestCase):
         self.assertEqual(field.value, "5")
         self.assertEqual(changed, [])
         view.deleteLater()
+
+    def test_inline_node_field_editor_enter_commits_shift_enter_adds_newline(self) -> None:
+        editor = InlineNodeFieldEditor()
+        commits: list[bool] = []
+        editor.editingFinished.connect(commits.append)
+        editor.setPlainText("A")
+        editor.moveCursor(QTextCursor.End)
+
+        shift_enter = QKeyEvent(QEvent.Type.KeyPress, Qt.Key_Return, Qt.ShiftModifier)
+        editor.keyPressEvent(shift_enter)
+
+        self.assertEqual(editor.toPlainText(), "A\n")
+        self.assertEqual(commits, [])
+
+        enter = QKeyEvent(QEvent.Type.KeyPress, Qt.Key_Return, Qt.NoModifier)
+        editor.keyPressEvent(enter)
+
+        self.assertTrue(enter.isAccepted())
+        self.assertEqual(commits, [True])
+        editor.deleteLater()
 
     def test_inline_edit_node_title_updates_title_and_emits_change(self) -> None:
         canvas = CanvasData(name="主画布")
@@ -847,6 +875,52 @@ class QtCanvasTests(unittest.TestCase):
         show_context_menu.assert_not_called()
         self.assertTrue(event.accepted)
         self.assertFalse(view._suppress_context_menu)
+        view.deleteLater()
+
+    def test_node_context_menu_ai_iteration_action_emits_signal(self) -> None:
+        canvas = CanvasData(name="主画布")
+        node = canvas.add_node(Node(title="当前节点", x=0, y=0, width=320, height=180))
+        view = NodeGraphView(canvas)
+        emitted: list[bool] = []
+        view.aiIterateRequested.connect(lambda: emitted.append(True))
+        item = view.node_items[node.id]
+        scene_pos = item.sceneBoundingRect().center()
+        view_pos = view.mapFromScene(scene_pos)
+
+        def fake_exec(menu: QMenu, _global_pos: QPoint):
+            for action in _iter_menu_actions(menu):
+                if action.text() == "迭代助手":
+                    return action
+            return None
+
+        with mock.patch.object(view, "_exec_context_menu", side_effect=fake_exec):
+            view._show_context_menu(view_pos, QPoint(20, 20))
+
+        self.assertEqual(emitted, [True])
+        self.assertEqual(view.selected_node_ids, {node.id})
+        view.deleteLater()
+
+    def test_group_context_menu_ai_iteration_action_emits_signal(self) -> None:
+        canvas = CanvasData(name="主画布")
+        group = canvas.add_group(BlueprintGroup(title="参考组", x=0, y=0, width=420, height=260))
+        view = NodeGraphView(canvas)
+        emitted: list[bool] = []
+        view.aiIterateRequested.connect(lambda: emitted.append(True))
+        item = view.group_items[group.id]
+        scene_pos = item.sceneBoundingRect().center()
+        view_pos = view.mapFromScene(scene_pos)
+
+        def fake_exec(menu: QMenu, _global_pos: QPoint):
+            for action in _iter_menu_actions(menu):
+                if action.text() == "迭代助手":
+                    return action
+            return None
+
+        with mock.patch.object(view, "_exec_context_menu", side_effect=fake_exec):
+            view._show_context_menu(view_pos, QPoint(20, 20))
+
+        self.assertEqual(emitted, [True])
+        self.assertEqual(view.selected_group_ids, {group.id})
         view.deleteLater()
 
     def test_source_image_cache_reuses_loaded_pixmap(self) -> None:

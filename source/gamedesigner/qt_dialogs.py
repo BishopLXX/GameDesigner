@@ -66,6 +66,7 @@ from .project_files.linked_documents import import_link_document, read_link_docu
 from .qt_theme import palette
 from .storage import project_bundle_dir
 from .ui.image_paint_dialog import ImagePaintDialog
+from .ui.submit_text_edit import SubmitPlainTextEdit
 from .window_layouts import restore_window_layout, save_window_layout
 
 
@@ -725,7 +726,10 @@ class InlineFieldEditor(QPlainTextEdit):
         super().focusOutEvent(event)
 
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
-        if event.key() in (Qt.Key_Return, Qt.Key_Enter) and event.modifiers() & Qt.ControlModifier:
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            if event.modifiers() & Qt.ShiftModifier:
+                super().keyPressEvent(event)
+                return
             self.editingFinished.emit()
             event.accept()
             return
@@ -1224,8 +1228,9 @@ class NodeEditorDialog(QDialog):
         self.field_label_button.setToolTip("在节点卡片上显示字段名")
         self.field_type = QComboBox()
         self.field_type.addItems(FIELD_TYPES)
-        self.field_value = QPlainTextEdit()
+        self.field_value = SubmitPlainTextEdit()
         self.field_value.setFixedHeight(86)
+        self.field_value.submitted.connect(self._accept)
         self.image_path = QLineEdit()
         self.image_button: QPushButton | None = None
         self.draw_image_button: QPushButton | None = None

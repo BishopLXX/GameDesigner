@@ -289,6 +289,73 @@ def stylesheet(name: str) -> str:
         border-bottom: 1px solid {colors["hairline"]};
         min-height: 34px;
     }}
+    QStackedWidget#aiAssistantStack {{
+        background: {colors["window"]};
+        border-left: 1px solid {colors["hairline"]};
+    }}
+    QWidget#aiAssistantPanel {{
+        background: {colors["panel"]};
+        border-left: 1px solid {colors["hairline"]};
+    }}
+    QWidget#aiAssistantCollapsed {{
+        background: {colors["window"]};
+        border-left: 1px solid {colors["hairline"]};
+    }}
+    QLabel#aiAssistantTitle {{
+        color: {colors["text"]};
+        font-weight: 700;
+        font-size: 10pt;
+    }}
+    QLabel#aiAssistantActivityLabel {{
+        color: {colors["text_muted"]};
+        font-size: 9pt;
+        padding: 0 2px 2px 2px;
+    }}
+    QProgressBar#aiAssistantBusyBar {{
+        background: {colors["panel_alt"]};
+        border: 0;
+        border-radius: 2px;
+        min-height: 4px;
+        max-height: 4px;
+    }}
+    QProgressBar#aiAssistantBusyBar::chunk {{
+        background: {colors["blue"]};
+        border-radius: 2px;
+    }}
+    QPlainTextEdit#aiAssistantActivityLog {{
+        background: {colors["panel_alt"]};
+        color: {colors["text_muted"]};
+        border: 1px solid {colors["hairline"]};
+        border-radius: 8px;
+        padding: 8px;
+        font-family: Consolas, "Cascadia Mono", monospace;
+        font-size: 8pt;
+    }}
+    QToolButton#aiAssistantCollapseButton {{
+        background: transparent;
+        color: {colors["text_muted"]};
+        border: 1px solid transparent;
+        border-radius: 7px;
+        padding: 3px 8px;
+    }}
+    QToolButton#aiAssistantCollapseButton:hover {{
+        background: {colors["control_hover"]};
+        color: {colors["text"]};
+        border-color: {colors["hairline"]};
+    }}
+    QToolButton#aiAssistantHandleButton {{
+        background: {colors["control"]};
+        color: {colors["text"]};
+        border: 1px solid {colors["hairline"]};
+        border-radius: 8px;
+        padding: 9px 4px;
+        font-weight: 600;
+        min-width: 30px;
+    }}
+    QToolButton#aiAssistantHandleButton:hover {{
+        background: {colors["control_hover"]};
+        border-color: {colors["accent"]};
+    }}
     QLabel#canvasFunctionLabel {{
         color: {colors["text_muted"]};
         padding-right: 6px;

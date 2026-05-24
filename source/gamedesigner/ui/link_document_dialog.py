@@ -10,7 +10,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMessageBox,
-    QPlainTextEdit,
     QPushButton,
     QSplitter,
     QTextBrowser,
@@ -26,6 +25,7 @@ from ..project_files.linked_documents import (
     write_link_document,
 )
 from ..window_layouts import restore_window_layout, save_window_layout
+from .submit_text_edit import SubmitPlainTextEdit
 
 
 class LinkDocumentDialog(QDialog):
@@ -52,9 +52,10 @@ class LinkDocumentDialog(QDialog):
         if not initial_content and not self.relative_path:
             initial_content = self._default_content()
 
-        self.editor = QPlainTextEdit()
+        self.editor = SubmitPlainTextEdit()
         self.editor.setPlainText(initial_content)
         self.editor.textChanged.connect(self._update_preview)
+        self.editor.submitted.connect(self._save)
 
         self.preview = QTextBrowser()
         self.preview.setOpenExternalLinks(True)

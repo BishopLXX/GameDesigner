@@ -6,12 +6,15 @@ from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QPointF
+from PySide6.QtCore import QEvent, QPointF, Qt
+from PySide6.QtGui import QKeyEvent, QTextCursor
 from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
 
 from gamedesigner.app import GameDesignerApp
+from gamedesigner.ai_tools import AiCanvasAction, AiCanvasFieldChange
+from gamedesigner.ai_tools import AiChatMessage, load_project_chat_history, save_project_chat_history
 from gamedesigner.canvas_io import import_canvas_sheet
-from gamedesigner.qt_dialogs import HEADER_HEIGHT, NodeEditorDialog
+from gamedesigner.qt_dialogs import HEADER_HEIGHT, InlineFieldEditor, NodeEditorDialog
 from gamedesigner.models import BlueprintGroup, Node, NodeField, NodeTemplate, ProjectData
 from gamedesigner.storage import (
     AppSettings,
@@ -22,6 +25,8 @@ from gamedesigner.storage import (
     save_settings,
 )
 from gamedesigner.ui.link_document_dialog import LinkDocumentDialog
+from gamedesigner.ui.ai_chat_dialog import AiChatPanel
+from gamedesigner.ui.submit_text_edit import SubmitPlainTextEdit
 
 
 class AppEditingTests(unittest.TestCase):
@@ -129,6 +134,279 @@ class AppEditingTests(unittest.TestCase):
         self.assertIn("AI上下文测试", context)
         self.assertIn("关键节点", context)
         self.assertIn("当前选中", context)
+        window.deleteLater()
+
+    def test_ai_assistant_lives_in_collapsible_right_panel(self) -> None:
+        window = GameDesignerApp()
+
+        self.assertFalse(window.ai_assistant_expanded)
+        self.assertEqual(window.ai_assistant_stack.width(), 42)
+
+        window._open_ai_chat()
+
+        self.assertTrue(window.ai_assistant_expanded)
+        self.assertIsNotNone(window.ai_assistant_panel)
+        self.assertEqual(window.ai_assistant_stack.width(), 560)
+        self.assertIs(window.ai_assistant_stack.currentWidget(), window.ai_assistant_panel)
+
+        window._collapse_ai_assistant()
+
+        self.assertFalse(window.ai_assistant_expanded)
+        self.assertEqual(window.ai_assistant_stack.width(), 42)
+        self.assertIs(window.ai_assistant_stack.currentWidget(), window.ai_assistant_collapsed)
+        window.deleteLater()
+
+    def test_ai_panel_clear_screen_keeps_project_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "MemoryProject.gdc"
+            save_project_chat_history(
+                project_path,
+                [AiChatMessage("user", "上一轮"), AiChatMessage("assistant", "上一答")],
+            )
+
+            panel = AiChatPanel(
+                None,
+                AppSettings(ai_provider="codex", ai_model="gpt-5.4"),
+                lambda: ("项目上下文", project_path.parent, project_path),
+            )
+
+            self.assertEqual(panel.clear_button.text(), "清空屏幕")
+            self.assertIn("上一轮", panel.transcript.toPlainText())
+
+            panel.clear_button.click()
+
+            self.assertNotIn("上一轮", panel.transcript.toPlainText())
+            self.assertIn("会话记忆仍保留", panel.transcript.toPlainText())
+            loaded = load_project_chat_history(project_path)
+            self.assertEqual([message.content for message in loaded], ["上一轮", "上一答"])
+            self.assertEqual([message.content for message in panel._history], ["上一轮", "上一答"])
+            panel.deleteLater()
+
+    def test_ai_panel_activity_log_and_busy_state_are_visible(self) -> None:
+        project_path = Path("D:/GameDesigner/ActivityProject.gdc")
+        panel = AiChatPanel(
+            None,
+            AppSettings(ai_provider="codex", ai_model="gpt-5.4"),
+            lambda: ("项目上下文", project_path.parent, project_path),
+        )
+
+        panel._start_activity("codex 正在思考")
+        panel._tick_activity()
+        panel._append_activity_from_chunk("thinking **Inspecting canvas**\n普通回复正文不显示\nrunning command: rg nodes", "运行日志")
+
+        self.assertFalse(panel.busy_bar.isHidden())
+        self.assertIn("codex 正在思考", panel.activity_label.text())
+        log_text = panel.activity_log.toPlainText()
+        self.assertIn("Inspecting canvas", log_text)
+        self.assertIn("running command", log_text)
+        self.assertNotIn("普通回复正文不显示", log_text)
+        self.assertNotIn("Inspecting canvas", panel.transcript.toPlainText())
+
+        panel._stop_activity()
+
+        self.assertTrue(panel.busy_bar.isHidden())
+        self.assertEqual(panel.activity_label.text(), "就绪")
+        panel.deleteLater()
+
+    def test_ai_panel_activity_log_is_separate_and_keeps_recent_lines(self) -> None:
+        project_path = Path("D:/GameDesigner/ActivityTrimProject.gdc")
+        panel = AiChatPanel(
+            None,
+            AppSettings(ai_provider="codex", ai_model="gpt-5.4"),
+            lambda: ("项目上下文", project_path.parent, project_path),
+        )
+
+        panel._append_activity_lines([f"running command {index}" for index in range(60)], "运行日志")
+
+        log_lines = panel.activity_log.toPlainText().splitlines()
+        self.assertEqual(len(log_lines), 48)
+        self.assertNotIn("running command 0", panel.activity_log.toPlainText())
+        self.assertIn("running command 59", panel.activity_log.toPlainText())
+        self.assertNotIn("running command", panel.transcript.toPlainText())
+
+        panel._clear_screen()
+
+        self.assertEqual(panel.activity_log.toPlainText(), "")
+        panel.deleteLater()
+
+    def test_submit_plain_text_edit_enter_submits_shift_enter_inserts_newline(self) -> None:
+        editor = SubmitPlainTextEdit()
+        submitted: list[bool] = []
+        editor.submitted.connect(lambda: submitted.append(True))
+        editor.setPlainText("问题")
+        editor.moveCursor(QTextCursor.End)
+
+        shift_enter = QKeyEvent(QEvent.Type.KeyPress, Qt.Key_Return, Qt.ShiftModifier)
+        editor.keyPressEvent(shift_enter)
+
+        self.assertEqual(editor.toPlainText(), "问题\n")
+        self.assertEqual(submitted, [])
+
+        enter = QKeyEvent(QEvent.Type.KeyPress, Qt.Key_Return, Qt.NoModifier)
+        editor.keyPressEvent(enter)
+
+        self.assertTrue(enter.isAccepted())
+        self.assertEqual(submitted, [True])
+        editor.deleteLater()
+
+    def test_inline_field_editor_enter_commits_shift_enter_inserts_newline(self) -> None:
+        editor = InlineFieldEditor()
+        committed: list[bool] = []
+        editor.editingFinished.connect(lambda: committed.append(True))
+        editor.setPlainText("内容")
+        editor.moveCursor(QTextCursor.End)
+
+        shift_enter = QKeyEvent(QEvent.Type.KeyPress, Qt.Key_Return, Qt.ShiftModifier)
+        editor.keyPressEvent(shift_enter)
+
+        self.assertEqual(editor.toPlainText(), "内容\n")
+        self.assertEqual(committed, [])
+
+        enter = QKeyEvent(QEvent.Type.KeyPress, Qt.Key_Return, Qt.NoModifier)
+        editor.keyPressEvent(enter)
+
+        self.assertTrue(enter.isAccepted())
+        self.assertEqual(committed, [True])
+        editor.deleteLater()
+
+    def test_apply_ai_canvas_actions_creates_and_updates_current_canvas_nodes(self) -> None:
+        window = GameDesignerApp()
+        project = ProjectData(name="AI助手操作测试")
+        project.ensure_canvas_structure()
+        canvas = project.root_canvas()
+        source = canvas.add_node(Node(title="参考节点", x=100, y=120, fields=[NodeField("内容信息", "长文本", "旧内容")]))
+        page = window._add_page(project, None, dirty=False, canvas_data=canvas)
+        window.tabs.setCurrentWidget(page)
+        page.canvas.select_node(source.id)
+
+        message = window._apply_ai_canvas_actions(
+            [
+                AiCanvasAction(
+                    type="create_node",
+                    title="延伸节点",
+                    icon="延",
+                    fields=[AiCanvasFieldChange("内容信息", "长文本", "基于参考节点继续迭代")],
+                ),
+                AiCanvasAction(
+                    type="update_node",
+                    node_id=source.id,
+                    title="参考节点强化版",
+                    fields=[AiCanvasFieldChange("内容信息", "长文本", "更新后的内容")],
+                ),
+            ]
+        )
+
+        self.assertIn("创建 1 个节点", message)
+        self.assertIn("更新 1 个节点", message)
+        self.assertEqual(len(canvas.nodes), 2)
+        created = next(node for node in canvas.nodes if node.id != source.id)
+        self.assertEqual(created.title, "延伸节点")
+        self.assertEqual(created.fields[0].value, "基于参考节点继续迭代")
+        self.assertGreater(created.x, source.x)
+        self.assertEqual(source.title, "参考节点强化版")
+        self.assertEqual(source.fields[0].value, "更新后的内容")
+        self.assertEqual(page.canvas.selected_node_ids, {source.id, created.id})
+        self.assertTrue(page.dirty)
+        window.deleteLater()
+
+    def test_ai_create_node_inherits_selected_node_template(self) -> None:
+        window = GameDesignerApp()
+        name_field = NodeField("节点名字", "文本", "原技能")
+        desc_field = NodeField("解锁描述", "长文本", "旧描述")
+        template = NodeTemplate(
+            id="template_skill",
+            name="技能模板",
+            title_field_id=name_field.id,
+            fields=[name_field, desc_field],
+        )
+        project = ProjectData(name="AI模板继承测试", templates=[template])
+        project.ensure_canvas_structure()
+        canvas = project.root_canvas()
+        source = template.create_node(100, 120)
+        canvas.add_node(source)
+        page = window._add_page(project, None, dirty=False, canvas_data=canvas)
+        window.tabs.setCurrentWidget(page)
+        page.canvas.select_node(source.id)
+
+        message = window._apply_ai_canvas_actions(
+            [
+                AiCanvasAction(
+                    type="create_node",
+                    title="火焰冲刺",
+                    fields=[
+                        AiCanvasFieldChange("节点名字", "文本", "火焰冲刺"),
+                        AiCanvasFieldChange("解锁描述", "长文本", "冲刺后留下燃烧路径"),
+                    ],
+                )
+            ]
+        )
+
+        created = next(node for node in canvas.nodes if node.id != source.id)
+        self.assertIn("创建 1 个节点", message)
+        self.assertEqual(created.template_id, template.id)
+        self.assertEqual([field.name for field in created.fields], ["节点名字", "解锁描述"])
+        self.assertEqual(created.fields[0].value, "火焰冲刺")
+        self.assertEqual(created.fields[1].value, "冲刺后留下燃烧路径")
+        window.deleteLater()
+
+    def test_ai_create_group_creates_group_and_member_nodes(self) -> None:
+        window = GameDesignerApp()
+        project = ProjectData(name="AI蓝图组测试")
+        project.ensure_canvas_structure()
+        canvas = project.root_canvas()
+        group = canvas.add_group(BlueprintGroup(title="参考组", x=100, y=120, width=640, height=280))
+        canvas.add_node(Node(title="参考节点", group_id=group.id, x=140, y=180, fields=[NodeField("内容信息", "长文本", "参考")]))
+        page = window._add_page(project, None, dirty=False, canvas_data=canvas)
+        window.tabs.setCurrentWidget(page)
+        page.canvas.select_group(group.id)
+
+        message = window._apply_ai_canvas_actions(
+            [
+                AiCanvasAction(
+                    type="create_group",
+                    title="迭代组",
+                    nodes=[
+                        AiCanvasAction(
+                            type="create_node",
+                            title="迭代节点A",
+                            fields=[AiCanvasFieldChange("内容信息", "长文本", "A")],
+                        ),
+                        AiCanvasAction(
+                            type="create_node",
+                            title="迭代节点B",
+                            fields=[AiCanvasFieldChange("内容信息", "长文本", "B")],
+                        ),
+                    ],
+                )
+            ]
+        )
+
+        self.assertIn("创建 1 个蓝图组", message)
+        self.assertIn("创建 2 个节点", message)
+        created_group = next(item for item in canvas.groups if item.id != group.id)
+        created_nodes = [node for node in canvas.nodes if node.group_id == created_group.id]
+        self.assertEqual(created_group.title, "迭代组")
+        self.assertEqual([node.title for node in created_nodes], ["迭代节点A", "迭代节点B"])
+        self.assertEqual(page.canvas.selected_node_ids, {node.id for node in created_nodes})
+        self.assertEqual(page.canvas.selected_group_ids, {created_group.id})
+        window.deleteLater()
+
+    def test_ai_iteration_assistant_expands_panel_and_enters_iteration_mode(self) -> None:
+        window = GameDesignerApp()
+        project = ProjectData(name="AI右键迭代测试")
+        project.ensure_canvas_structure()
+        canvas = project.root_canvas()
+        node = canvas.add_node(Node(title="参考节点"))
+        page = window._add_page(project, None, dirty=False, canvas_data=canvas)
+        window.tabs.setCurrentWidget(page)
+        page.canvas.select_node(node.id)
+
+        window._open_ai_iteration_assistant()
+
+        self.assertTrue(window.ai_assistant_expanded)
+        self.assertIsNotNone(window.ai_assistant_panel)
+        self.assertTrue(window.ai_assistant_panel._iteration_mode)
+        self.assertIn("基于当前选中对象继续迭代", window.ai_assistant_panel.input.toPlainText())
         window.deleteLater()
 
     def test_add_node_inside_group_assigns_group_membership(self) -> None:
@@ -562,6 +840,25 @@ class AppEditingTests(unittest.TestCase):
         self.assertTrue(dialog.result.fields[0].show_label)
         dialog.deleteLater()
 
+    def test_node_editor_field_value_enter_accepts_shift_enter_keeps_multiline(self) -> None:
+        node = Node(title="属性", fields=[NodeField("说明", "长文本", "第一行")])
+        dialog = NodeEditorDialog(None, node, templates=[])
+        dialog.field_value.setPlainText("第一行")
+        dialog.field_value.moveCursor(QTextCursor.End)
+
+        shift_enter = QKeyEvent(QEvent.Type.KeyPress, Qt.Key_Return, Qt.ShiftModifier)
+        dialog.field_value.keyPressEvent(shift_enter)
+        dialog.field_value.insertPlainText("第二行")
+
+        self.assertIsNone(dialog.result)
+        self.assertEqual(dialog.field_value.toPlainText(), "第一行\n第二行")
+
+        enter = QKeyEvent(QEvent.Type.KeyPress, Qt.Key_Return, Qt.NoModifier)
+        dialog.field_value.keyPressEvent(enter)
+
+        self.assertEqual(dialog.result.fields[0].value, "第一行\n第二行")
+        dialog.deleteLater()
+
     def test_node_editor_canvas_resize_sets_node_size(self) -> None:
         node = Node(title="模块", fields=[NodeField("名称", "文本", "攻击模块", x=20, y=18, width=180, height=40)])
         dialog = NodeEditorDialog(None, node, templates=[])
@@ -940,6 +1237,28 @@ class AppEditingTests(unittest.TestCase):
             self.assertTrue(dialog.saved)
             self.assertEqual(dialog.relative_path, "linked_docs/预览文档.md")
             self.assertTrue((project_path.parent / f"{project_path.name}.files" / "linked_docs" / "预览文档.md").exists())
+            dialog.deleteLater()
+
+    def test_link_document_editor_enter_saves_shift_enter_inserts_newline(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "EnterSaveProject.gdc"
+            dialog = LinkDocumentDialog(None, project_path, "", "回车保存", "md")
+            dialog.editor.setPlainText("# 回车保存")
+            dialog.editor.moveCursor(QTextCursor.End)
+
+            shift_enter = QKeyEvent(QEvent.Type.KeyPress, Qt.Key_Return, Qt.ShiftModifier)
+            dialog.editor.keyPressEvent(shift_enter)
+            dialog.editor.insertPlainText("第二行")
+
+            self.assertFalse(dialog.saved)
+            self.assertEqual(dialog.editor.toPlainText(), "# 回车保存\n第二行")
+
+            enter = QKeyEvent(QEvent.Type.KeyPress, Qt.Key_Return, Qt.NoModifier)
+            dialog.editor.keyPressEvent(enter)
+
+            self.assertTrue(dialog.saved)
+            path = project_path.parent / f"{project_path.name}.files" / "linked_docs" / "回车保存.md"
+            self.assertEqual(path.read_text(encoding="utf-8"), "# 回车保存\n第二行")
             dialog.deleteLater()
 
     def test_node_editor_dialog_restores_project_window_layout(self) -> None:

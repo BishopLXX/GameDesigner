@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
     QToolButton,
     QInputDialog,
     QStackedLayout,
+    QStackedWidget,
     QWidget,
     QVBoxLayout,
 )
@@ -48,6 +49,7 @@ from .models import (
     CanvasData,
     Node,
     NodeField,
+    NodeTemplate,
     ProjectData,
     default_project,
     default_tech_tree_node,
@@ -447,7 +449,22 @@ class GameDesignerApp(QMainWindow):
         self.tabs.setMovable(True)
         self.tabs.currentChanged.connect(lambda _index: self._on_current_tab_changed())
         self.tabs.tabCloseRequested.connect(self._close_tab)
-        self.setCentralWidget(self.tabs)
+        self.ai_assistant_panel = None
+        self.ai_assistant_expanded = False
+        self.ai_assistant_stack = QStackedWidget(self)
+        self.ai_assistant_stack.setObjectName("aiAssistantStack")
+        self.ai_assistant_stack.setFixedWidth(42)
+        self.ai_assistant_collapsed = self._build_ai_assistant_collapsed_handle()
+        self.ai_assistant_stack.addWidget(self.ai_assistant_collapsed)
+        self.ai_assistant_stack.setCurrentWidget(self.ai_assistant_collapsed)
+
+        self.workspace = QWidget(self)
+        workspace_layout = QHBoxLayout(self.workspace)
+        workspace_layout.setContentsMargins(0, 0, 0, 0)
+        workspace_layout.setSpacing(0)
+        workspace_layout.addWidget(self.tabs, 1)
+        workspace_layout.addWidget(self.ai_assistant_stack)
+        self.setCentralWidget(self.workspace)
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
@@ -534,7 +551,7 @@ class GameDesignerApp(QMainWindow):
         self.template_action = QAction("节点模板...", self)
         self.template_action.triggered.connect(self._manage_templates)
 
-        self.ai_chat_action = QAction("AI 工程聊天...", self)
+        self.ai_chat_action = QAction("AI 助手...", self)
         self.ai_chat_action.setShortcut(QKeySequence("Ctrl+Shift+A"))
         self.ai_chat_action.triggered.connect(self._open_ai_chat)
 
@@ -600,6 +617,23 @@ class GameDesignerApp(QMainWindow):
         self.ai_menu = QMenu("AI", self)
         self.ai_menu.addAction(self.ai_chat_action)
         self.ai_menu.addAction(self.ai_settings_action)
+
+    def _build_ai_assistant_collapsed_handle(self) -> QWidget:
+        holder = QWidget(self)
+        holder.setObjectName("aiAssistantCollapsed")
+        layout = QVBoxLayout(holder)
+        layout.setContentsMargins(4, 8, 4, 8)
+        layout.setSpacing(8)
+        button = QToolButton(holder)
+        button.setObjectName("aiAssistantHandleButton")
+        button.setText("AI\n助手")
+        button.setToolTip("展开 AI 助手")
+        button.setAutoRaise(True)
+        button.clicked.connect(self._open_ai_chat)
+        layout.addStretch(1)
+        layout.addWidget(button)
+        layout.addStretch(1)
+        return holder
 
     def _build_toolbar(self) -> None:
         self.titlebar = CompactTitleBar(self, self.icon_path)
@@ -724,6 +758,7 @@ class GameDesignerApp(QMainWindow):
         canvas.dataCanvasImportRequested.connect(self._import_canvas_sheet)
         canvas.templateManagerRequested.connect(self._manage_templates)
         canvas.openProjectRequested.connect(self._open_project)
+        canvas.aiIterateRequested.connect(self._open_ai_iteration_assistant)
         page.table_view.projectChanged.connect(lambda page=page: self._mark_dirty(page))
         page.parentJumpRequested.connect(lambda page=page: self._jump_to_parent_canvas(page))
         page.returnCloseRequested.connect(lambda page=page: self._return_to_previous_canvas(page))
@@ -2387,18 +2422,32 @@ class GameDesignerApp(QMainWindow):
         self._mark_dirty(page)
 
     def _open_ai_chat(self) -> None:
-        from .ui.ai_chat_dialog import AiChatDialog
+        self._open_ai_assistant_panel()
 
-        dialog = getattr(self, "_ai_chat_dialog", None)
-        if isinstance(dialog, AiChatDialog):
-            dialog.show()
-            dialog.raise_()
-            dialog.activateWindow()
-            return
-        dialog = AiChatDialog(self, self.settings, self._current_ai_project_context)
-        dialog.destroyed.connect(lambda _obj=None: setattr(self, "_ai_chat_dialog", None))
-        self._ai_chat_dialog = dialog
-        dialog.show()
+    def _open_ai_iteration_assistant(self) -> None:
+        panel = self._open_ai_assistant_panel()
+        if hasattr(panel, "enter_iteration_mode"):
+            panel.enter_iteration_mode()
+
+    def _open_ai_assistant_panel(self):
+        from .ui.ai_chat_dialog import AiChatPanel
+
+        if not isinstance(self.ai_assistant_panel, AiChatPanel):
+            panel = AiChatPanel(self, self.settings, self._current_ai_project_context, self._apply_ai_canvas_actions)
+            panel.collapseRequested.connect(self._collapse_ai_assistant)
+            self.ai_assistant_panel = panel
+            self.ai_assistant_stack.addWidget(panel)
+        self.ai_assistant_expanded = True
+        self.ai_assistant_stack.setFixedWidth(560)
+        self.ai_assistant_stack.setCurrentWidget(self.ai_assistant_panel)
+        self.ai_assistant_panel.show()
+        self.ai_assistant_panel.input.setFocus(Qt.OtherFocusReason)
+        return self.ai_assistant_panel
+
+    def _collapse_ai_assistant(self) -> None:
+        self.ai_assistant_expanded = False
+        self.ai_assistant_stack.setFixedWidth(42)
+        self.ai_assistant_stack.setCurrentWidget(self.ai_assistant_collapsed)
 
     def _open_ai_settings(self) -> None:
         from .ui.ai_chat_dialog import AiSettingsDialog
@@ -2411,7 +2460,7 @@ class GameDesignerApp(QMainWindow):
 
         page = self._current_page()
         if not page or page.is_welcome:
-            raise ValueError("请先打开一个项目画布，再使用 AI 工程聊天。")
+            raise ValueError("请先打开一个项目画布，再使用 AI 助手。")
         project_path = self._ensure_project_path_for_files(page)
         context = build_project_chat_context(
             page.project,
@@ -2422,6 +2471,232 @@ class GameDesignerApp(QMainWindow):
             selected_edge_id=page.selected_edge_id,
         )
         return context, project_path.parent, project_path
+
+    def _apply_ai_canvas_actions(self, actions: list[Any]) -> str:
+        from .ai_tools import AiCanvasAction
+
+        page = self._current_page()
+        if not page or page.is_welcome:
+            raise ValueError("请先打开一个项目画布，再应用 AI 画布操作。")
+        if not actions:
+            return "没有可应用的画布操作。"
+        created = 0
+        updated = 0
+        created_groups = 0
+        selected_ids: set[str] = set()
+        selected_group_ids: set[str] = set()
+        base = self._ai_action_base_position(page)
+        create_index = 0
+        for action in actions:
+            if not isinstance(action, AiCanvasAction):
+                continue
+            if action.type == "create_group":
+                group = self._group_from_ai_action(page, action, base, created_groups + 1)
+                page.canvas_data.add_group(group)
+                selected_group_ids.add(group.id)
+                created_groups += 1
+                group_base = QPointF(group.x + 32, group.y + 54)
+                for group_node_index, node_action in enumerate(action.nodes, start=1):
+                    node_action.group_id = group.id
+                    node = self._node_from_ai_action(page, node_action, group_base, group_node_index)
+                    node.group_id = group.id
+                    page.canvas_data.add_node(node)
+                    selected_ids.add(node.id)
+                    created += 1
+                continue
+            if action.type == "create_node":
+                create_index += 1
+                node = self._node_from_ai_action(page, action, base, create_index)
+                page.canvas_data.add_node(node)
+                selected_ids.add(node.id)
+                created += 1
+            elif action.type == "update_node":
+                node = page.canvas_data.find_node(action.node_id)
+                if node is None:
+                    continue
+                self._apply_ai_update_to_node(node, action)
+                selected_ids.add(node.id)
+                updated += 1
+        if not created and not updated and not created_groups:
+            raise ValueError("AI 没有提供能应用到当前画布的操作。")
+        if page.canvas_data.is_data_canvas():
+            self._sync_canvas_state(page)
+            page.table_view.set_canvas(page.project, page.canvas_data)
+        page.canvas.rebuild()
+        if selected_ids:
+            page.canvas.select_nodes(selected_ids)
+            if selected_group_ids:
+                page.canvas.selected_group_ids = set(selected_group_ids)
+                for group_id, item in page.canvas.group_items.items():
+                    item.setSelected(group_id in selected_group_ids)
+        elif selected_group_ids:
+            page.canvas.select_group(next(iter(selected_group_ids)))
+        self._mark_dirty(page)
+        parts: list[str] = []
+        if created_groups:
+            parts.append(f"创建 {created_groups} 个蓝图组")
+        if created:
+            parts.append(f"创建 {created} 个节点")
+        if updated:
+            parts.append(f"更新 {updated} 个节点")
+        return "已应用到当前画布：" + "，".join(parts) + "。"
+
+    def _ai_action_base_position(self, page: ProjectPage) -> QPointF:
+        selected = [
+            node
+            for node in page.canvas_data.nodes
+            if node.id in page.canvas.selected_node_ids
+        ]
+        if selected:
+            right = max(node.x + (node.width or 320) for node in selected)
+            top = min(node.y for node in selected)
+            return QPointF(right + 80, top)
+        selected_groups = [
+            group
+            for group in page.canvas_data.groups
+            if group.id in page.canvas.selected_group_ids
+        ]
+        if selected_groups:
+            right = max(group.x + group.width for group in selected_groups)
+            top = min(group.y for group in selected_groups)
+            return QPointF(right + 80, top)
+        center = page.canvas.center_world()
+        return QPointF(center.x() - 180, center.y() - 90)
+
+    def _group_from_ai_action(
+        self,
+        page: ProjectPage,
+        action: Any,
+        base: QPointF,
+        index: int,
+    ) -> BlueprintGroup:
+        x = action.x if action.x is not None else base.x() + ((index - 1) % 2) * 720
+        y = action.y if action.y is not None else base.y() + ((index - 1) // 2) * 340
+        width = max(360.0, float(action.width or 640.0))
+        height = max(220.0, float(action.height or 300.0))
+        if action.nodes:
+            rows = (len(action.nodes) + 1) // 2
+            height = max(height, 96.0 + rows * 240.0)
+            width = max(width, 900.0 if len(action.nodes) > 1 else 460.0)
+        return BlueprintGroup(
+            title=action.title or "AI 蓝图组",
+            x=float(x),
+            y=float(y),
+            width=width,
+            height=height,
+            color=action.color or "#486A96",
+        )
+
+    def _node_from_ai_action(
+        self,
+        page: ProjectPage,
+        action: Any,
+        base: QPointF,
+        index: int,
+    ) -> Node:
+        x = action.x if action.x is not None else base.x() + ((index - 1) % 2) * 460
+        y = action.y if action.y is not None else base.y() + ((index - 1) // 2) * 240
+        template = self._template_for_ai_action(page, action)
+        if template is not None and action.node_type not in {"画布", "超文本"}:
+            node = template.create_node(float(x), float(y))
+            node.template_locked = page.canvas_data.is_data_canvas()
+            node.title = action.title or node.title
+            if action.icon:
+                node.icon = action.icon
+                node.icon_from_title = False
+            if action.color:
+                node.color = action.color
+            self._apply_ai_fields_to_node(node, action)
+        else:
+            fields = [
+                NodeField(field.name, field.data_type, field.value)
+                for field in action.fields
+            ]
+            if not fields:
+                fields = [NodeField("内容信息", "长文本", "")]
+            node = Node(
+                title=action.title or "AI 节点",
+                node_type=action.node_type if action.node_type in {"普通", "画布", "超文本"} else "普通",
+                icon=action.icon or (action.title[:1] if action.title else "AI"),
+                icon_from_title=not bool(action.icon),
+                x=float(x),
+                y=float(y),
+                width=max(0.0, float(action.width or 0.0)),
+                height=max(0.0, float(action.height or 0.0)),
+                color=action.color or "#ffffff",
+                group_id=action.group_id,
+                fields=fields,
+            )
+        node.x = float(x)
+        node.y = float(y)
+        if action.width is not None:
+            node.width = max(0.0, float(action.width))
+        if action.height is not None:
+            node.height = max(0.0, float(action.height))
+        if action.group_id:
+            node.group_id = action.group_id
+        if not any(group.id == node.group_id for group in page.canvas_data.groups):
+            node.group_id = page.canvas.group_id_at_scene_pos(QPointF(node.x, node.y))
+        if node.node_type == "画布":
+            canvas = page.project.add_canvas(node.title, parent_canvas_id=page.canvas_id, parent_node_id=node.id)
+            node.canvas_id = canvas.id
+            node.icon = node.icon or "画"
+        elif node.node_type == "超文本":
+            node.link_format = "md"
+            node.link_path = ""
+        return node
+
+    def _template_for_ai_action(self, page: ProjectPage, action: Any) -> NodeTemplate | None:
+        if action.template_id:
+            template = page.project.find_template(action.template_id)
+            if template is not None:
+                return template
+        if page.canvas_data.is_data_canvas():
+            return self._data_canvas_template_for_page(page)
+        selected_nodes = [
+            node
+            for node in page.canvas_data.nodes
+            if node.id in page.canvas.selected_node_ids
+        ]
+        for node in selected_nodes:
+            template = page.project.find_template(node.template_id)
+            if template is not None:
+                return template
+        for group_id in page.canvas.selected_group_ids:
+            for node in page.canvas_data.nodes:
+                if node.group_id != group_id:
+                    continue
+                template = page.project.find_template(node.template_id)
+                if template is not None:
+                    return template
+        return None
+
+    def _apply_ai_update_to_node(self, node: Node, action: Any) -> None:
+        if action.title:
+            node.title = action.title
+        if action.icon:
+            node.icon = action.icon
+            node.icon_from_title = False
+        if action.color:
+            node.color = action.color
+        if action.width is not None:
+            node.width = max(0.0, float(action.width))
+        if action.height is not None:
+            node.height = max(0.0, float(action.height))
+        self._apply_ai_fields_to_node(node, action)
+
+    def _apply_ai_fields_to_node(self, node: Node, action: Any) -> None:
+        for field_change in action.fields:
+            field = next((item for item in node.fields if item.name == field_change.name), None)
+            if field is None:
+                node.fields.append(NodeField(field_change.name, field_change.data_type, field_change.value))
+                continue
+            field.data_type = field_change.data_type
+            field.value = field_change.value
+        if node.title_field_id:
+            title_field = next((item for item in node.fields if item.id == node.title_field_id), None)
+            if title_field is not None and title_field.value.strip() and not action.title:
+                node.title = title_field.value.strip()
 
     def _reset_view(self) -> None:
         page = self._current_page()

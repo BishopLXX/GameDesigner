@@ -95,9 +95,10 @@ class InlineNodeFieldEditor(QPlainTextEdit):
             self.setLineWrapMode(QPlainTextEdit.NoWrap)
 
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
-        if event.key() in (Qt.Key_Return, Qt.Key_Enter) and (
-            self.single_line or event.modifiers() & Qt.ControlModifier
-        ):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            if not self.single_line and event.modifiers() & Qt.ShiftModifier:
+                super().keyPressEvent(event)
+                return
             self.editingFinished.emit(True)
             event.accept()
             return
@@ -1811,6 +1812,7 @@ class NodeGraphView(QGraphicsView):
     dataCanvasImportRequested = Signal()
     templateManagerRequested = Signal()
     openProjectRequested = Signal()
+    aiIterateRequested = Signal()
 
     def __init__(
         self,
@@ -3047,7 +3049,7 @@ class NodeGraphView(QGraphicsView):
                 open_folder_action = None
                 if node.node.id in self.folder_action_node_ids:
                     open_folder_action = menu.addAction("打开项目所在文件夹")
-                action = menu.exec(global_pos)
+                action = self._exec_context_menu(menu, global_pos)
                 if action == open_action:
                     self.nodeActivated.emit(node.node.id)
                 elif open_folder_action and action == open_folder_action:
@@ -3057,7 +3059,7 @@ class NodeGraphView(QGraphicsView):
             open_project = menu.addAction("打开项目...")
             menu.addSeparator()
             reset = menu.addAction("重置视图")
-            action = menu.exec(global_pos)
+            action = self._exec_context_menu(menu, global_pos)
             if action == create:
                 self.createNodeRequested.emit(scene_pos.x(), scene_pos.y())
             elif action == open_project:
@@ -3073,16 +3075,20 @@ class NodeGraphView(QGraphicsView):
             elif node.node.node_type == "超文本":
                 open_link = menu.addAction("打开文档")
             edit = menu.addAction("编辑节点")
+            ai_menu = menu.addMenu("AI")
+            ai_iterate = ai_menu.addAction("迭代助手")
             connect = None if self.is_data_canvas() else menu.addAction("连接")
             menu.addSeparator()
             delete = menu.addAction("删除节点")
-            action = menu.exec(global_pos)
+            action = self._exec_context_menu(menu, global_pos)
             if open_canvas and action == open_canvas:
                 self.nodeActivated.emit(node.node.id)
             elif open_link and action == open_link:
                 self.nodeActivated.emit(node.node.id)
             elif action == edit:
                 self.nodeEditRequested.emit(node.node.id)
+            elif action == ai_iterate:
+                self.aiIterateRequested.emit()
             elif connect and action == connect:
                 self.start_connection(node.node.id)
             elif action == delete:
@@ -3107,7 +3113,7 @@ class NodeGraphView(QGraphicsView):
             orthogonal.setCheckable(True)
             orthogonal.setChecked(edge.edge.style == "orthogonal")
             delete_edge = menu.addAction("删除连线")
-            action = menu.exec(global_pos)
+            action = self._exec_context_menu(menu, global_pos)
             if delete_route_point and action == delete_route_point:
                 if edge.delete_route_point_at_scene(scene_pos):
                     self.projectChanged.emit()
@@ -3125,10 +3131,15 @@ class NodeGraphView(QGraphicsView):
         if group_body:
             create_menu, create_actions = self._build_create_menu(menu)
             edit_group = menu.addAction("重命名蓝图组")
+            ai_menu = menu.addMenu("AI")
+            ai_iterate = ai_menu.addAction("迭代助手")
             connect_group = None if self.is_data_canvas() else menu.addAction("连接")
             menu.addSeparator()
             delete_group = menu.addAction("删除蓝图组")
-            action = menu.exec(global_pos)
+            action = self._exec_context_menu(menu, global_pos)
+            if action == ai_iterate:
+                self.aiIterateRequested.emit()
+                return
             if self._handle_create_action(action, create_actions, scene_pos):
                 return
             if action == edit_group:
@@ -3140,12 +3151,16 @@ class NodeGraphView(QGraphicsView):
             return
         if group:
             edit_group = menu.addAction("重命名蓝图组")
+            ai_menu = menu.addMenu("AI")
+            ai_iterate = ai_menu.addAction("迭代助手")
             connect_group = None if self.is_data_canvas() else menu.addAction("连接")
             menu.addSeparator()
             delete_group = menu.addAction("删除蓝图组")
-            action = menu.exec(global_pos)
+            action = self._exec_context_menu(menu, global_pos)
             if action == edit_group:
                 self.groupEditRequested.emit(group.group.id)
+            elif action == ai_iterate:
+                self.aiIterateRequested.emit()
             elif connect_group and action == connect_group:
                 self.start_connection(group.group.id)
             elif action == delete_group:
@@ -3159,13 +3174,16 @@ class NodeGraphView(QGraphicsView):
             cancel = menu.addAction("取消连接模式")
         else:
             cancel = None
-        action = menu.exec(global_pos)
+        action = self._exec_context_menu(menu, global_pos)
         if self._handle_create_action(action, create_actions, scene_pos):
             return
         if action == reset:
             self.reset_view()
         elif cancel and action == cancel:
             self.cancel_connection()
+
+    def _exec_context_menu(self, menu: QMenu, global_pos: QPoint):
+        return menu.exec(global_pos)
 
     def _build_create_menu(self, menu: QMenu) -> tuple[QMenu, dict[str, object]]:
         create_menu = menu.addMenu("创建")
