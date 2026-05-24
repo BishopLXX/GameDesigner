@@ -2483,12 +2483,20 @@ class GameDesignerApp(QMainWindow):
         created = 0
         updated = 0
         created_groups = 0
+        updated_rules = 0
         selected_ids: set[str] = set()
         selected_group_ids: set[str] = set()
         base = self._ai_action_base_position(page)
         create_index = 0
         for action in actions:
             if not isinstance(action, AiCanvasAction):
+                continue
+            if action.type == "update_canvas_rules":
+                rules = str(action.rules).strip()
+                if not rules:
+                    continue
+                page.canvas_data.ai_rules = rules
+                updated_rules += 1
                 continue
             if action.type == "create_group":
                 group = self._group_from_ai_action(page, action, base, created_groups + 1)
@@ -2517,7 +2525,7 @@ class GameDesignerApp(QMainWindow):
                 self._apply_ai_update_to_node(node, action)
                 selected_ids.add(node.id)
                 updated += 1
-        if not created and not updated and not created_groups:
+        if not created and not updated and not created_groups and not updated_rules:
             raise ValueError("AI 没有提供能应用到当前画布的操作。")
         if page.canvas_data.is_data_canvas():
             self._sync_canvas_state(page)
@@ -2539,6 +2547,8 @@ class GameDesignerApp(QMainWindow):
             parts.append(f"创建 {created} 个节点")
         if updated:
             parts.append(f"更新 {updated} 个节点")
+        if updated_rules:
+            parts.append("写入当前画布规则记忆")
         return "已应用到当前画布：" + "，".join(parts) + "。"
 
     def _ai_action_base_position(self, page: ProjectPage) -> QPointF:

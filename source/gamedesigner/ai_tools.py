@@ -24,7 +24,7 @@ AI_LINKED_DOC_LIMIT = 8
 AI_LINKED_DOC_CHARS = 1200
 AI_ACTION_BLOCK_START = "【GD_ACTIONS】"
 AI_ACTION_BLOCK_END = "【/GD_ACTIONS】"
-AI_CANVAS_ACTION_TYPES = {"create_node", "update_node", "create_group"}
+AI_CANVAS_ACTION_TYPES = {"create_node", "update_node", "create_group", "update_canvas_rules"}
 
 
 @dataclass
@@ -68,6 +68,7 @@ class AiCanvasAction:
     type: str
     title: str = ""
     node_id: str = ""
+    rules: str = ""
     template_id: str = ""
     icon: str = ""
     node_type: str = "普通"
@@ -147,10 +148,16 @@ def build_ai_assistant_prompt(context: str, user_message: str, history: list[AiC
         "如果用户要求参考某个蓝图组继续迭代，可以创建新的蓝图组，并在其中创建一批结构相近但内容迭代后的节点。\n"
         "你可以给出设计建议、文案、节点规划，也可以在用户要求改画布时输出可执行的画布动作。\n"
         "不要声称你自己直接改了工程文件；如果输出画布动作，GameDesigner 会在回复结束后自动应用到当前画布，不需要用户再点击确认。\n\n"
-        "当需要创建或更新节点时，请在自然语言回复后追加一个严格 JSON 动作块，格式如下：\n"
+        "每个画布都有自己的规则记忆。当前画布规则记忆是高权重上下文，生成与迭代必须优先遵守；"
+        "当用户说“记住、规则、以后都按、这个画布要遵守”等内容时，应优先输出 update_canvas_rules 动作写入当前画布规则。\n\n"
+        "当需要创建或更新节点、蓝图组或当前画布规则时，请在自然语言回复后追加一个严格 JSON 动作块，格式如下：\n"
         f"{AI_ACTION_BLOCK_START}\n"
         "{\n"
         '  "actions": [\n'
+        "    {\n"
+        '      "type": "update_canvas_rules",\n'
+        '      "rules": "当前画布需要长期遵守的规则，合并保留旧规则后写成清晰条目"\n'
+        "    },\n"
         "    {\n"
         '      "type": "create_node",\n'
         '      "title": "节点标题",\n'
@@ -191,7 +198,8 @@ def build_ai_assistant_prompt(context: str, user_message: str, history: list[AiC
         "  ]\n"
         "}\n"
         f"{AI_ACTION_BLOCK_END}\n\n"
-        "动作块要求：只使用 create_node、update_node 或 create_group；create_group 的 nodes 只放 create_node；"
+        "动作块要求：只使用 create_node、update_node、create_group 或 update_canvas_rules；create_group 的 nodes 只放 create_node；"
+        "update_canvas_rules 只写入当前画布规则，rules 必须是完整合并后的规则文本，不要只写增量片段；"
         "update_node 必须使用上下文中真实存在的 node_id；"
         "字段 data_type 优先用 文本、长文本、整数、数字、布尔、枚举、日期、资源路径；"
         "如果是迭代新节点或新蓝图组，请直接输出动作块；如果用户只是咨询，不要输出动作块。\n\n"
@@ -339,6 +347,8 @@ def describe_ai_canvas_actions(actions: list[AiCanvasAction]) -> list[str]:
         elif action.type == "create_group":
             node_text = f"，{len(action.nodes)} 个组内节点" if action.nodes else ""
             lines.append(f"创建蓝图组：{action.title or '未命名蓝图组'}{node_text}")
+        elif action.type == "update_canvas_rules":
+            lines.append("写入当前画布规则记忆")
     return lines
 
 
@@ -370,6 +380,7 @@ def _ai_canvas_action_from_dict(raw: dict[str, Any]) -> AiCanvasAction | None:
         type=action_type,
         title=str(raw.get("title") or "").strip(),
         node_id=str(raw.get("node_id") or "").strip(),
+        rules=str(raw.get("rules") or raw.get("content") or "").strip(),
         template_id=str(raw.get("template_id") or "").strip(),
         icon=str(raw.get("icon") or "").strip()[:4],
         node_type=node_type,
@@ -458,6 +469,10 @@ def build_project_chat_context(
             f"节点模板数: {len(project.templates)}",
         ]
     )
+    if canvas.ai_rules.strip():
+        lines.append("")
+        lines.append("当前画布规则记忆（高权重，生成与迭代必须优先遵守）:")
+        lines.append(canvas.ai_rules.strip())
 
     selected_nodes = [node for node in canvas.nodes if node.id in selected_node_ids]
     selected_groups = [group for group in canvas.groups if group.id in selected_group_ids]

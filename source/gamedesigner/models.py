@@ -328,12 +328,14 @@ class CanvasData:
     nodes: list[Node] = field(default_factory=list)
     edges: list[Edge] = field(default_factory=list)
     groups: list[BlueprintGroup] = field(default_factory=list)
+    ai_rules: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
             "name": self.name,
             "canvas_type": self.canvas_type if self.canvas_type in CANVAS_TYPES else "normal",
+            "ai_rules": self.ai_rules,
             "data_layout": self.data_layout if self.data_layout in DATA_LAYOUT_MODES else "grid",
             "data_row_style": self.data_row_style if self.data_row_style in DATA_ROW_STYLE_MODES else "independent",
             "data_grid_rows": max(0, int(self.data_grid_rows)),
@@ -360,6 +362,7 @@ class CanvasData:
             id=str(raw.get("id") or new_id("canvas")),
             name=str(raw.get("name") or "画布"),
             canvas_type=_choice_or(raw.get("canvas_type"), CANVAS_TYPES, "normal"),
+            ai_rules=str(raw.get("ai_rules") or raw.get("rules_memory") or ""),
             data_layout=_choice_or(raw.get("data_layout"), DATA_LAYOUT_MODES, "grid"),
             data_row_style=_choice_or(raw.get("data_row_style"), DATA_ROW_STYLE_MODES, "independent"),
             data_grid_rows=max(0, int(_float_or(raw.get("data_grid_rows"), 0.0))),

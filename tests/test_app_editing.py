@@ -391,6 +391,28 @@ class AppEditingTests(unittest.TestCase):
         self.assertEqual(page.canvas.selected_group_ids, {created_group.id})
         window.deleteLater()
 
+    def test_ai_canvas_actions_can_write_current_canvas_rules_memory(self) -> None:
+        window = GameDesignerApp()
+        project = ProjectData(name="AI画布规则测试")
+        project.ensure_canvas_structure()
+        canvas = project.root_canvas()
+        page = window._add_page(project, None, dirty=False, canvas_data=canvas)
+        window.tabs.setCurrentWidget(page)
+
+        message = window._apply_ai_canvas_actions(
+            [
+                AiCanvasAction(
+                    type="update_canvas_rules",
+                    rules="- 本画布新增节点必须沿用当前模板\n- 设计内容优先服务 Boss Rush",
+                )
+            ]
+        )
+
+        self.assertIn("写入当前画布规则记忆", message)
+        self.assertIn("沿用当前模板", canvas.ai_rules)
+        self.assertTrue(page.dirty)
+        window.deleteLater()
+
     def test_ai_iteration_assistant_expands_panel_and_enters_iteration_mode(self) -> None:
         window = GameDesignerApp()
         project = ProjectData(name="AI右键迭代测试")

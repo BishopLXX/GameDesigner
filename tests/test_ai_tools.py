@@ -141,13 +141,19 @@ class AiToolsTests(unittest.TestCase):
         self.assertIn("create_node", prompt)
         self.assertIn("update_node", prompt)
         self.assertIn("create_group", prompt)
+        self.assertIn("update_canvas_rules", prompt)
+        self.assertIn("当前画布规则记忆是高权重上下文", prompt)
         self.assertIn("自动应用到当前画布", prompt)
 
-    def test_parse_ai_canvas_actions_supports_create_update_and_group(self) -> None:
+    def test_parse_ai_canvas_actions_supports_create_update_group_and_canvas_rules(self) -> None:
         actions = parse_ai_canvas_actions(
             """
             {
               "actions": [
+                {
+                  "type": "update_canvas_rules",
+                  "rules": "- 本画布只生成 Boss 设计节点\\n- 输出必须包含机制弱点"
+                },
                 {
                   "type": "create_node",
                   "title": "冲刺技能",
@@ -183,13 +189,32 @@ class AiToolsTests(unittest.TestCase):
             """
         )
 
-        self.assertEqual([action.type for action in actions], ["create_node", "create_group", "update_node"])
-        self.assertEqual(actions[0].title, "冲刺技能")
-        self.assertEqual(actions[0].template_id, "template_skill")
-        self.assertEqual(actions[0].fields[0], AiCanvasFieldChange("内容信息", "长文本", "向前突进"))
-        self.assertEqual(actions[1].title, "冲刺流派")
-        self.assertEqual(actions[1].nodes[0].title, "冲刺强化")
-        self.assertEqual(actions[2].node_id, "node_a")
+        self.assertEqual(
+            [action.type for action in actions],
+            ["update_canvas_rules", "create_node", "create_group", "update_node"],
+        )
+        self.assertIn("Boss 设计节点", actions[0].rules)
+        self.assertEqual(actions[1].title, "冲刺技能")
+        self.assertEqual(actions[1].template_id, "template_skill")
+        self.assertEqual(actions[1].fields[0], AiCanvasFieldChange("内容信息", "长文本", "向前突进"))
+        self.assertEqual(actions[2].title, "冲刺流派")
+        self.assertEqual(actions[2].nodes[0].title, "冲刺强化")
+        self.assertEqual(actions[3].node_id, "node_a")
+
+    def test_project_chat_context_includes_canvas_rules_as_high_priority_memory(self) -> None:
+        canvas = CanvasData(
+            id="canvas_rules",
+            name="Boss画布",
+            ai_rules="- 本画布新增节点必须延续几何 Boss Rush 风格\n- 每个 Boss 必须有清晰弱点",
+            nodes=[Node(title="基准Boss")],
+        )
+        project = ProjectData(name="规则测试", root_canvas_id=canvas.id, canvases=[canvas])
+
+        context = build_project_chat_context(project, canvas, "D:/GameDesigner/demo.gdc")
+
+        self.assertIn("当前画布规则记忆（高权重", context)
+        self.assertIn("几何 Boss Rush 风格", context)
+        self.assertIn("每个 Boss 必须有清晰弱点", context)
 
     def test_split_ai_canvas_action_response_hides_action_block(self) -> None:
         visible, actions, error = split_ai_canvas_action_response(

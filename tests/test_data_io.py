@@ -153,6 +153,21 @@ class DataIoTests(unittest.TestCase):
             self.assertNotIn('"nodes": [', manifest)
             self.assertEqual(load_project(path).root_canvas().nodes[0].title, "主节点")
 
+    def test_canvas_ai_rules_roundtrip_in_split_canvas_file(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            tmp_path = Path(folder)
+            project = ProjectData(name="规则记忆工程")
+            project.ensure_canvas_structure()
+            project.root_canvas().ai_rules = "- 本画布只生成 Boss 机制节点\n- 新节点必须包含弱点"
+
+            path = tmp_path / "rules.gdc"
+            save_project(project, path)
+            loaded = load_project(path)
+
+            self.assertIn("Boss 机制节点", loaded.root_canvas().ai_rules)
+            canvas_file = path.parent / f"{path.name}.files" / "canvases" / f"{project.root_canvas_id}.json"
+            self.assertIn('"ai_rules"', canvas_file.read_text(encoding="utf-8"))
+
     def test_game_csv_export_is_single_flat_table(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             tmp_path = Path(folder)
