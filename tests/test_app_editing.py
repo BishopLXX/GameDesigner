@@ -112,6 +112,25 @@ class AppEditingTests(unittest.TestCase):
         self.assertEqual(pasted.y, source.y + 40)
         window.deleteLater()
 
+    def test_ai_project_context_uses_current_page_selection(self) -> None:
+        window = GameDesignerApp()
+        project = ProjectData(name="AI上下文测试")
+        project.ensure_canvas_structure()
+        canvas = project.root_canvas()
+        node = canvas.add_node(Node(title="关键节点", fields=[NodeField("说明", "文本", "需要分析")]))
+        page = window._add_page(project, Path("D:/GameDesigner/AiContext.gdc"), dirty=False, canvas_data=canvas)
+        window.tabs.setCurrentWidget(page)
+        page.canvas.select_node(node.id)
+
+        context, cwd, project_path = window._current_ai_project_context()
+
+        self.assertEqual(cwd, Path("D:/GameDesigner"))
+        self.assertEqual(project_path, Path("D:/GameDesigner/AiContext.gdc"))
+        self.assertIn("AI上下文测试", context)
+        self.assertIn("关键节点", context)
+        self.assertIn("当前选中", context)
+        window.deleteLater()
+
     def test_add_node_inside_group_assigns_group_membership(self) -> None:
         window = GameDesignerApp()
         project = ProjectData(name="蓝图创建测试")

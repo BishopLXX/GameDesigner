@@ -25,6 +25,11 @@ class AppSettings:
     last_project: str = ""
     theme: str = "dark"
     last_edge_style: str = "curve"
+    ai_provider: str = "codex"
+    ai_model: str = "gpt-5.4"
+    ai_auth_mode: str = "official"
+    ai_api_key: str = ""
+    ai_base_url: str = ""
     recent_projects: list[str] = field(default_factory=list)
     welcome_layout: dict[str, dict[str, float]] = field(default_factory=dict)
     welcome_recent_layouts: dict[str, dict[str, float]] = field(default_factory=dict)
@@ -37,6 +42,11 @@ class AppSettings:
             "last_project": self.last_project,
             "theme": self.theme,
             "last_edge_style": self.last_edge_style,
+            "ai_provider": self.ai_provider,
+            "ai_model": self.ai_model,
+            "ai_auth_mode": self.ai_auth_mode,
+            "ai_api_key": self.ai_api_key,
+            "ai_base_url": self.ai_base_url,
             "recent_projects": self.recent_projects,
             "welcome_layout": self.welcome_layout,
             "welcome_recent_layouts": self.welcome_recent_layouts,
@@ -51,12 +61,23 @@ class AppSettings:
         last_edge_style = str(raw.get("last_edge_style", "curve") or "curve")
         if last_edge_style not in EDGE_STYLES:
             last_edge_style = "curve"
+        ai_provider = str(raw.get("ai_provider", "codex") or "codex")
+        if ai_provider not in {"codex", "claude"}:
+            ai_provider = "codex"
+        ai_auth_mode = str(raw.get("ai_auth_mode", "official") or "official")
+        if ai_auth_mode not in {"official", "api_key"}:
+            ai_auth_mode = "official"
         return cls(
             workspace_dir=str(raw.get("workspace_dir", "")),
             export_dir=str(raw.get("export_dir", "")),
             last_project=str(raw.get("last_project", "")),
             theme=str(raw.get("theme", "dark") or "dark"),
             last_edge_style=last_edge_style,
+            ai_provider=ai_provider,
+            ai_model=str(raw.get("ai_model", "gpt-5.4") or "gpt-5.4"),
+            ai_auth_mode=ai_auth_mode,
+            ai_api_key=str(raw.get("ai_api_key", "")),
+            ai_base_url=str(raw.get("ai_base_url", "")),
             recent_projects=[str(item) for item in recent if item],
             welcome_layout=_coerce_layout_map(raw.get("welcome_layout")),
             welcome_recent_layouts=_coerce_layout_map(raw.get("welcome_recent_layouts")),

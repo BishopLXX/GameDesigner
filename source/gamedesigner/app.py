@@ -318,6 +318,7 @@ class CompactTitleBar(QWidget):
         layout.addWidget(self._menu_button("文件", window.file_menu))
         layout.addWidget(self._menu_button("编辑", window.edit_menu))
         layout.addWidget(self._menu_button("视图", window.view_menu))
+        layout.addWidget(self._menu_button("AI", window.ai_menu))
         layout.addStretch(1)
         layout.addWidget(self._action_button(window.reset_view_action, "重置"))
         layout.addWidget(self._action_button(window.dark_mode_action, "夜间"))
@@ -533,6 +534,13 @@ class GameDesignerApp(QMainWindow):
         self.template_action = QAction("节点模板...", self)
         self.template_action.triggered.connect(self._manage_templates)
 
+        self.ai_chat_action = QAction("AI 工程聊天...", self)
+        self.ai_chat_action.setShortcut(QKeySequence("Ctrl+Shift+A"))
+        self.ai_chat_action.triggered.connect(self._open_ai_chat)
+
+        self.ai_settings_action = QAction("AI 设置...", self)
+        self.ai_settings_action.triggered.connect(self._open_ai_settings)
+
         self.import_data_sheet_action = QAction("导入画布 CSV/Excel...", self)
         self.import_data_sheet_action.triggered.connect(self._import_canvas_sheet)
         self.convert_to_data_canvas_action = QAction("转换为排序画布", self)
@@ -588,6 +596,10 @@ class GameDesignerApp(QMainWindow):
         self.view_menu = QMenu("视图", self)
         self.view_menu.addAction(self.reset_view_action)
         self.view_menu.addAction(self.dark_mode_action)
+
+        self.ai_menu = QMenu("AI", self)
+        self.ai_menu.addAction(self.ai_chat_action)
+        self.ai_menu.addAction(self.ai_settings_action)
 
     def _build_toolbar(self) -> None:
         self.titlebar = CompactTitleBar(self, self.icon_path)
@@ -2373,6 +2385,43 @@ class GameDesignerApp(QMainWindow):
         self._sync_project_templates(page.project)
         self._refresh_project_views(page.project)
         self._mark_dirty(page)
+
+    def _open_ai_chat(self) -> None:
+        from .ui.ai_chat_dialog import AiChatDialog
+
+        dialog = getattr(self, "_ai_chat_dialog", None)
+        if isinstance(dialog, AiChatDialog):
+            dialog.show()
+            dialog.raise_()
+            dialog.activateWindow()
+            return
+        dialog = AiChatDialog(self, self.settings, self._current_ai_project_context)
+        dialog.destroyed.connect(lambda _obj=None: setattr(self, "_ai_chat_dialog", None))
+        self._ai_chat_dialog = dialog
+        dialog.show()
+
+    def _open_ai_settings(self) -> None:
+        from .ui.ai_chat_dialog import AiSettingsDialog
+
+        dialog = AiSettingsDialog(self, self.settings)
+        dialog.exec()
+
+    def _current_ai_project_context(self) -> tuple[str, Path, Path]:
+        from .ai_tools import build_project_chat_context
+
+        page = self._current_page()
+        if not page or page.is_welcome:
+            raise ValueError("请先打开一个项目画布，再使用 AI 工程聊天。")
+        project_path = self._ensure_project_path_for_files(page)
+        context = build_project_chat_context(
+            page.project,
+            page.canvas_data,
+            project_path,
+            selected_node_ids=set(page.canvas.selected_node_ids),
+            selected_group_ids=set(page.canvas.selected_group_ids),
+            selected_edge_id=page.selected_edge_id,
+        )
+        return context, project_path.parent, project_path
 
     def _reset_view(self) -> None:
         page = self._current_page()
