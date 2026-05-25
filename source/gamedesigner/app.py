@@ -65,6 +65,7 @@ from .models import (
 from .project_history import ProjectHistory, ProjectSnapshot
 from .qt_canvas import NodeGraphView
 from .qt_fonts import configure_fonts
+from .ui.node_preview_panel import NodePreviewPanel
 from .qt_theme import stylesheet
 from .node_visuals import visual_node_size
 from .storage import (
@@ -157,6 +158,7 @@ class ProjectPage(QWidget):
     parentJumpRequested = Signal()
     returnCloseRequested = Signal()
     resetViewRequested = Signal()
+    previewCanvasOpenRequested = Signal(str)
     dataLayoutRequested = Signal(str)
     dataGridRowsRequested = Signal(int)
     dataRowStyleRequested = Signal(str)
@@ -262,9 +264,25 @@ class ProjectPage(QWidget):
         self.content_layout.addWidget(self.canvas)
         self.content_layout.addWidget(self.table_view)
         layout.addWidget(self.content)
+        self.preview_button = QToolButton(self.content)
+        self.preview_button.setObjectName("nodePreviewHandleButton")
+        self.preview_button.setText("预览")
+        self.preview_button.setToolTip("打开节点预览")
+        self.preview_button.setCheckable(True)
+        self.preview_button.setAutoRaise(True)
+        self.preview_button.clicked.connect(self._toggle_node_preview)
+        self.preview_panel = NodePreviewPanel(self.content)
+        self.preview_panel.setVisible(False)
+        self.preview_panel.closeRequested.connect(self._hide_node_preview)
+        self.preview_panel.openCanvasRequested.connect(self.previewCanvasOpenRequested.emit)
         self.refresh_canvas_nav()
         self.refresh_active_template()
         self.refresh_canvas_mode()
+        self._position_preview_overlay()
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self._position_preview_overlay()
 
     def _function_toggle_button(self, text: str, tooltip: str, layout_value: str) -> QToolButton:
         button = QToolButton(self.function_bar)
@@ -319,6 +337,11 @@ class ProjectPage(QWidget):
         show_table = bool(self.canvas_data.is_data_canvas() and self.canvas_data.data_layout == "table")
         self.canvas.setVisible(not show_table)
         self.table_view.setVisible(show_table)
+        self.preview_button.setVisible(not self.is_welcome)
+        if self.is_welcome:
+            self.preview_panel.setVisible(False)
+            self.preview_button.setChecked(False)
+        self._position_preview_overlay()
         self.table_view.set_canvas(self.project, self.canvas_data)
         self.function_bar.setVisible(not self.is_welcome)
         is_data_canvas = self.canvas_data.is_data_canvas()
@@ -338,6 +361,57 @@ class ProjectPage(QWidget):
         self.table_layout_button.setChecked(is_data_canvas and self.canvas_data.data_layout == "table")
         self.independent_row_button.setChecked(show_row_style and self.canvas_data.data_row_style != "thumbnail")
         self.thumbnail_row_button.setChecked(show_row_style and self.canvas_data.data_row_style == "thumbnail")
+
+    def _position_preview_overlay(self) -> None:
+        if not hasattr(self, "preview_panel"):
+            return
+        button_size = 44
+        margin = 12
+        gap = 8
+        width = min(520, max(360, self.content.width() // 3))
+        height = min(660, max(320, self.content.height() - button_size - margin * 3 - gap))
+        self.preview_panel.setFixedSize(width, height)
+        x = max(margin, self.content.width() - width - margin)
+        y = max(margin, self.content.height() - height - button_size - margin - gap)
+        self.preview_panel.move(x, y)
+        self.preview_panel.raise_()
+        if hasattr(self, "preview_button"):
+            self.preview_button.setFixedSize(button_size, button_size)
+            self.preview_button.move(max(margin, self.content.width() - button_size - margin), max(margin, self.content.height() - button_size - margin))
+            self.preview_button.raise_()
+
+    def _toggle_node_preview(self, checked: bool) -> None:
+        if checked:
+            self.show_selected_node_preview()
+        else:
+            self._hide_node_preview()
+
+    def show_selected_node_preview(self) -> None:
+        node_id = self.selected_node_id
+        if not node_id:
+            self.preview_panel.clear_preview()
+            self.preview_panel.setVisible(True)
+            self.preview_button.setChecked(True)
+            self._position_preview_overlay()
+            return
+        self.show_node_preview(node_id)
+
+    def show_node_preview(self, node_id: str) -> None:
+        node = self.canvas_data.find_node(node_id)
+        if node is None:
+            self._hide_node_preview()
+            return
+        self.preview_panel.set_theme(self.theme)
+        self.preview_panel.set_node(self.project, self.canvas_data, node, self.path, self.theme)
+        self.preview_panel.setVisible(True)
+        self.preview_button.setChecked(True)
+        self._position_preview_overlay()
+
+    def _hide_node_preview(self) -> None:
+        self.preview_panel.clear_preview()
+        self.preview_panel.setVisible(False)
+        self.preview_button.setChecked(False)
+        self._position_preview_overlay()
 
 
 class CompactTitleBar(QWidget):
@@ -798,6 +872,7 @@ class GameDesignerApp(QMainWindow):
         canvas.selectionChanged.connect(lambda node_id, edge_id, page=page: self._on_selection_changed(page, node_id, edge_id))
         canvas.projectChanged.connect(lambda page=page: self._mark_dirty(page))
         canvas.nodeActivated.connect(lambda node_id, page=page: self._activate_welcome_node(page, node_id))
+        canvas.nodePreviewRequested.connect(lambda node_id, page=page: self._show_node_preview(page, node_id))
         canvas.nodeFolderRequested.connect(lambda node_id, page=page: self._open_welcome_project_folder(page, node_id))
         canvas.nodeEditRequested.connect(self._edit_node)
         canvas.nodeNotesRequested.connect(self._edit_node_notes)
@@ -829,6 +904,7 @@ class GameDesignerApp(QMainWindow):
         page.parentJumpRequested.connect(lambda page=page: self._jump_to_parent_canvas(page))
         page.returnCloseRequested.connect(lambda page=page: self._return_to_previous_canvas(page))
         page.resetViewRequested.connect(lambda page=page: page.canvas.reset_view())
+        page.previewCanvasOpenRequested.connect(lambda canvas_id, page=page: self._open_canvas_page(page.project, page.path, canvas_id, source_canvas_id=page.canvas_id))
         page.dataLayoutRequested.connect(self._set_data_canvas_layout)
         page.dataGridRowsRequested.connect(self._set_data_canvas_grid_rows)
         page.dataRowStyleRequested.connect(self._set_data_canvas_row_style)
@@ -1243,8 +1319,28 @@ class GameDesignerApp(QMainWindow):
     def _on_selection_changed(self, page: ProjectPage, node_id: str | None, edge_id: str | None) -> None:
         page.selected_node_id = node_id
         page.selected_edge_id = edge_id
+        if node_id is None:
+            page._hide_node_preview()
+        elif page.preview_panel.isVisible() or page.preview_button.isChecked():
+            page.show_node_preview(node_id)
         if page is self._current_page():
             self._update_status()
+
+    def _show_node_preview(self, page: ProjectPage, node_id: str) -> None:
+        if page.is_welcome:
+            return
+        if page is not self._current_page():
+            index = self.tabs.indexOf(page)
+            if index >= 0:
+                self.tabs.setCurrentIndex(index)
+        page.show_node_preview(node_id)
+        self._position_preview_overlay(page)
+
+    def _hide_node_preview(self, page: ProjectPage | None = None) -> None:
+        page = page or self._current_page()
+        if not page:
+            return
+        page._hide_node_preview()
 
     def _mark_dirty(self, page: ProjectPage | None = None) -> None:
         page = page or self._current_page()
@@ -3364,7 +3460,13 @@ class GameDesignerApp(QMainWindow):
             if isinstance(page, ProjectPage):
                 page.theme = self.theme
                 page.canvas.set_theme(self.theme)
+                page.preview_panel.set_theme(self.theme)
         self._update_status()
+
+    def _position_preview_overlay(self, page: ProjectPage | None = None) -> None:
+        page = page or self._current_page()
+        if page is not None:
+            page._position_preview_overlay()
 
     def _close_current_tab(self) -> None:
         index = self.tabs.currentIndex()

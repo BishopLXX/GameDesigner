@@ -382,6 +382,103 @@ def stylesheet(name: str) -> str:
         background: {colors["control_hover"]};
         border-color: {colors["accent"]};
     }}
+    QWidget#nodePreviewPanel {{
+        background: {colors["panel"]};
+        border: 1px solid {colors["hairline"]};
+        border-radius: 12px;
+    }}
+    QToolButton#nodePreviewHandleButton {{
+        background: {colors["control"]};
+        color: {colors["text"]};
+        border: 1px solid {colors["hairline"]};
+        border-radius: 10px;
+        padding: 0;
+        min-width: 44px;
+        min-height: 44px;
+        font-weight: 600;
+    }}
+    QToolButton#nodePreviewHandleButton:hover {{
+        background: {colors["control_hover"]};
+        border-color: {colors["accent"]};
+    }}
+    QToolButton#nodePreviewHandleButton:checked {{
+        background: {colors["blue_soft"]};
+        color: {colors["blue"]};
+        border-color: {colors["blue"]};
+    }}
+    QLabel#nodePreviewTypeLabel {{
+        color: {colors["text_muted"]};
+        font-size: 9pt;
+        font-weight: 600;
+    }}
+    QLabel#nodePreviewTitle {{
+        color: {colors["text"]};
+        font-size: 10pt;
+        font-weight: 700;
+    }}
+    QToolButton#nodePreviewCloseButton {{
+        background: transparent;
+        color: {colors["text_muted"]};
+        border: 1px solid transparent;
+        border-radius: 7px;
+        padding: 0;
+    }}
+    QToolButton#nodePreviewCloseButton:hover {{
+        background: {colors["control_hover"]};
+        color: {colors["text"]};
+        border-color: {colors["hairline"]};
+    }}
+    QToolButton#nodePreviewMiniButton {{
+        background: {colors["control"]};
+        color: {colors["text_muted"]};
+        border: 1px solid {colors["hairline"]};
+        border-radius: 7px;
+        padding: 4px 9px;
+        font-size: 9pt;
+    }}
+    QToolButton#nodePreviewMiniButton:hover {{
+        background: {colors["control_hover"]};
+        color: {colors["text"]};
+        border-color: {colors["accent"]};
+    }}
+    QScrollArea#nodePreviewScroll {{
+        background: transparent;
+        border: 0;
+    }}
+    QWidget#nodePreviewBody {{
+        background: transparent;
+    }}
+    QFrame#nodePreviewCard, QFrame#nodePreviewCanvasFrame, QFrame#nodePreviewVisualCanvas, QFrame#nodePreviewImageFrame {{
+        background: {colors["panel_alt"]};
+        border: 1px solid {colors["hairline"]};
+        border-radius: 10px;
+    }}
+    QFrame#nodePreviewVisualField {{
+        background: {colors["panel"]};
+        border: 1px solid {colors["hairline"]};
+        border-radius: 9px;
+    }}
+    QLabel#nodePreviewEmptyLabel {{
+        color: {colors["text_muted"]};
+        padding: 18px;
+    }}
+    QLabel#nodePreviewFieldName {{
+        color: {colors["text"]};
+        font-weight: 700;
+    }}
+    QLabel#nodePreviewFieldType, QLabel#nodePreviewMetaKey {{
+        color: {colors["text_muted"]};
+    }}
+    QLabel#nodePreviewMetaValue, QLabel#nodePreviewValue, QLabel#nodePreviewSmallText {{
+        color: {colors["text"]};
+    }}
+    QTextBrowser#nodePreviewBrowser {{
+        background: {colors["panel_alt"]};
+        color: {colors["text"]};
+        border: 1px solid {colors["hairline"]};
+        border-radius: 9px;
+        padding: 8px;
+    }}
     QLabel#canvasFunctionLabel {{
         color: {colors["text_muted"]};
         padding-right: 6px;

@@ -71,6 +71,7 @@ NODE_DEFAULT_WIDTH = 310.0
 NODE_MIN_WIDTH = 260.0
 NODE_MIN_HEIGHT = 92.0
 NODE_MAX_NATURAL_WIDTH = 680.0
+NODE_PREVIEW_ZOOM_THRESHOLD = 0.62
 HEADER_HEIGHT = VISUAL_NODE_HEADER_HEIGHT
 ROW_GAP = 7.0
 ROW_TOP = HEADER_HEIGHT + 6.0
@@ -753,6 +754,11 @@ class NodeItem(QGraphicsObject):
         if event.button() == Qt.LeftButton:
             self.unsetCursor()
             self.view.sync_interaction_cursor()
+            if not self.view.read_only and self.view.is_compact_node_preview_mode():
+                self.view.select_node(self.node.id)
+                self.view.nodePreviewRequested.emit(self.node.id)
+                event.accept()
+                return
             self.view.nodeActivated.emit(self.node.id)
             event.accept()
             return
@@ -820,6 +826,19 @@ class NodeItem(QGraphicsObject):
                 self.view.start_inline_field_edit(self, self._inline_candidate_field, self._inline_candidate_rect)
             else:
                 self.view.start_inline_node_text_edit(self, self._inline_candidate_part, self._inline_candidate_rect)
+            event.accept()
+            self._inline_candidate_field = None
+            self._inline_candidate_part = ""
+            self._inline_candidate_rect = QRectF()
+            return
+        elif (
+            event.button() == Qt.LeftButton
+            and not was_resizing
+            and not self._moved
+            and not self.view.read_only
+            and self.view.is_compact_node_preview_mode()
+        ):
+            self.view.nodePreviewRequested.emit(self.node.id)
             event.accept()
             self._inline_candidate_field = None
             self._inline_candidate_part = ""
@@ -1001,7 +1020,12 @@ class NodeItem(QGraphicsObject):
         return pos.x() >= rect.right() - RESIZE_HANDLE and pos.y() >= rect.bottom() - RESIZE_HANDLE
 
     def _editable_node_text_at(self, pos: QPointF) -> tuple[str, QRectF] | None:
-        if self.view.read_only or self.view.is_inline_field_editing() or self._uses_horizontal_thumbnail_row():
+        if (
+            self.view.read_only
+            or self.view.is_inline_field_editing()
+            or self._uses_horizontal_thumbnail_row()
+            or self.view.is_compact_node_preview_mode()
+        ):
             return None
         for part, rect in self._editable_node_text_rects():
             if rect.contains(pos):
@@ -1056,7 +1080,7 @@ class NodeItem(QGraphicsObject):
         return QRectF()
 
     def _editable_field_at(self, pos: QPointF) -> tuple[NodeField, QRectF] | None:
-        if self.view.read_only or self.view.is_inline_field_editing():
+        if self.view.read_only or self.view.is_inline_field_editing() or self.view.is_compact_node_preview_mode():
             return None
         for field, rect in reversed(self._editable_field_rects()):
             if rect.contains(pos):
@@ -2088,6 +2112,7 @@ class NodeGraphView(QGraphicsView):
     selectionChanged = Signal(object, object)
     projectChanged = Signal()
     nodeActivated = Signal(str)
+    nodePreviewRequested = Signal(str)
     nodeFolderRequested = Signal(str)
     nodeEditRequested = Signal(str)
     nodeNotesRequested = Signal(str)
@@ -2221,6 +2246,9 @@ class NodeGraphView(QGraphicsView):
 
     def is_inline_field_editing(self) -> bool:
         return self._inline_proxy is not None
+
+    def is_compact_node_preview_mode(self) -> bool:
+        return self.transform().m11() < NODE_PREVIEW_ZOOM_THRESHOLD
 
     def start_inline_field_edit(self, item: NodeItem, field: NodeField, local_rect: QRectF | None = None) -> None:
         if self.read_only or field.data_type == "图片":

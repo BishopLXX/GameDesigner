@@ -14,6 +14,7 @@ from gamedesigner.app import EDGE_LABEL_MAX_LENGTH, GameDesignerApp
 from gamedesigner.ai_tools import AiCanvasAction, AiCanvasFieldChange
 from gamedesigner.ai_tools import AiChatMessage, load_project_chat_history, save_project_chat_history
 from gamedesigner.canvas_io import import_canvas_sheet
+from gamedesigner.qt_canvas import NodeGraphView
 from gamedesigner.qt_dialogs import HEADER_HEIGHT, InlineFieldEditor, NodeEditorDialog, TemplateSaveDialog
 from gamedesigner.models import BlueprintGroup, DesignNote, Node, NodeField, NodeTemplate, ProjectData
 from gamedesigner.storage import (
@@ -27,6 +28,7 @@ from gamedesigner.storage import (
 )
 from gamedesigner.ui.link_document_dialog import LinkDocumentDialog
 from gamedesigner.ui.ai_chat_dialog import AiChatPanel, AiSettingsDialog
+from gamedesigner.ui.node_preview_panel import NodePreviewPanel
 from gamedesigner.ui.submit_text_edit import SubmitPlainTextEdit
 
 
@@ -97,6 +99,45 @@ class AppEditingTests(unittest.TestCase):
         self.assertEqual(pasted_inside.y, inside.y + 40)
         self.assertIsNone(next((node for node in canvas.nodes if node.title == outside.title and node.id != outside.id), None))
         self.assertEqual(page.canvas.selected_group_ids, {pasted_group.id})
+        window.deleteLater()
+
+    def test_node_preview_panel_embeds_read_only_canvas_preview_for_canvas_node(self) -> None:
+        project = ProjectData(name="预览测试")
+        project.ensure_canvas_structure()
+        root = project.root_canvas()
+        child = project.add_canvas("子画布", parent_canvas_id=root.id)
+        child.add_node(Node(title="子节点", x=40, y=60, width=320, height=160))
+        link = root.add_node(Node(title="打开子画布", node_type="画布", canvas_id=child.id))
+        panel = NodePreviewPanel()
+
+        panel.set_node(project, root, link, None, "dark")
+
+        preview_views = panel.findChildren(NodeGraphView)
+        self.assertEqual(len(preview_views), 1)
+        self.assertIs(preview_views[0].project, child)
+        self.assertTrue(preview_views[0].read_only)
+        self.assertEqual(panel.type_label.text(), "画布预览")
+        panel.deleteLater()
+
+    def test_compact_canvas_click_opens_preview_and_blank_click_closes_it(self) -> None:
+        window = GameDesignerApp()
+        project = ProjectData(name="预览点击测试")
+        project.ensure_canvas_structure()
+        root = project.root_canvas()
+        node = root.add_node(Node(title="紧凑节点", x=0, y=0, width=320, height=160))
+        page = window._add_page(project, None, dirty=False, canvas_data=root)
+        window.tabs.setCurrentWidget(page)
+        page.canvas.scale(0.5, 0.5)
+
+        page.canvas.nodePreviewRequested.emit(node.id)
+
+        self.assertFalse(page.preview_panel.isHidden())
+        self.assertTrue(page.preview_button.isChecked())
+
+        page.canvas.clear_selection()
+
+        self.assertTrue(page.preview_panel.isHidden())
+        self.assertFalse(page.preview_button.isChecked())
         window.deleteLater()
 
     def test_duplicate_selected_node_copies_and_pastes_immediately(self) -> None:

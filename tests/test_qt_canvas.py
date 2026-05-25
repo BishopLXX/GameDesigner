@@ -154,6 +154,58 @@ class QtCanvasTests(unittest.TestCase):
         self.assertEqual(node.height, 188)
         view.deleteLater()
 
+    def test_compact_zoom_click_node_requests_preview_without_inline_edit(self) -> None:
+        canvas = CanvasData(name="主画布")
+        node = canvas.add_node(
+            Node(
+                title="紧凑节点",
+                x=0,
+                y=0,
+                width=320,
+                height=160,
+                fields=[NodeField("描述", "长文本", "内容")],
+            )
+        )
+        view = NodeGraphView(canvas)
+        view.scale(0.5, 0.5)
+        emitted: list[str] = []
+        activated: list[str] = []
+        view.nodePreviewRequested.connect(emitted.append)
+        view.nodeActivated.connect(activated.append)
+        item = view.node_items[node.id]
+        local_pos = QPointF(120, 64)
+        scene_pos = item.mapToScene(local_pos)
+
+        self.assertTrue(view.is_compact_node_preview_mode())
+        self.assertIsNone(item._editable_node_text_at(local_pos))
+        self.assertIsNone(item._editable_field_at(local_pos))
+
+        item.mouseReleaseEvent(_ScenePointerEvent(local_pos, scene_pos))
+
+        self.assertEqual(emitted, [node.id])
+        self.assertEqual(activated, [])
+        self.assertIsNone(view._inline_proxy)
+        view.deleteLater()
+
+    def test_compact_zoom_double_click_node_requests_preview_not_activation(self) -> None:
+        canvas = CanvasData(name="主画布")
+        node = canvas.add_node(Node(title="子画布", node_type="画布", x=0, y=0, width=320, height=160))
+        view = NodeGraphView(canvas)
+        view.scale(0.5, 0.5)
+        emitted: list[str] = []
+        activated: list[str] = []
+        view.nodePreviewRequested.connect(emitted.append)
+        view.nodeActivated.connect(activated.append)
+        item = view.node_items[node.id]
+        local_pos = QPointF(120, 64)
+        scene_pos = item.mapToScene(local_pos)
+
+        item.mouseDoubleClickEvent(_ScenePointerEvent(local_pos, scene_pos))
+
+        self.assertEqual(emitted, [node.id])
+        self.assertEqual(activated, [])
+        view.deleteLater()
+
     def test_dragging_node_edge_handle_creates_edge(self) -> None:
         canvas = CanvasData(name="主画布")
         source = canvas.add_node(Node(title="源", x=0, y=0, width=320, height=180))
