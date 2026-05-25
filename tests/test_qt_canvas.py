@@ -470,6 +470,48 @@ class QtCanvasTests(unittest.TestCase):
         self.assertGreater(dot, 0)
         view.deleteLater()
 
+    def test_zoomed_out_curve_edge_uses_diagonal_corner_anchors(self) -> None:
+        canvas = CanvasData(name="主画布")
+        source = canvas.add_node(Node(title="源", x=0, y=0, width=320, height=180))
+        target = canvas.add_node(Node(title="目标", x=560, y=240, width=320, height=180))
+        edge = canvas.add_edge(source.id, target.id)
+        edge.style = "curve"
+        view = NodeGraphView(canvas)
+        item = view.edge_items[edge.id]
+
+        view.scale(0.5, 0.5)
+        view._refresh_edge_paths()
+        path = item.path()
+        source_rect = view.node_items[source.id].sceneBoundingRect()
+        target_rect = view.node_items[target.id].sceneBoundingRect()
+
+        self.assertEqual(path.pointAtPercent(0), source_rect.bottomRight())
+        self.assertEqual(path.pointAtPercent(1), target_rect.topLeft())
+        view.deleteLater()
+
+    def test_zoomed_out_edge_width_is_thicker_on_screen(self) -> None:
+        canvas = CanvasData(name="主画布")
+        source = canvas.add_node(Node(title="源", x=0, y=0, width=320, height=180))
+        target = canvas.add_node(Node(title="目标", x=560, y=240, width=320, height=180))
+        edge = canvas.add_edge(source.id, target.id)
+        view = NodeGraphView(canvas)
+        item = view.edge_items[edge.id]
+
+        self.assertGreater(item._edge_screen_width(False, zoom=0.45), item._edge_screen_width(False, zoom=1.0))
+        self.assertGreater(item._edge_screen_width(True, zoom=0.45), item._edge_screen_width(True, zoom=1.0))
+        view.deleteLater()
+
+    def test_zoomed_out_connection_preview_starts_from_diagonal_corner(self) -> None:
+        canvas = CanvasData(name="主画布")
+        source = canvas.add_node(Node(title="源", x=0, y=0, width=320, height=180))
+        view = NodeGraphView(canvas)
+        view.scale(0.5, 0.5)
+        source_rect = view.node_items[source.id].sceneBoundingRect()
+        start = view._connection_start(source_rect, QPointF(720, 420))
+
+        self.assertEqual(start, source_rect.bottomRight())
+        view.deleteLater()
+
     def test_resizing_visual_node_scales_inner_fields(self) -> None:
         canvas = CanvasData(name="主画布")
         field = NodeField("说明", "文本", "内容", x=20, y=10, width=120, height=40, font_size=12)

@@ -14,7 +14,7 @@ from gamedesigner.app import EDGE_LABEL_MAX_LENGTH, GameDesignerApp
 from gamedesigner.ai_tools import AiCanvasAction, AiCanvasFieldChange
 from gamedesigner.ai_tools import AiChatMessage, load_project_chat_history, save_project_chat_history
 from gamedesigner.canvas_io import import_canvas_sheet
-from gamedesigner.qt_dialogs import HEADER_HEIGHT, InlineFieldEditor, NodeEditorDialog
+from gamedesigner.qt_dialogs import HEADER_HEIGHT, InlineFieldEditor, NodeEditorDialog, TemplateSaveDialog
 from gamedesigner.models import BlueprintGroup, DesignNote, Node, NodeField, NodeTemplate, ProjectData
 from gamedesigner.storage import (
     AppSettings,
@@ -1346,6 +1346,7 @@ class AppEditingTests(unittest.TestCase):
         canvas = project.root_canvas()
         locked = template.create_node(0, 0)
         locked.template_locked = True
+        locked.title = "节点自己的名称"
         locked.fields[0].value = "节点自己的名称"
         locked.fields[1].value = "节点自己的说明"
         canvas.add_node(locked)
@@ -1384,17 +1385,50 @@ class AppEditingTests(unittest.TestCase):
         self.assertFalse(dialog.save_template_button.isHidden())
         dialog.deleteLater()
 
+    def test_free_canvas_locked_template_keeps_node_title_editable(self) -> None:
+        title_field = NodeField("名称", "文本", "模板标题")
+        template = NodeTemplate(
+            name="通用模板",
+            title_field_id=title_field.id,
+            fields=[title_field, NodeField("说明", "长文本", "模板说明")],
+        )
+        node = template.create_node(0, 0)
+        node.template_locked = True
+        node.title = "节点自己的名字"
+
+        dialog = NodeEditorDialog(None, node, templates=[template])
+
+        self.assertFalse(dialog.title_edit.isReadOnly())
+        self.assertEqual(dialog.title_edit.text(), "节点自己的名字")
+        dialog.title_edit.setText("新的节点名字")
+        dialog._accept()
+
+        self.assertIsNotNone(dialog.result)
+        self.assertEqual(dialog.result.title, "新的节点名字")
+        self.assertTrue(dialog.result.template_locked)
+        self.assertEqual(dialog.result.title_field_id, "")
+        dialog.deleteLater()
+
     def test_save_template_does_not_capture_node_icon(self) -> None:
         node = Node(title="Boss", icon="Boss", icon_from_title=False, fields=[NodeField("名称", "文本", "HeroBody")])
         dialog = NodeEditorDialog(None, node, templates=[])
 
-        with mock.patch("gamedesigner.qt_dialogs.QInputDialog.getText", return_value=("敌人模板", True)):
+        with mock.patch("gamedesigner.qt_dialogs.TemplateSaveDialog.get_name", return_value=("敌人模板", True)):
             dialog._save_current_template()
 
         self.assertIsNotNone(dialog.templates)
         self.assertEqual(dialog.templates[-1].name, "敌人模板")
         self.assertEqual(dialog.templates[-1].icon, "")
         self.assertFalse(dialog.templates[-1].icon_from_title)
+        dialog.deleteLater()
+
+    def test_save_template_dialog_lists_existing_templates(self) -> None:
+        templates = [NodeTemplate(name="启程"), NodeTemplate(name="战斗")]
+        dialog = TemplateSaveDialog(None, "新模板", templates)
+
+        names = [dialog.existing_list.item(index).text() for index in range(dialog.existing_list.count())]
+        self.assertEqual(names, ["启程", "战斗"])
+        self.assertEqual(dialog.template_name(), "新模板")
         dialog.deleteLater()
 
     def test_node_editor_field_show_label_toggle_is_saved(self) -> None:
@@ -1427,6 +1461,41 @@ class AppEditingTests(unittest.TestCase):
         dialog.field_value.keyPressEvent(enter)
 
         self.assertEqual(dialog.result.fields[0].value, "第一行\n第二行")
+        dialog.deleteLater()
+
+    def test_node_editor_field_copy_paste_and_duplicate_selected_card(self) -> None:
+        node = Node(
+            title="属性",
+            fields=[NodeField("说明", "长文本", "第一项", x=24, y=32, width=180, height=42)],
+        )
+        dialog = NodeEditorDialog(None, node, templates=[])
+        dialog.canvas.setFocus()
+
+        dialog._load_selected_props(0)
+        dialog.canvas.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key_C, Qt.ControlModifier))
+        self.assertIsNotNone(dialog._field_clipboard)
+
+        dialog.canvas.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key_V, Qt.ControlModifier))
+
+        self.assertEqual(len(dialog.fields), 2)
+        self.assertEqual(dialog.fields[1].name, dialog.fields[0].name)
+        self.assertEqual(dialog.fields[1].data_type, dialog.fields[0].data_type)
+        self.assertEqual(dialog.fields[1].value, dialog.fields[0].value)
+        self.assertEqual(dialog.fields[1].x, dialog.fields[0].x + 24.0)
+        self.assertEqual(dialog.fields[1].y, dialog.fields[0].y + 24.0)
+        self.assertNotEqual(dialog.fields[1].id, dialog.fields[0].id)
+
+        duplicate_dialog = NodeEditorDialog(None, node, templates=[])
+        duplicate_dialog.canvas.setFocus()
+        duplicate_dialog._load_selected_props(0)
+        duplicate_dialog.canvas.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key_D, Qt.ControlModifier))
+
+        self.assertEqual(len(duplicate_dialog.fields), 2)
+        self.assertEqual(duplicate_dialog.fields[1].name, duplicate_dialog.fields[0].name)
+        self.assertEqual(duplicate_dialog.fields[1].value, duplicate_dialog.fields[0].value)
+        self.assertEqual(duplicate_dialog.fields[1].x, duplicate_dialog.fields[0].x + 24.0)
+        self.assertEqual(duplicate_dialog.fields[1].y, duplicate_dialog.fields[0].y + 24.0)
+        duplicate_dialog.deleteLater()
         dialog.deleteLater()
 
     def test_node_editor_canvas_resize_sets_node_size(self) -> None:
@@ -1983,6 +2052,37 @@ class AppEditingTests(unittest.TestCase):
                 self.assertEqual(reopened.width(), 1520)
                 self.assertEqual(reopened.height(), 960)
                 reopened.deleteLater()
+
+    def test_main_window_toggle_window_mode_restores_normal_geometry(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            tmp_path = Path(folder)
+            settings = AppSettings(workspace_dir=folder, export_dir=str(tmp_path / "exports"))
+            with mock.patch.dict(os.environ, {"APPDATA": folder}):
+                save_settings(settings)
+                window = GameDesignerApp()
+                window.setGeometry(90, 110, 1320, 780)
+                normal_geometry = window.geometry()
+
+                window.toggle_window_mode()
+
+                self.assertTrue(window.is_window_fullscreen())
+                self.assertEqual(window.titlebar.window_mode_button.text(), "窗口")
+                self.assertNotEqual(window.geometry(), normal_geometry)
+
+                window.toggle_window_mode()
+
+                self.assertFalse(window.is_window_fullscreen())
+                self.assertEqual(window.titlebar.window_mode_button.text(), "全屏")
+                self.assertEqual(window.geometry(), normal_geometry)
+
+                window.toggle_window_mode()
+                window.close()
+
+                saved = load_settings()
+                layout = saved.window_layouts["main_window"]
+                self.assertEqual(layout["width"], float(normal_geometry.width()))
+                self.assertEqual(layout["height"], float(normal_geometry.height()))
+                window.deleteLater()
 
 
 if __name__ == "__main__":

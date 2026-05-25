@@ -12,6 +12,7 @@ from PySide6.QtGui import (
     QPainter,
     QPainterPath,
     QPen,
+    QKeySequence,
     QPixmap,
 )
 from PySide6.QtWidgets import (
@@ -846,6 +847,9 @@ class FieldCanvas(QGraphicsView):
     fieldChanged = Signal()
     nodeSizeChanged = Signal(float, float)
     cardAddRequested = Signal(str, float, float)
+    cardCopyRequested = Signal()
+    cardPasteRequested = Signal()
+    cardDuplicateRequested = Signal()
     cardDeleteRequested = Signal(int)
 
     def __init__(
@@ -879,6 +883,7 @@ class FieldCanvas(QGraphicsView):
         self.setViewportUpdateMode(QGraphicsView.FullViewportUpdate)
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.setFrameShape(QGraphicsView.NoFrame)
+        self.setFocusPolicy(Qt.StrongFocus)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.refresh()
@@ -1107,6 +1112,21 @@ class FieldCanvas(QGraphicsView):
         target = max(0.35, min(2.6, current * factor))
         self.scale(target / current, target / current)
 
+    def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        if event.matches(QKeySequence.Copy):
+            self.cardCopyRequested.emit()
+            event.accept()
+            return
+        if event.matches(QKeySequence.Paste):
+            self.cardPasteRequested.emit()
+            event.accept()
+            return
+        if event.key() == Qt.Key_D and event.modifiers() & Qt.ControlModifier:
+            self.cardDuplicateRequested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         if event.button() == Qt.MiddleButton:
             self._panning = True
@@ -1148,19 +1168,31 @@ class FieldCanvas(QGraphicsView):
         menu = QMenu(self)
         if item:
             self._select_item(item.index)
+            copy_action = menu.addAction("复制卡片")
+            paste_action = menu.addAction("粘贴卡片")
+            duplicate_action = menu.addAction("复制一份")
             delete = menu.addAction("删除卡片")
             action = menu.exec(event.globalPos())
-            if action == delete:
+            if action == copy_action:
+                self.cardCopyRequested.emit()
+            elif action == paste_action:
+                self.cardPasteRequested.emit()
+            elif action == duplicate_action:
+                self.cardDuplicateRequested.emit()
+            elif action == delete:
                 self.cardDeleteRequested.emit(item.index)
             return
 
         scene_pos = self.mapToScene(event.pos())
         field_x = max(0.0, scene_pos.x())
         field_y = max(0.0, scene_pos.y() - HEADER_HEIGHT)
+        paste = menu.addAction("粘贴卡片")
         add_text = menu.addAction("新增文字卡片")
         add_image = menu.addAction("新增图片卡片")
         action = menu.exec(event.globalPos())
-        if action == add_text:
+        if action == paste:
+            self.cardPasteRequested.emit()
+        elif action == add_text:
             self.cardAddRequested.emit("text", field_x, field_y)
         elif action == add_image:
             self.cardAddRequested.emit("image", field_x, field_y)
@@ -1169,6 +1201,7 @@ class FieldCanvas(QGraphicsView):
         if self._inline_index != index:
             self._close_inline_editor()
         self.selected_index = index
+        self.setFocus()
         for item in self.scene_obj.items():
             if isinstance(item, EditorFieldItem):
                 item.setSelected(item.index == index)
@@ -1252,6 +1285,72 @@ class FieldCanvas(QGraphicsView):
         return visual_node_size(self.fields, self.node_width, self.node_height)
 
 
+class TemplateSaveDialog(QDialog):
+    def __init__(
+        self,
+        parent: QWidget | None,
+        default_name: str,
+        templates: list[NodeTemplate],
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("保存模板")
+        self.setModal(True)
+
+        self.name_edit = QLineEdit(default_name)
+        self.existing_list = QListWidget()
+        self.existing_list.setMaximumHeight(118)
+        self.existing_list.setMinimumHeight(72)
+        self.existing_list.setAlternatingRowColors(True)
+
+        names = [template.name.strip() for template in templates if template.name.strip()]
+        if names:
+            for name in names:
+                self.existing_list.addItem(name)
+            self.existing_list.itemDoubleClicked.connect(self._use_existing_name)
+        else:
+            self.existing_list.addItem("暂无已保存模板")
+            self.existing_list.setEnabled(False)
+
+        form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        form.addRow("模板名称", self.name_edit)
+        form.addRow("已保存模板", self.existing_list)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("确定")
+        buttons.button(QDialogButtonBox.Cancel).setText("取消")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 14)
+        layout.setSpacing(12)
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+        self.resize(380, 230)
+        self.name_edit.selectAll()
+        self.name_edit.setFocus()
+
+    @classmethod
+    def get_name(
+        cls,
+        parent: QWidget | None,
+        default_name: str,
+        templates: list[NodeTemplate],
+    ) -> tuple[str, bool]:
+        dialog = cls(parent, default_name, templates)
+        if dialog.exec() != QDialog.Accepted:
+            return "", False
+        return dialog.template_name(), True
+
+    def template_name(self) -> str:
+        return self.name_edit.text().strip()
+
+    def _use_existing_name(self, item) -> None:
+        self.name_edit.setText(item.text())
+        self.name_edit.selectAll()
+
+
 class NodeEditorDialog(QDialog):
     def __init__(
         self,
@@ -1283,8 +1382,14 @@ class NodeEditorDialog(QDialog):
         template_ids = {template.id for template in self.templates} if self.templates is not None else set()
         self._template_id = node.template_id if node.template_id in template_ids or not template_ids else ""
         self._force_template_lock = force_template_lock
+        if node.template_locked and not self._force_template_lock:
+            template = next((item for item in self.templates or [] if item.id == self._template_id), None)
+            if template is not None and self.title_field_id == template.title_field_id:
+                self.title_field_id = ""
         self.templates_result: list[NodeTemplate] | None = None
         self.templates_changed = False
+        self._field_clipboard: NodeField | None = None
+        self._field_paste_serial = 0
         self.import_template_button: QToolButton | None = None
         self.import_template_menu: QMenu | None = None
         self.save_template_button: QToolButton | None = None
@@ -1359,7 +1464,8 @@ class NodeEditorDialog(QDialog):
         self.pin_buttons: dict[str, QToolButton] = {}
 
         self.canvas = FieldCanvas(self.fields, theme, self.project_path, self._width, self._height)
-        self._sync_title_from_field()
+        if self._force_template_lock:
+            self._sync_title_from_field()
         self._sync_icon_from_title()
         self.canvas.set_header(self.title_edit.text(), self._display_icon(), self.color_edit.text())
         self.canvas.fieldSelected.connect(self._load_selected_props)
@@ -1368,6 +1474,9 @@ class NodeEditorDialog(QDialog):
         self.canvas.fieldChanged.connect(self._on_field_changed)
         self.canvas.nodeSizeChanged.connect(self._on_canvas_node_size_changed)
         self.canvas.cardAddRequested.connect(self._add_card_at)
+        self.canvas.cardCopyRequested.connect(self._copy_selected_card)
+        self.canvas.cardPasteRequested.connect(self._paste_selected_card)
+        self.canvas.cardDuplicateRequested.connect(self._duplicate_selected_card)
         self.canvas.cardDeleteRequested.connect(self._delete_card_at)
 
         splitter = QSplitter()
@@ -1589,13 +1698,19 @@ class NodeEditorDialog(QDialog):
                 template_id=self._template_id,
                 fields=[NodeField.from_dict(field.to_dict()) for field in self.fields],
             )
-            apply_template_to_node(working, template, preserve_values=True)
+            apply_template_to_node(
+                working,
+                template,
+                preserve_values=True,
+                preserve_title=True,
+                preserve_title_binding=True,
+            )
             title = working.title
             icon_from_title = working.icon_from_title
             icon = working.icon
             color = working.color
             fields = [NodeField.from_dict(field.to_dict()) for field in working.fields]
-            title_field_id = working.title_field_id
+            title_field_id = ""
         else:
             title = template.name
             icon_from_title = self.icon_from_title_button.isChecked()
@@ -1611,7 +1726,8 @@ class NodeEditorDialog(QDialog):
         self.color_edit.setText(color)
         self.fields = fields
         self.title_field_id = title_field_id
-        self._sync_title_from_field()
+        if not (preserve_values and self._force_template_lock):
+            self._sync_title_from_field()
         self._sync_icon_from_title()
         self._ensure_visual_layout()
         self.canvas.fields = self.fields
@@ -2303,6 +2419,35 @@ class NodeEditorDialog(QDialog):
             return
         self._delete_card_at(index)
 
+    def _copy_selected_card(self) -> None:
+        self._apply_props()
+        field = self._selected_field()
+        if field is None:
+            return
+        self._field_clipboard = copy.deepcopy(field)
+        self._field_paste_serial = 0
+
+    def _paste_selected_card(self) -> None:
+        if self._field_clipboard is None:
+            return
+        source = copy.deepcopy(self._field_clipboard)
+        offset = 24.0 * (self._field_paste_serial + 1)
+        source.id = new_id("field")
+        source.x = max(0.0, source.x + offset)
+        source.y = max(0.0, source.y + offset)
+        index = self.canvas.selected_index
+        insert_at = len(self.fields)
+        if index is not None and 0 <= index < len(self.fields):
+            insert_at = index + 1
+        self.fields.insert(insert_at, source)
+        self._field_paste_serial += 1
+        self.canvas.refresh(insert_at)
+        self._load_selected_props(insert_at)
+
+    def _duplicate_selected_card(self) -> None:
+        self._copy_selected_card()
+        self._paste_selected_card()
+
     def _import_template(self, template_id: str) -> None:
         if self.templates is None:
             return
@@ -2319,7 +2464,7 @@ class NodeEditorDialog(QDialog):
             QMessageBox.information(self, "排序画布模板", "排序画布使用当前画布自己的模板，不支持在这里导出为通用模板。")
             return
         default_name = self.title_edit.text().strip() or "节点模板"
-        name, ok = QInputDialog.getText(self, "保存模板", "模板名称", text=default_name)
+        name, ok = TemplateSaveDialog.get_name(self, default_name, self.templates)
         if not ok:
             return
         name = name.strip()

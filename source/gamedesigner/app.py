@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import QPoint, QPointF, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QPoint, QPointF, QRect, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
@@ -371,7 +371,9 @@ class CompactTitleBar(QWidget):
         layout.addWidget(self._action_button(window.dark_mode_action, "夜间"))
         layout.addSpacing(4)
         layout.addWidget(self._window_button("-", window.showMinimized))
-        layout.addWidget(self._window_button("□", self._toggle_maximized))
+        self.window_mode_button = self._window_button("全屏", self._toggle_maximized)
+        self.window_mode_button.setToolTip("切换到全屏模式")
+        layout.addWidget(self.window_mode_button)
         layout.addWidget(self._window_button("×", window.close, close=True))
 
     def set_title(self, title: str) -> None:
@@ -414,10 +416,11 @@ class CompactTitleBar(QWidget):
         return button
 
     def _toggle_maximized(self) -> None:
-        if self.window.isMaximized():
-            self.window.showNormal()
-        else:
-            self.window.showMaximized()
+        self.window.toggle_window_mode()
+
+    def set_fullscreen_mode(self, enabled: bool) -> None:
+        self.window_mode_button.setText("窗口" if enabled else "全屏")
+        self.window_mode_button.setToolTip("切换到窗口模式" if enabled else "切换到全屏模式")
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         if event.button() == Qt.LeftButton:
@@ -428,7 +431,7 @@ class CompactTitleBar(QWidget):
 
     def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
         if self._drag_offset is not None and event.buttons() & Qt.LeftButton:
-            if not self.window.isMaximized():
+            if not self.window.isMaximized() and not self.window.is_window_fullscreen():
                 self.window.move(event.globalPosition().toPoint() - self._drag_offset)
             event.accept()
             return
@@ -472,6 +475,8 @@ class GameDesignerApp(QMainWindow):
         self.theme = self.settings.theme if self.settings.theme in {"dark", "light"} else "dark"
         self._closing_app = False
         self._restoring_history = False
+        self._window_fullscreen = False
+        self._normal_window_geometry: QRect | None = None
         self._project_histories: dict[int, ProjectHistory] = {}
         self._copied_nodes: list[dict[str, Any]] = []
         self._copied_groups: list[dict[str, Any]] = []
@@ -486,6 +491,7 @@ class GameDesignerApp(QMainWindow):
         self.resize(1360, 860)
         self.setMinimumSize(1020, 640)
         restore_window_layout(self, "main_window")
+        self._normal_window_geometry = QRect(self.geometry())
         self.setStyleSheet(stylesheet(self.theme))
 
         self.tabs = QTabWidget()
@@ -709,7 +715,7 @@ class GameDesignerApp(QMainWindow):
         return super().nativeEvent(event_type, message)
 
     def _windows_hit_test(self, global_pos: QPoint) -> int | None:
-        if not self.isMaximized() and not self.isFullScreen():
+        if not self.isMaximized() and not self.isFullScreen() and not self.is_window_fullscreen():
             rect = self.frameGeometry()
             left = global_pos.x() <= rect.left() + RESIZE_BORDER
             right = global_pos.x() >= rect.right() - RESIZE_BORDER
@@ -3072,6 +3078,83 @@ class GameDesignerApp(QMainWindow):
                     return template
         return None
 
+    def is_window_fullscreen(self) -> bool:
+        return self._window_fullscreen
+
+    def toggle_window_mode(self) -> None:
+        if self._window_fullscreen:
+            self._exit_window_fullscreen()
+        else:
+            self._enter_window_fullscreen()
+
+    def _enter_window_fullscreen(self) -> None:
+        if self._window_fullscreen:
+            return
+        self._normal_window_geometry = QRect(self.geometry())
+        screen = self._window_action_screen()
+        if screen is None:
+            return
+        self._window_fullscreen = True
+        self.setWindowState(self.windowState() & ~Qt.WindowMaximized & ~Qt.WindowFullScreen)
+        self.setGeometry(screen.availableGeometry())
+        self._sync_window_mode_button()
+
+    def _exit_window_fullscreen(self) -> None:
+        if not self._window_fullscreen:
+            return
+        geometry = self._normal_window_geometry or QRect(80, 80, 1360, 860)
+        self._window_fullscreen = False
+        self.setWindowState(self.windowState() & ~Qt.WindowMaximized & ~Qt.WindowFullScreen)
+        self.setGeometry(self._constrain_window_geometry_to_screens(geometry))
+        self._normal_window_geometry = QRect(self.geometry())
+        self._sync_window_mode_button()
+
+    def _sync_window_mode_button(self) -> None:
+        titlebar = getattr(self, "titlebar", None)
+        if isinstance(titlebar, CompactTitleBar):
+            titlebar.set_fullscreen_mode(self._window_fullscreen)
+
+    def _window_action_screen(self):
+        for point in (QCursor.pos(), self.frameGeometry().center()):
+            screen = QApplication.screenAt(point)
+            if screen is not None:
+                return screen
+        handle = self.windowHandle()
+        if handle is not None and handle.screen() is not None:
+            return handle.screen()
+        return QApplication.primaryScreen()
+
+    def _constrain_window_geometry_to_screens(self, geometry: QRect) -> QRect:
+        if geometry.isValid():
+            for screen in QApplication.screens():
+                if geometry.intersects(screen.availableGeometry()):
+                    return QRect(geometry)
+        screen = self._window_action_screen() or QApplication.primaryScreen()
+        if screen is None:
+            return QRect(geometry)
+        available = screen.availableGeometry()
+        width = min(max(geometry.width(), self.minimumWidth()), available.width())
+        height = min(max(geometry.height(), self.minimumHeight()), available.height())
+        return QRect(available.left() + 40, available.top() + 40, width, height)
+
+    def _remember_normal_window_geometry(self) -> None:
+        if self._window_fullscreen or self.isMinimized():
+            return
+        self._normal_window_geometry = QRect(self.geometry())
+
+    def _window_layout_geometry(self) -> QRect:
+        if self._window_fullscreen and self._normal_window_geometry is not None:
+            return QRect(self._normal_window_geometry)
+        return QRect(self.geometry())
+
+    def moveEvent(self, event) -> None:  # type: ignore[override]
+        super().moveEvent(event)
+        self._remember_normal_window_geometry()
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self._remember_normal_window_geometry()
+
     def _reference_node_for_ai_action(self, page: ProjectPage, action: Any) -> Node | None:
         if page.canvas_data.is_data_canvas():
             return None
@@ -3342,7 +3425,7 @@ class GameDesignerApp(QMainWindow):
                 self._closing_app = False
                 event.ignore()
                 return
-        save_window_layout(self, "main_window", persist=False)
+        save_window_layout(self, "main_window", persist=False, geometry_override=self._window_layout_geometry())
         save_settings(self.settings)
         event.accept()
 

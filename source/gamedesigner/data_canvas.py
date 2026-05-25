@@ -22,7 +22,11 @@ def apply_template_to_node(
     *,
     preserve_values: bool = True,
     force_lock: bool | None = None,
+    preserve_title: bool = False,
+    preserve_title_binding: bool = False,
 ) -> None:
+    original_title = node.title
+    original_title_field_id = node.title_field_id
     original_fields = list(node.fields)
     existing_fields = {field.id: field for field in original_fields}
     existing_fields_by_name: dict[str, list[NodeField]] = defaultdict(list)
@@ -30,8 +34,10 @@ def apply_template_to_node(
         existing_fields_by_name[_field_match_name(field)].append(field)
     used_existing_ids: set[str] = set()
     cloned_fields: list[NodeField] = []
+    preserved_title_field_id = ""
     for index, template_field in enumerate(template.fields):
         cloned = NodeField.from_dict(template_field.to_dict())
+        existing = None
         if preserve_values:
             existing = _matching_existing_field(
                 cloned,
@@ -43,6 +49,8 @@ def apply_template_to_node(
             )
             if existing:
                 _preserve_field_content(cloned, existing)
+        if preserve_title_binding and existing is not None and existing.id == original_title_field_id:
+            preserved_title_field_id = cloned.id
         cloned_fields.append(cloned)
 
     node.node_type = "普通"
@@ -52,9 +60,15 @@ def apply_template_to_node(
     node.template_id = template.id
     node.fields = cloned_fields
 
-    title_field_id = template.title_field_id if any(field.id == template.title_field_id for field in cloned_fields) else ""
+    if preserve_title_binding:
+        title_field_id = preserved_title_field_id
+    else:
+        title_field_id = template.title_field_id if any(field.id == template.title_field_id for field in cloned_fields) else ""
     node.title_field_id = title_field_id
-    node.title = _template_title(template, cloned_fields, title_field_id)
+    if preserve_title:
+        node.title = original_title
+    else:
+        node.title = _template_title(template, cloned_fields, title_field_id)
     if force_lock is not None:
         node.template_locked = force_lock
 
@@ -159,7 +173,14 @@ def sync_locked_template_nodes(project: ProjectData) -> bool:
                 node.title_field_id,
                 [(field.id, field.name, field.data_type, field.value, field.image_path) for field in node.fields],
             )
-            apply_template_to_node(node, template, preserve_values=True, force_lock=True)
+            apply_template_to_node(
+                node,
+                template,
+                preserve_values=True,
+                force_lock=True,
+                preserve_title=True,
+                preserve_title_binding=True,
+            )
             after = (
                 node.color,
                 node.icon,

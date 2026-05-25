@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QByteArray
+from PySide6.QtCore import QByteArray, QRect
 from PySide6.QtWidgets import QWidget
 
 from .storage import AppSettings, load_project_window_layouts, save_project_window_layouts, save_settings
@@ -26,9 +26,10 @@ def save_window_layout(
     *,
     persist: bool = True,
     project_path: str | Path | None = None,
+    geometry_override: QRect | None = None,
 ) -> None:
     project_path = project_path or _window_project_path(widget)
-    layout = _capture_window_layout(widget)
+    layout = _capture_window_layout(widget, geometry_override=geometry_override)
     if project_path:
         layouts = load_project_window_layouts(project_path)
         layouts[key] = layout
@@ -67,8 +68,8 @@ def _apply_window_layout(widget: QWidget, layout: dict[str, Any] | None) -> None
         widget.move(int(layout["x"]), int(layout["y"]))
 
 
-def _capture_window_layout(widget: QWidget) -> dict[str, Any]:
-    geometry = widget.geometry()
+def _capture_window_layout(widget: QWidget, *, geometry_override: QRect | None = None) -> dict[str, Any]:
+    geometry = geometry_override or widget.geometry()
     return {
         "x": float(geometry.x()),
         "y": float(geometry.y()),

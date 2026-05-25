@@ -1356,9 +1356,10 @@ class EdgeItem(QGraphicsPathItem):
     def update_path(self) -> None:
         source_rect = self.source.sceneBoundingRect()
         target_rect = self.target.sceneBoundingRect()
-        start = self._anchor(source_rect, target_rect)
-        end = self._anchor(target_rect, source_rect)
         style = self.edge.style if self.edge.style in {"curve", "straight", "orthogonal"} else "curve"
+        zoom = self._zoom_factor()
+        start = self._anchor(source_rect, target_rect, zoom=zoom, style=style)
+        end = self._anchor(target_rect, source_rect, zoom=zoom, style=style)
         if style == "straight":
             path = QPainterPath(start)
             path.lineTo(end)
@@ -1381,11 +1382,14 @@ class EdgeItem(QGraphicsPathItem):
         colors = palette(self.view.theme)
         painter.setRenderHint(QPainter.Antialiasing, True)
         selected = self.isSelected()
+        zoom = self._zoom_factor()
+        edge_width = self._edge_screen_width(selected, zoom)
         if selected:
-            painter.setPen(QPen(QColor(colors["edge_selected_glow"]), 9, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            glow_width = max(9.0, edge_width + 5.0)
+            painter.setPen(QPen(QColor(colors["edge_selected_glow"]), glow_width / zoom, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
             painter.drawPath(self.path())
         edge_color = QColor(colors["edge_selected"] if selected else colors["edge"])
-        painter.setPen(QPen(edge_color, 3.2 if selected else 2.2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        painter.setPen(QPen(edge_color, edge_width / zoom, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
         painter.drawPath(self.path())
         self._draw_arrow(painter, edge_color)
         if selected and self.edge.style == "orthogonal":
@@ -1553,14 +1557,38 @@ class EdgeItem(QGraphicsPathItem):
             return path.pointAtPercent(0.995)
         return path.pointAtPercent(0.97)
 
-    def _anchor(self, rect: QRectF, other: QRectF) -> QPointF:
+    def _zoom_factor(self) -> float:
+        return max(0.18, self.view.transform().m11())
+
+    def _edge_screen_width(self, selected: bool, zoom: float | None = None) -> float:
+        zoom = self._zoom_factor() if zoom is None else max(0.18, zoom)
+        base = 3.2 if selected else 2.2
+        boost = 2.0 if selected else 1.4
+        if zoom < 1.0:
+            base += (1.0 - zoom) * boost
+        return base
+
+    def _anchor(self, rect: QRectF, other: QRectF, zoom: float | None = None, style: str | None = None) -> QPointF:
         center = rect.center()
         other_center = other.center()
         dx = other_center.x() - center.x()
         dy = other_center.y() - center.y()
+        if style != "orthogonal" and style is not None:
+            zoom_value = self._zoom_factor() if zoom is None else max(0.18, zoom)
+            if zoom_value < 0.75 and self._should_use_corner_anchor(rect, dx, dy):
+                return self._corner_anchor(rect, dx, dy)
         if abs(dx) >= abs(dy):
             return QPointF(rect.right() if dx >= 0 else rect.left(), center.y())
         return QPointF(center.x(), rect.bottom() if dy >= 0 else rect.top())
+
+    def _should_use_corner_anchor(self, rect: QRectF, dx: float, dy: float) -> bool:
+        return abs(dx) >= rect.width() * 0.55 and abs(dy) >= rect.height() * 0.55
+
+    def _corner_anchor(self, rect: QRectF, dx: float, dy: float) -> QPointF:
+        return QPointF(
+            rect.right() if dx >= 0 else rect.left(),
+            rect.bottom() if dy >= 0 else rect.top(),
+        )
 
     def _curve_control_points(
         self,
@@ -2644,6 +2672,7 @@ class NodeGraphView(QGraphicsView):
 
     def reset_view(self) -> None:
         self.resetTransform()
+        self._refresh_edge_paths()
         if self.is_data_canvas():
             self.centerOn(self.sceneRect().center())
         else:
@@ -2969,6 +2998,10 @@ class NodeGraphView(QGraphicsView):
             if edge_item.edge.source == endpoint_id or edge_item.edge.target == endpoint_id:
                 edge_item.update_path()
         self._update_scene_rect()
+
+    def _refresh_edge_paths(self) -> None:
+        for edge_item in self.edge_items.values():
+            edge_item.update_path()
 
     def move_nodes_in_group(self, group_id: str, delta: QPointF) -> None:
         self._moving_group = True
@@ -3351,7 +3384,9 @@ class NodeGraphView(QGraphicsView):
             if source:
                 start = self.connection_anchor_scene or self._connection_start(source.sceneBoundingRect(), self.mouse_scene)
                 path = self._preview_path(start, self.mouse_scene)
-                painter.setPen(QPen(QColor(colors["edge"]), 2.2, Qt.DashLine, Qt.RoundCap, Qt.RoundJoin))
+                zoom = max(0.18, self.transform().m11())
+                preview_width = self._edge_preview_screen_width(zoom)
+                painter.setPen(QPen(QColor(colors["edge"]), preview_width / zoom, Qt.DashLine, Qt.RoundCap, Qt.RoundJoin))
                 painter.drawPath(path)
         self._paint_selected_node_notes(painter, colors)
 
@@ -3404,6 +3439,14 @@ class NodeGraphView(QGraphicsView):
             lines.append(f"... 还有 {len(preview_notes) - 2} 条便签")
         return "\n".join(line for line in lines if line.strip())
 
+    def _edge_preview_screen_width(self, zoom: float) -> float:
+        zoom = max(0.18, zoom)
+        base = 2.2
+        boost = 1.4
+        if zoom < 1.0:
+            base += (1.0 - zoom) * boost
+        return base
+
     def wheelEvent(self, event) -> None:  # type: ignore[override]
         if self._scroll_inline_editor_under_mouse(event):
             return
@@ -3413,6 +3456,7 @@ class NodeGraphView(QGraphicsView):
         current = self.transform().m11()
         target = max(0.18, min(2.8, current * factor))
         self.scale(target / current, target / current)
+        self._refresh_edge_paths()
         self.viewport().update()
 
     def _scroll_inline_editor_under_mouse(self, event) -> bool:
@@ -4051,6 +4095,12 @@ class NodeGraphView(QGraphicsView):
         center = rect.center()
         dx = target.x() - center.x()
         dy = target.y() - center.y()
+        zoom = max(0.18, self.transform().m11())
+        if zoom < 0.75 and abs(dx) >= rect.width() * 0.55 and abs(dy) >= rect.height() * 0.55:
+            return QPointF(
+                rect.right() if dx >= 0 else rect.left(),
+                rect.bottom() if dy >= 0 else rect.top(),
+            )
         if abs(dx) >= abs(dy):
             return QPointF(rect.right() if dx >= 0 else rect.left(), center.y())
         return QPointF(center.x(), rect.bottom() if dy >= 0 else rect.top())
