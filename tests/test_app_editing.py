@@ -758,6 +758,72 @@ class AppEditingTests(unittest.TestCase):
         self.assertEqual(child_spec.target_folder, "D:/custom")
         dialog.deleteLater()
 
+    def test_export_canvas_csv_dialog_restores_saved_state(self) -> None:
+        from gamedesigner.qt_dialogs import ExportCanvasCsvDialog
+
+        project = ProjectData(name="导出状态测试")
+        project.ensure_canvas_structure()
+        root = project.root_canvas()
+        root.name = "主画布"
+        child = project.add_canvas("BodyData")
+        state = {
+            "folder": "D:/saved",
+            "canvases": {
+                child.id: {
+                    "canvas_name": child.name,
+                    "enabled": False,
+                    "sort_mode": "x",
+                    "target_folder": "D:/body",
+                }
+            },
+        }
+
+        dialog = ExportCanvasCsvDialog(None, project, "D:/default", export_state=state)
+        checkbox, combo, folder_edit = dialog._canvas_rows[child.id]
+
+        self.assertEqual(dialog.folder_edit.text(), "D:/saved")
+        self.assertFalse(checkbox.isChecked())
+        self.assertEqual(combo.currentData(), "x")
+        self.assertEqual(folder_edit.text(), "D:/body")
+
+        checkbox.setChecked(True)
+        folder_edit.setText("D:/changed")
+        dialog._accept()
+
+        self.assertIsNotNone(dialog.result_data)
+        saved = dialog.result_data["export_state"]
+        self.assertEqual(saved["folder"], "D:/saved")
+        self.assertTrue(saved["canvases"][child.id]["enabled"])
+        self.assertEqual(saved["canvases"][child.id]["target_folder"], "D:/changed")
+        dialog.deleteLater()
+
+    def test_export_canvas_csv_dialog_uses_dark_list_colors(self) -> None:
+        from gamedesigner.qt_dialogs import ExportCanvasCsvDialog
+        from gamedesigner.qt_theme import palette
+
+        project = ProjectData(name="夜间导出测试")
+        project.ensure_canvas_structure()
+
+        dialog = ExportCanvasCsvDialog(None, project, "D:/default", theme="dark")
+        colors = palette("dark")
+        list_widget = dialog.findChild(QWidget, "exportCanvasList")
+
+        self.assertIsNotNone(list_widget)
+        style = list_widget.styleSheet()
+        self.assertIn(colors["panel"], style)
+        self.assertIn(colors["panel_alt"], style)
+        self.assertIn(colors["text"], style)
+        dialog.deleteLater()
+
+    def test_notes_dialog_does_not_save_initial_empty_note(self) -> None:
+        from gamedesigner.ui.notes_dialog import NotesDialog
+
+        dialog = NotesDialog(None, "画布便签", [])
+        dialog._accept()
+
+        self.assertEqual(dialog.result_notes, [])
+        dialog.deleteLater()
+
     def test_convert_canvas_type_switches_between_normal_and_data(self) -> None:
         window = GameDesignerApp()
         project = ProjectData(name="转换测试")
@@ -814,6 +880,38 @@ class AppEditingTests(unittest.TestCase):
         self.assertEqual(unlocked.icon, "模")
         self.assertEqual(unlocked.fields[0].name, "名称")
         self.assertEqual(len(unlocked.fields), 2)
+        window.deleteLater()
+
+    def test_locked_template_sync_preserves_field_content_when_template_fields_are_rebuilt(self) -> None:
+        window = GameDesignerApp()
+        title_field = NodeField("名称", "文本", "默认名称")
+        desc_field = NodeField("说明", "长文本", "默认说明")
+        template = NodeTemplate(
+            name="通用模板",
+            title_field_id=title_field.id,
+            fields=[title_field, desc_field],
+        )
+        project = ProjectData(name="模板内容保护", templates=[template])
+        project.ensure_canvas_structure()
+        canvas = project.root_canvas()
+        locked = template.create_node(0, 0)
+        locked.template_locked = True
+        locked.fields[0].value = "节点自己的名称"
+        locked.fields[1].value = "节点自己的说明"
+        canvas.add_node(locked)
+
+        rebuilt_title = NodeField("名称", "文本", "模板新名称")
+        rebuilt_desc = NodeField("说明", "长文本", "模板新说明")
+        template.title_field_id = rebuilt_title.id
+        template.fields = [rebuilt_title, rebuilt_desc]
+
+        window._sync_project_templates(project)
+
+        self.assertEqual(locked.fields[0].value, "节点自己的名称")
+        self.assertEqual(locked.fields[1].value, "节点自己的说明")
+        self.assertEqual(locked.title, "节点自己的名称")
+        self.assertEqual(locked.fields[0].id, rebuilt_title.id)
+        self.assertEqual(locked.fields[1].id, rebuilt_desc.id)
         window.deleteLater()
 
     def test_free_canvas_locked_template_can_unlock_and_restore_template_buttons(self) -> None:
@@ -1022,6 +1120,63 @@ class AppEditingTests(unittest.TestCase):
         self.assertEqual([field.name for field in data_canvas.nodes[1].fields], ["名称", "职业"])
         self.assertEqual(data_canvas.nodes[0].fields[0].value, "第一项")
         self.assertEqual(data_canvas.nodes[1].fields[0].value, "第二项")
+        window.deleteLater()
+
+    def test_data_canvas_template_sync_preserves_other_node_content_when_field_ids_change(self) -> None:
+        window = GameDesignerApp()
+        title_field = NodeField("名称", "文本", "条目")
+        desc_field = NodeField("说明", "长文本", "默认说明")
+        template = NodeTemplate(
+            name="数据模板",
+            title_field_id=title_field.id,
+            fields=[title_field, desc_field],
+        )
+        project = ProjectData(name="数据内容保护", templates=[template])
+        project.ensure_canvas_structure()
+        data_canvas = project.add_canvas("排序画布", canvas_type="data", template_id=template.id)
+        first = template.create_node(0, 0)
+        first.fields[0].value = "第一项"
+        first.fields[1].value = "第一自己的说明"
+        second = template.create_node(0, 0)
+        second.fields[0].value = "第二项"
+        second.fields[1].value = "第二自己的说明"
+        data_canvas.add_node(first)
+        data_canvas.add_node(second)
+        page = window._add_page(project, None, dirty=False, canvas_data=data_canvas)
+        window.tabs.setCurrentWidget(page)
+
+        rebuilt_title = NodeField("名称", "文本", "第一项")
+        rebuilt_desc = NodeField("说明", "长文本", "第一改过的说明")
+        updated = Node(
+            id=first.id,
+            title="数据模板",
+            node_type="普通",
+            color=template.color,
+            title_field_id=rebuilt_title.id,
+            template_id=template.id,
+            template_locked=True,
+            fields=[rebuilt_title, rebuilt_desc],
+        )
+
+        class _FakeDialog:
+            Accepted = 1
+
+            def __init__(self, *_args, **_kwargs) -> None:
+                self.result = updated
+                self.templates_changed = False
+                self.templates_result = None
+
+            def exec(self) -> int:
+                return self.Accepted
+
+        with mock.patch("gamedesigner.qt_dialogs.NodeEditorDialog", _FakeDialog):
+            window._edit_node(first.id)
+
+        self.assertEqual(data_canvas.nodes[0].fields[1].value, "第一改过的说明")
+        self.assertEqual(data_canvas.nodes[1].fields[0].value, "第二项")
+        self.assertEqual(data_canvas.nodes[1].fields[1].value, "第二自己的说明")
+        self.assertEqual(data_canvas.nodes[1].fields[0].id, rebuilt_title.id)
+        self.assertEqual(data_canvas.nodes[1].fields[1].id, rebuilt_desc.id)
         window.deleteLater()
 
     def test_delete_canvas_branch_closes_canvas_tabs(self) -> None:

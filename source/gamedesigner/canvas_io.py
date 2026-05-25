@@ -4,8 +4,6 @@ import csv
 from dataclasses import dataclass
 from pathlib import Path
 
-from openpyxl import load_workbook
-
 from .data_canvas import layout_canvas_nodes
 from .models import CanvasData, NodeField, NodeTemplate, ProjectData, new_id
 
@@ -60,6 +58,11 @@ def _read_csv(path: Path) -> ImportedSheet:
 
 
 def _read_excel(path: Path) -> ImportedSheet:
+    try:
+        from openpyxl import load_workbook
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("缺少 Excel 导入依赖 openpyxl，请重新安装依赖或重新打包 exe。") from exc
+
     workbook = load_workbook(path, read_only=True, data_only=True)
     sheet = workbook.active
     rows = []

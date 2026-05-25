@@ -211,18 +211,44 @@ def stylesheet(name: str) -> str:
     }}
     QListWidget, QTreeWidget, QTableWidget {{
         background: {colors["panel"]};
+        alternate-background-color: {colors["window"]};
         color: {colors["text"]};
         border: 1px solid {colors["hairline"]};
         border-radius: 12px;
         outline: 0;
     }}
+    QTreeWidget::item, QTableWidget::item {{
+        padding: 5px 7px;
+    }}
     QListWidget::item {{
         padding: 8px;
         border-radius: 8px;
     }}
-    QListWidget::item:selected {{
+    QListWidget::item:selected, QTreeWidget::item:selected, QTableWidget::item:selected {{
         background: {colors["accent"]};
         color: #FFFFFF;
+    }}
+    QHeaderView {{
+        background: {colors["panel"]};
+    }}
+    QHeaderView::section {{
+        background: {colors["panel_alt"]};
+        color: {colors["text"]};
+        border: 0;
+        border-right: 1px solid {colors["hairline"]};
+        border-bottom: 1px solid {colors["hairline"]};
+        padding: 7px;
+        font-weight: 600;
+    }}
+    QHeaderView::section:vertical {{
+        color: {colors["text_muted"]};
+        font-weight: 400;
+    }}
+    QTableCornerButton::section {{
+        background: {colors["panel_alt"]};
+        border: 0;
+        border-right: 1px solid {colors["hairline"]};
+        border-bottom: 1px solid {colors["hairline"]};
     }}
     QStatusBar {{
         background: {colors["window"]};

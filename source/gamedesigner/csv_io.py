@@ -87,7 +87,6 @@ def export_all_canvas_csv(
         folder = folder.parent
     folder.mkdir(parents=True, exist_ok=True)
 
-    used_names_by_folder: dict[Path, dict[str, int]] = {}
     paths: list[Path] = []
     export_specs = _resolved_canvas_specs(project, sort_mode, canvas_specs)
     for canvas, spec in export_specs:
@@ -97,8 +96,7 @@ def export_all_canvas_csv(
         if export_folder.suffix.lower() == ".csv":
             export_folder = export_folder.parent
         export_folder.mkdir(parents=True, exist_ok=True)
-        used_names = used_names_by_folder.setdefault(export_folder, {})
-        path = export_folder / _canvas_csv_filename(project, canvas, used_names)
+        path = export_folder / _canvas_csv_filename(canvas)
         paths.append(_write_canvas_csv(path, canvas, spec.sort_mode))
     return paths
 
@@ -256,16 +254,8 @@ def _format_number(value: float) -> str:
     return str(int(value)) if float(value).is_integer() else f"{value:g}"
 
 
-def _canvas_csv_filename(
-    project: ProjectData,
-    canvas: CanvasData,
-    used_names: dict[str, int],
-) -> str:
-    base = f"{_safe_filename(project.name)}__{_safe_filename(canvas.name)}"
-    used_names[base] = used_names.get(base, 0) + 1
-    if used_names[base] > 1:
-        base = f"{base}_{used_names[base]}"
-    return f"{base}.csv"
+def _canvas_csv_filename(canvas: CanvasData) -> str:
+    return f"{_safe_filename(canvas.name)}.csv"
 
 
 def _safe_filename(name: str) -> str:

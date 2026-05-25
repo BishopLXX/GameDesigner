@@ -46,6 +46,34 @@ def new_id(prefix: str) -> str:
 
 
 @dataclass
+class DesignNote:
+    id: str = field(default_factory=lambda: new_id("note"))
+    title: str = "便签"
+    content: str = ""
+
+    def is_empty(self) -> bool:
+        return not self.title.strip() and not self.content.strip()
+
+    def display_title(self) -> str:
+        return self.title.strip() or "未命名便签"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "title": self.title,
+            "content": self.content,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "DesignNote":
+        return cls(
+            id=str(raw.get("id") or new_id("note")),
+            title=str(raw.get("title") or ""),
+            content=str(raw.get("content") or ""),
+        )
+
+
+@dataclass
 class NodeField:
     name: str = "字段"
     data_type: str = "文本"
@@ -156,6 +184,7 @@ class Node:
     template_id: str = ""
     template_locked: bool = False
     fields: list[NodeField] = field(default_factory=list)
+    notes: list[DesignNote] = field(default_factory=list)
 
     def normalized_node_type(self) -> str:
         return "超文本" if self.node_type == "超链接" else self.node_type
@@ -187,13 +216,17 @@ class Node:
             "template_id": self.template_id,
             "template_locked": self.template_locked,
             "fields": [item.to_dict() for item in self.fields],
+            "notes": [note.to_dict() for note in self.notes if not note.is_empty()],
         }
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "Node":
         fields = raw.get("fields", [])
+        notes = raw.get("notes", [])
         if not isinstance(fields, list):
             fields = []
+        if not isinstance(notes, list):
+            notes = []
         node_type = str(raw.get("node_type") or raw.get("type") or "普通")
         if node_type == "超链接":
             node_type = "超文本"
@@ -219,6 +252,7 @@ class Node:
             template_id=str(raw.get("template_id") or ""),
             template_locked=bool(raw.get("template_locked", False)),
             fields=[NodeField.from_dict(item) for item in fields if isinstance(item, dict)],
+            notes=[DesignNote.from_dict(item) for item in notes if isinstance(item, dict)],
         )
         if node.title_field_id and not any(field.id == node.title_field_id for field in node.fields):
             node.title_field_id = ""
@@ -329,6 +363,7 @@ class CanvasData:
     edges: list[Edge] = field(default_factory=list)
     groups: list[BlueprintGroup] = field(default_factory=list)
     ai_rules: str = ""
+    notes: list[DesignNote] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -336,6 +371,7 @@ class CanvasData:
             "name": self.name,
             "canvas_type": self.canvas_type if self.canvas_type in CANVAS_TYPES else "normal",
             "ai_rules": self.ai_rules,
+            "notes": [note.to_dict() for note in self.notes if not note.is_empty()],
             "data_layout": self.data_layout if self.data_layout in DATA_LAYOUT_MODES else "grid",
             "data_row_style": self.data_row_style if self.data_row_style in DATA_ROW_STYLE_MODES else "independent",
             "data_grid_rows": max(0, int(self.data_grid_rows)),
@@ -352,12 +388,15 @@ class CanvasData:
         nodes_raw = raw.get("nodes", [])
         edges_raw = raw.get("edges", [])
         groups_raw = raw.get("groups", [])
+        notes_raw = raw.get("notes", [])
         if not isinstance(nodes_raw, list):
             nodes_raw = []
         if not isinstance(edges_raw, list):
             edges_raw = []
         if not isinstance(groups_raw, list):
             groups_raw = []
+        if not isinstance(notes_raw, list):
+            notes_raw = []
         canvas = cls(
             id=str(raw.get("id") or new_id("canvas")),
             name=str(raw.get("name") or "画布"),
@@ -372,6 +411,7 @@ class CanvasData:
             groups=[BlueprintGroup.from_dict(item) for item in groups_raw if isinstance(item, dict)],
             nodes=[Node.from_dict(item) for item in nodes_raw if isinstance(item, dict)],
             edges=[Edge.from_dict(item) for item in edges_raw if isinstance(item, dict)],
+            notes=[DesignNote.from_dict(item) for item in notes_raw if isinstance(item, dict)],
         )
         canvas.remove_broken_edges()
         canvas.remove_broken_groups()

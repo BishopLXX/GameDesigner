@@ -18,6 +18,11 @@
 - In the node editor, blank preview-area right-click adds sub-cards, and selected sub-card right-click exposes sub-card actions.
 - Keyboard shortcuts should remain available, but visible UI should stay compact.
 
+## Persistence Defaults
+
+- User-facing window and dialog settings must persist across close and restart unless explicitly temporary.
+- Persist changed directories, checkbox selections, sort modes, per-item dialog choices, and window geometry; restore them the next time the same workflow opens.
+
 ## Project Structure
 
 - Do not grow the project into one giant file. New features should be split into focused modules or subfolders by responsibility.

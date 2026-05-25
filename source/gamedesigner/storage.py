@@ -34,6 +34,7 @@ class AppSettings:
     welcome_layout: dict[str, dict[str, float]] = field(default_factory=dict)
     welcome_recent_layouts: dict[str, dict[str, float]] = field(default_factory=dict)
     window_layouts: dict[str, dict[str, Any]] = field(default_factory=dict)
+    export_canvas_csv_dialog: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -51,6 +52,7 @@ class AppSettings:
             "welcome_layout": self.welcome_layout,
             "welcome_recent_layouts": self.welcome_recent_layouts,
             "window_layouts": self.window_layouts,
+            "export_canvas_csv_dialog": self.export_canvas_csv_dialog,
         }
 
     @classmethod
@@ -82,6 +84,7 @@ class AppSettings:
             welcome_layout=_coerce_layout_map(raw.get("welcome_layout")),
             welcome_recent_layouts=_coerce_layout_map(raw.get("welcome_recent_layouts")),
             window_layouts=_coerce_layout_map(raw.get("window_layouts"), include_geometry=True),
+            export_canvas_csv_dialog=_coerce_export_canvas_csv_dialog(raw.get("export_canvas_csv_dialog")),
         )
 
 
@@ -163,6 +166,35 @@ def _coerce_layout(raw: dict[str, Any], *, include_geometry: bool = False) -> di
     if include_geometry and isinstance(geometry, str) and geometry:
         result["geometry"] = geometry
     return result
+
+
+def _coerce_export_canvas_csv_dialog(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    projects_raw = raw.get("projects")
+    if not isinstance(projects_raw, dict):
+        return {}
+    projects: dict[str, Any] = {}
+    for project_key, state_raw in projects_raw.items():
+        if not isinstance(project_key, str) or not isinstance(state_raw, dict):
+            continue
+        canvases_raw = state_raw.get("canvases")
+        canvases: dict[str, Any] = {}
+        if isinstance(canvases_raw, dict):
+            for canvas_id, canvas_raw in canvases_raw.items():
+                if not isinstance(canvas_id, str) or not isinstance(canvas_raw, dict):
+                    continue
+                canvases[canvas_id] = {
+                    "canvas_name": str(canvas_raw.get("canvas_name") or ""),
+                    "enabled": bool(canvas_raw.get("enabled", True)),
+                    "sort_mode": str(canvas_raw.get("sort_mode") or "created"),
+                    "target_folder": str(canvas_raw.get("target_folder") or ""),
+                }
+        projects[project_key] = {
+            "folder": str(state_raw.get("folder") or ""),
+            "canvases": canvases,
+        }
+    return {"projects": projects} if projects else {}
 
 
 def save_settings(settings: AppSettings) -> None:

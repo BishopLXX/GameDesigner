@@ -555,6 +555,9 @@ class GameDesignerApp(QMainWindow):
         self.ai_chat_action.setShortcut(QKeySequence("Ctrl+Shift+A"))
         self.ai_chat_action.triggered.connect(self._open_ai_chat)
 
+        self.canvas_notes_action = QAction("画布便签...", self)
+        self.canvas_notes_action.triggered.connect(self._open_canvas_notes)
+
         self.ai_settings_action = QAction("AI 设置...", self)
         self.ai_settings_action.triggered.connect(self._open_ai_settings)
 
@@ -616,6 +619,7 @@ class GameDesignerApp(QMainWindow):
 
         self.ai_menu = QMenu("AI", self)
         self.ai_menu.addAction(self.ai_chat_action)
+        self.ai_menu.addAction(self.canvas_notes_action)
         self.ai_menu.addAction(self.ai_settings_action)
 
     def _build_ai_assistant_collapsed_handle(self) -> QWidget:
@@ -630,8 +634,15 @@ class GameDesignerApp(QMainWindow):
         button.setToolTip("展开 AI 助手")
         button.setAutoRaise(True)
         button.clicked.connect(self._open_ai_chat)
+        notes_button = QToolButton(holder)
+        notes_button.setObjectName("aiAssistantHandleButton")
+        notes_button.setText("便签")
+        notes_button.setToolTip("当前画布便签")
+        notes_button.setAutoRaise(True)
+        notes_button.clicked.connect(self._open_canvas_notes)
         layout.addStretch(1)
         layout.addWidget(button)
+        layout.addWidget(notes_button)
         layout.addStretch(1)
         return holder
 
@@ -738,6 +749,7 @@ class GameDesignerApp(QMainWindow):
         canvas.nodeActivated.connect(lambda node_id, page=page: self._activate_welcome_node(page, node_id))
         canvas.nodeFolderRequested.connect(lambda node_id, page=page: self._open_welcome_project_folder(page, node_id))
         canvas.nodeEditRequested.connect(self._edit_node)
+        canvas.nodeNotesRequested.connect(self._edit_node_notes)
         canvas.nodeDeleteRequested.connect(self._delete_node_by_id)
         canvas.nodesDeleteRequested.connect(self._delete_nodes_by_ids)
         canvas.groupDeleteRequested.connect(self._delete_group_by_id)
@@ -1628,11 +1640,14 @@ class GameDesignerApp(QMainWindow):
             str(Path(default_folder)),
             default_sort_mode=sort_mode,
             project_path=page.path,
+            theme=self.theme,
+            export_state=self._export_canvas_csv_dialog_state(page),
         )
         if dialog.exec() != ExportCanvasCsvDialog.Accepted or not dialog.result_data:
             return
         folder = str(dialog.result_data["folder"])
         canvas_specs = list(dialog.result_data["canvas_specs"])
+        self._save_export_canvas_csv_dialog_state(page, dict(dialog.result_data.get("export_state") or {}))
         try:
             export_paths = export_all_canvas_csv(
                 page.project,
@@ -1647,6 +1662,34 @@ class GameDesignerApp(QMainWindow):
         self.settings.export_dir = folder
         save_settings(self.settings)
         self.status.showMessage(f"已导出 {len(export_paths)} 个画布 CSV：{folder}", 5000)
+
+    def _export_canvas_csv_dialog_state(self, page: ProjectPage) -> dict[str, Any]:
+        raw = self.settings.export_canvas_csv_dialog
+        if not isinstance(raw, dict):
+            return {}
+        projects = raw.get("projects")
+        if not isinstance(projects, dict):
+            return {}
+        state = projects.get(self._export_canvas_csv_dialog_state_key(page))
+        return dict(state) if isinstance(state, dict) else {}
+
+    def _save_export_canvas_csv_dialog_state(self, page: ProjectPage, state: dict[str, Any]) -> None:
+        key = self._export_canvas_csv_dialog_state_key(page)
+        raw = self.settings.export_canvas_csv_dialog if isinstance(self.settings.export_canvas_csv_dialog, dict) else {}
+        projects = raw.get("projects")
+        if not isinstance(projects, dict):
+            projects = {}
+        projects[key] = state
+        self.settings.export_canvas_csv_dialog = {"projects": projects}
+        folder = str(state.get("folder") or "").strip()
+        if folder:
+            self.settings.export_dir = folder
+        save_settings(self.settings)
+
+    def _export_canvas_csv_dialog_state_key(self, page: ProjectPage) -> str:
+        if page.path is not None:
+            return str(Path(page.path).resolve())
+        return f"unsaved:{page.project.name}:{page.project.root_canvas_id}"
 
     def _import_gdc(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -2454,6 +2497,36 @@ class GameDesignerApp(QMainWindow):
 
         dialog = AiSettingsDialog(self, self.settings)
         dialog.exec()
+
+    def _open_canvas_notes(self) -> None:
+        from .ui.notes_dialog import NotesDialog
+
+        page = self._current_page()
+        if not page or page.is_welcome:
+            QMessageBox.information(self, "画布便签", "请先打开一个项目画布。")
+            return
+        dialog = NotesDialog(self, f"{page.canvas_data.name} 便签", page.canvas_data.notes)
+        if dialog.exec() != NotesDialog.Accepted or dialog.result_notes is None:
+            return
+        page.canvas_data.notes = dialog.result_notes
+        self._mark_dirty(page)
+        page.canvas.viewport().update()
+
+    def _edit_node_notes(self, node_id: str) -> None:
+        from .ui.notes_dialog import NotesDialog
+
+        page = self._current_page()
+        if not page or page.is_welcome:
+            return
+        node = page.canvas_data.find_node(node_id)
+        if node is None:
+            return
+        dialog = NotesDialog(self, f"{node.title} 便签", node.notes)
+        if dialog.exec() != NotesDialog.Accepted or dialog.result_notes is None:
+            return
+        node.notes = dialog.result_notes
+        self._mark_dirty(page)
+        page.canvas.viewport().update()
 
     def _current_ai_project_context(self) -> tuple[str, Path, Path]:
         from .ai_tools import build_project_chat_context

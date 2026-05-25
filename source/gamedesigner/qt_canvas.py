@@ -1792,6 +1792,7 @@ class NodeGraphView(QGraphicsView):
     nodeActivated = Signal(str)
     nodeFolderRequested = Signal(str)
     nodeEditRequested = Signal(str)
+    nodeNotesRequested = Signal(str)
     nodeDeleteRequested = Signal(str)
     nodesDeleteRequested = Signal(object)
     groupDeleteRequested = Signal(str)
@@ -1925,9 +1926,28 @@ class NodeGraphView(QGraphicsView):
             "QPlainTextEdit#inlineCanvasFieldEditor {"
             "border: 2px solid #0A84FF;"
             "border-radius: 8px;"
-            "padding: 6px;"
+            "padding: 6px 10px 6px 6px;"
             f"color: {field.text_color or '#1D1D1F'};"
             f"background: {field.bg_color or '#FFFFFF'};"
+            "}"
+            "QPlainTextEdit#inlineCanvasFieldEditor QScrollBar:vertical {"
+            "background: rgba(0, 0, 0, 18);"
+            "border: 0;"
+            "border-radius: 8px;"
+            "width: 18px;"
+            "margin: 4px 3px 4px 3px;"
+            "}"
+            "QPlainTextEdit#inlineCanvasFieldEditor QScrollBar::handle:vertical {"
+            "background: rgba(60, 60, 67, 150);"
+            "border-radius: 6px;"
+            "min-height: 42px;"
+            "}"
+            "QPlainTextEdit#inlineCanvasFieldEditor QScrollBar::handle:vertical:hover {"
+            "background: rgba(60, 60, 67, 210);"
+            "}"
+            "QPlainTextEdit#inlineCanvasFieldEditor QScrollBar::add-line:vertical,"
+            "QPlainTextEdit#inlineCanvasFieldEditor QScrollBar::sub-line:vertical {"
+            "height: 0;"
             "}"
         )
         font = editor.font()
@@ -2835,8 +2855,57 @@ class NodeGraphView(QGraphicsView):
                 path = self._preview_path(start, self.mouse_scene)
                 painter.setPen(QPen(QColor(colors["edge"]), 2.2, Qt.DashLine, Qt.RoundCap, Qt.RoundJoin))
                 painter.drawPath(path)
+        self._paint_selected_node_notes(painter, colors)
+
+    def _paint_selected_node_notes(self, painter: QPainter, colors: dict[str, str]) -> None:
+        if len(self.selected_node_ids) != 1 or not self.selected_node_id:
+            return
+        item = self.node_items.get(self.selected_node_id)
+        if item is None or not item.node.notes:
+            return
+        text = self._selected_note_preview_text(item.node)
+        if not text:
+            return
+        node_rect = item.sceneBoundingRect()
+        zoom = max(0.18, self.transform().m11())
+        width = 270.0 / zoom
+        height = 118.0 / zoom
+        gap = 14.0 / zoom
+        bubble = QRectF(node_rect.right() + gap, node_rect.top(), width, height)
+        if bubble.right() > self.mapToScene(self.viewport().rect()).boundingRect().right() - gap:
+            bubble.moveRight(node_rect.left() - gap)
+        path = QPainterPath()
+        radius = 10.0 / zoom
+        path.addRoundedRect(bubble, radius, radius)
+        fill = QColor("#29261B" if self.theme == "dark" else "#FFF7D6")
+        fill.setAlpha(244)
+        border = QColor("#746B45" if self.theme == "dark" else "#E1C96D")
+        painter.fillPath(path, fill)
+        painter.setPen(QPen(border, max(1.0 / zoom, 0.6)))
+        painter.drawPath(path)
+        painter.setPen(QColor(colors["text"] if self.theme == "dark" else colors["accent_dark"]))
+        painter.setFont(_font(max(5, min(52, int(9 / zoom)))))
+        painter.drawText(
+            bubble.adjusted(12.0 / zoom, 10.0 / zoom, -12.0 / zoom, -10.0 / zoom),
+            Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap | Qt.TextWrapAnywhere,
+            text,
+        )
+
+    def _selected_note_preview_text(self, node: Node) -> str:
+        lines: list[str] = []
+        for note in node.notes[:2]:
+            title = note.display_title()
+            content = " ".join(note.content.split())
+            if len(content) > 90:
+                content = f"{content[:87]}..."
+            lines.append(f"{title}: {content}" if content else title)
+        if len(node.notes) > 2:
+            lines.append(f"... 还有 {len(node.notes) - 2} 条便签")
+        return "\n".join(line for line in lines if line.strip())
 
     def wheelEvent(self, event) -> None:  # type: ignore[override]
+        if self._scroll_inline_editor_under_mouse(event):
+            return
         self._close_inline_field_editor(commit=True)
         self._begin_interaction_preview()
         factor = 1.12 if event.angleDelta().y() > 0 else 1 / 1.12
@@ -2844,6 +2913,28 @@ class NodeGraphView(QGraphicsView):
         target = max(0.18, min(2.8, current * factor))
         self.scale(target / current, target / current)
         self.viewport().update()
+
+    def _scroll_inline_editor_under_mouse(self, event) -> bool:
+        if self._inline_proxy is None or self._inline_editor is None:
+            return False
+        view_pos = event.position().toPoint()
+        scene_pos = self.mapToScene(view_pos)
+        if not self._inline_proxy.sceneBoundingRect().contains(scene_pos):
+            return False
+        scrollbar = self._inline_editor.verticalScrollBar()
+        pixel_delta = event.pixelDelta().y() if hasattr(event, "pixelDelta") else 0
+        if pixel_delta:
+            scrollbar.setValue(scrollbar.value() - pixel_delta)
+            event.accept()
+            return True
+        delta = event.angleDelta().y()
+        if delta:
+            step = scrollbar.singleStep() or 20
+            units = max(1, abs(delta) // 120)
+            direction = -1 if delta > 0 else 1
+            scrollbar.setValue(scrollbar.value() + direction * step * 3 * units)
+        event.accept()
+        return True
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         self.setFocus()
@@ -3075,6 +3166,7 @@ class NodeGraphView(QGraphicsView):
             elif node.node.node_type == "超文本":
                 open_link = menu.addAction("打开文档")
             edit = menu.addAction("编辑节点")
+            notes = menu.addAction("便签...")
             ai_menu = menu.addMenu("AI")
             ai_iterate = ai_menu.addAction("迭代助手")
             connect = None if self.is_data_canvas() else menu.addAction("连接")
@@ -3087,6 +3179,8 @@ class NodeGraphView(QGraphicsView):
                 self.nodeActivated.emit(node.node.id)
             elif action == edit:
                 self.nodeEditRequested.emit(node.node.id)
+            elif action == notes:
+                self.nodeNotesRequested.emit(node.node.id)
             elif action == ai_iterate:
                 self.aiIterateRequested.emit()
             elif connect and action == connect:

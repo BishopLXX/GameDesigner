@@ -19,7 +19,7 @@ from gamedesigner.ai_tools import (
     save_project_chat_history,
     split_ai_canvas_action_response,
 )
-from gamedesigner.models import BlueprintGroup, CanvasData, Edge, Node, NodeField, ProjectData
+from gamedesigner.models import BlueprintGroup, CanvasData, DesignNote, Edge, Node, NodeField, ProjectData
 from gamedesigner.storage import AppSettings
 
 
@@ -215,6 +215,27 @@ class AiToolsTests(unittest.TestCase):
         self.assertIn("当前画布规则记忆（高权重", context)
         self.assertIn("几何 Boss Rush 风格", context)
         self.assertIn("每个 Boss 必须有清晰弱点", context)
+
+    def test_project_chat_context_includes_canvas_and_node_notes(self) -> None:
+        node = Node(
+            id="node_unlock",
+            title="解锁节点",
+            notes=[DesignNote(title="节点参考", content="这个节点应当只负责开放新玩法。")],
+        )
+        canvas = CanvasData(
+            id="canvas_notes",
+            name="科技树",
+            notes=[DesignNote(title="布局规则", content="科技树上面大部分是解锁，下面大部分是养成。")],
+            nodes=[node],
+        )
+        project = ProjectData(name="便签测试", root_canvas_id=canvas.id, canvases=[canvas])
+
+        context = build_project_chat_context(project, canvas, "D:/GameDesigner/demo.gdc", selected_node_ids={node.id})
+
+        self.assertIn("当前画布便签（高权重", context)
+        self.assertIn("科技树上面大部分是解锁", context)
+        self.assertIn("节点便签（绑定到具体节点", context)
+        self.assertIn("这个节点应当只负责开放新玩法", context)
 
     def test_split_ai_canvas_action_response_hides_action_block(self) -> None:
         visible, actions, error = split_ai_canvas_action_response(

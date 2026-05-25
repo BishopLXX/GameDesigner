@@ -10,7 +10,7 @@ from typing import Any
 
 from PySide6.QtCore import QProcessEnvironment
 
-from .models import FIELD_TYPES, NODE_TYPES, BlueprintGroup, CanvasData, Edge, Node, ProjectData
+from .models import FIELD_TYPES, NODE_TYPES, BlueprintGroup, CanvasData, DesignNote, Edge, Node, ProjectData
 from .storage import AppSettings, project_bundle_dir
 
 
@@ -473,6 +473,16 @@ def build_project_chat_context(
         lines.append("")
         lines.append("当前画布规则记忆（高权重，生成与迭代必须优先遵守）:")
         lines.append(canvas.ai_rules.strip())
+    canvas_note_lines = _design_note_lines(canvas.notes, limit=20)
+    if canvas_note_lines:
+        lines.append("")
+        lines.append("当前画布便签（高权重，作为设计师参考规则）:")
+        lines.extend(canvas_note_lines)
+    node_note_lines = _node_note_lines(canvas, selected_node_ids)
+    if node_note_lines:
+        lines.append("")
+        lines.append("节点便签（绑定到具体节点，选中节点优先）:")
+        lines.extend(node_note_lines)
 
     selected_nodes = [node for node in canvas.nodes if node.id in selected_node_ids]
     selected_groups = [group for group in canvas.groups if group.id in selected_group_ids]
@@ -550,9 +560,58 @@ def _node_summary(node: Node, project: ProjectData | None = None, *, detailed: b
         summary += f", 蓝图组 {node.group_id}"
     if fields:
         summary += f", 字段: {fields}"
+    if node.notes:
+        summary += f", 便签: {_note_titles(node.notes)}"
     if detailed and len(node.fields) > field_limit:
         summary += f", 另有 {len(node.fields) - field_limit} 个字段"
     return summary
+
+
+def _design_note_lines(notes: list[DesignNote], limit: int = 20) -> list[str]:
+    lines: list[str] = []
+    for note in notes[:limit]:
+        title = note.display_title()
+        content = _compact_note_text(note.content, 360)
+        if content:
+            lines.append(f"- {title}: {content}")
+        elif title:
+            lines.append(f"- {title}")
+    if len(notes) > limit:
+        lines.append(f"- ... 还有 {len(notes) - limit} 条便签未列出")
+    return lines
+
+
+def _node_note_lines(canvas: CanvasData, selected_node_ids: set[str], limit: int = 40) -> list[str]:
+    noted_nodes = [node for node in canvas.nodes if node.notes]
+    noted_nodes.sort(key=lambda node: (0 if node.id in selected_node_ids else 1, node.order, node.title))
+    lines: list[str] = []
+    for node in noted_nodes:
+        for note in node.notes:
+            title = note.display_title()
+            content = _compact_note_text(note.content, 260)
+            if content:
+                lines.append(f"- {node.title} ({node.id}) / {title}: {content}")
+            else:
+                lines.append(f"- {node.title} ({node.id}) / {title}")
+            if len(lines) >= limit:
+                remaining = sum(len(item.notes) for item in noted_nodes) - len(lines)
+                if remaining > 0:
+                    lines.append(f"- ... 还有 {remaining} 条节点便签未列出")
+                return lines
+    return lines
+
+
+def _note_titles(notes: list[DesignNote]) -> str:
+    titles = [note.display_title() for note in notes[:3] if note.display_title()]
+    suffix = f", 另有 {len(notes) - 3} 条" if len(notes) > 3 else ""
+    return ", ".join(titles) + suffix
+
+
+def _compact_note_text(value: str, limit: int) -> str:
+    text = " ".join(value.split())
+    if len(text) > limit:
+        return f"{text[: max(0, limit - 3)]}..."
+    return text
 
 
 def _group_detail_lines(group: BlueprintGroup, canvas: CanvasData, project: ProjectData) -> list[str]:

@@ -222,12 +222,17 @@ class ExportCanvasCsvDialog(QDialog):
         default_folder: str,
         default_sort_mode: str = "created",
         project_path: str | Path | None = None,
+        theme: str = "dark",
+        export_state: dict[str, object] | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("导出所有画布 CSV")
         self.setModal(True)
         self.project_path = Path(project_path) if project_path else None
         self.project = project
+        self.theme = theme if theme in {"dark", "light"} else "dark"
+        self._export_state = export_state if isinstance(export_state, dict) else {}
+        self._canvas_export_state = self._coerce_canvas_export_state(self._export_state.get("canvases"))
         self.result_data: dict[str, object] | None = None
         self._default_sort_mode = (
             default_sort_mode
@@ -236,7 +241,8 @@ class ExportCanvasCsvDialog(QDialog):
         )
         self._canvas_rows: dict[str, tuple[QCheckBox, QComboBox, QLineEdit]] = {}
 
-        self.folder_edit = QLineEdit(default_folder)
+        saved_folder = str(self._export_state.get("folder") or "").strip()
+        self.folder_edit = QLineEdit(saved_folder or default_folder)
         browse_button = QPushButton("浏览")
         browse_button.clicked.connect(self._pick_folder)
 
@@ -257,16 +263,20 @@ class ExportCanvasCsvDialog(QDialog):
         controls.addStretch(1)
 
         list_host = QWidget()
+        list_host.setObjectName("exportCanvasListHost")
         self.canvas_list_layout = QVBoxLayout(list_host)
-        self.canvas_list_layout.setContentsMargins(0, 0, 0, 0)
+        self.canvas_list_layout.setContentsMargins(10, 10, 10, 10)
         self.canvas_list_layout.setSpacing(10)
         for canvas in self.project.canvases:
             self._add_canvas_row(canvas)
         self.canvas_list_layout.addStretch(1)
 
         list_scroll = QScrollArea()
+        list_scroll.setObjectName("exportCanvasList")
         list_scroll.setWidgetResizable(True)
         list_scroll.setWidget(list_host)
+        list_scroll.viewport().setObjectName("exportCanvasListViewport")
+        list_scroll.setStyleSheet(self._list_stylesheet())
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Ok).setText("导出")
@@ -288,6 +298,7 @@ class ExportCanvasCsvDialog(QDialog):
 
     def _path_row(self, edit: QLineEdit, button: QPushButton) -> QWidget:
         row = QWidget()
+        row.setObjectName("pathRow")
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
@@ -296,16 +307,17 @@ class ExportCanvasCsvDialog(QDialog):
         return row
 
     def _add_canvas_row(self, canvas: CanvasData) -> None:
+        saved = self._state_for_canvas(canvas)
         row = QWidget()
-        row.setStyleSheet("QWidget { background: transparent; }")
+        row.setObjectName("exportCanvasRow")
         layout = QVBoxLayout(row)
-        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
 
         checkbox = QCheckBox(self._canvas_label(canvas))
-        checkbox.setChecked(True)
+        checkbox.setObjectName("exportCanvasCheck")
+        checkbox.setChecked(bool(saved.get("enabled", True)))
         checkbox.toggled.connect(lambda _checked=False: self._refresh_selected_count())
-        checkbox.setStyleSheet("QCheckBox { font-weight: 600; }")
 
         combo = QComboBox()
         combo.setMinimumWidth(170)
@@ -315,22 +327,28 @@ class ExportCanvasCsvDialog(QDialog):
         else:
             for mode, label in CSV_SORT_MODE_LABELS.items():
                 combo.addItem(label, mode)
-            combo.setCurrentIndex(max(0, combo.findData(self._default_sort_mode)))
+            saved_sort = str(saved.get("sort_mode") or self._default_sort_mode)
+            combo.setCurrentIndex(max(0, combo.findData(saved_sort)))
 
         header = QWidget()
+        header.setObjectName("exportCanvasRowHeader")
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(12, 10, 12, 0)
         header_layout.setSpacing(12)
         header_layout.addWidget(checkbox, 1)
-        header_layout.addWidget(QLabel("排序"), 0)
+        sort_label = QLabel("排序")
+        sort_label.setObjectName("exportCanvasMutedLabel")
+        header_layout.addWidget(sort_label, 0)
         header_layout.addWidget(combo, 0)
 
         folder_edit = QLineEdit()
         folder_edit.setPlaceholderText("单独导出目录，留空则使用上方默认目录")
+        folder_edit.setText(str(saved.get("target_folder") or ""))
         folder_button = QPushButton("浏览")
         folder_button.clicked.connect(lambda _checked=False, edit=folder_edit: self._pick_canvas_folder(edit))
         folder_row = self._path_row(folder_edit, folder_button)
         folder_row_host = QWidget()
+        folder_row_host.setObjectName("exportCanvasFolderHost")
         folder_row_layout = QFormLayout(folder_row_host)
         folder_row_layout.setContentsMargins(12, 0, 12, 10)
         folder_row_layout.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
@@ -340,6 +358,72 @@ class ExportCanvasCsvDialog(QDialog):
         layout.addWidget(folder_row_host)
         self.canvas_list_layout.addWidget(row)
         self._canvas_rows[canvas.id] = (checkbox, combo, folder_edit)
+
+    def _coerce_canvas_export_state(self, raw: object) -> dict[str, dict[str, object]]:
+        if not isinstance(raw, dict):
+            return {}
+        result: dict[str, dict[str, object]] = {}
+        for key, value in raw.items():
+            if isinstance(key, str) and isinstance(value, dict):
+                result[key] = dict(value)
+        return result
+
+    def _state_for_canvas(self, canvas: CanvasData) -> dict[str, object]:
+        direct = self._canvas_export_state.get(canvas.id)
+        if direct is not None:
+            return direct
+        for state in self._canvas_export_state.values():
+            if str(state.get("canvas_name") or "") == canvas.name:
+                return state
+        return {}
+
+    def export_state(self) -> dict[str, object]:
+        canvases: dict[str, object] = {}
+        for canvas in self.project.canvases:
+            checkbox, combo, folder_edit = self._canvas_rows[canvas.id]
+            canvases[canvas.id] = {
+                "canvas_name": canvas.name,
+                "enabled": checkbox.isChecked(),
+                "sort_mode": str(combo.currentData() or "created"),
+                "target_folder": folder_edit.text().strip(),
+            }
+        return {
+            "folder": self.folder_edit.text().strip(),
+            "canvases": canvases,
+        }
+
+    def _list_stylesheet(self) -> str:
+        colors = palette(self.theme)
+        return f"""
+        QScrollArea#exportCanvasList {{
+            background: {colors["panel"]};
+            border: 1px solid {colors["hairline"]};
+            border-radius: 10px;
+        }}
+        QWidget#exportCanvasListViewport,
+        QWidget#exportCanvasListHost {{
+            background: {colors["panel"]};
+        }}
+        QWidget#exportCanvasRow {{
+            background: {colors["panel_alt"]};
+            border: 1px solid {colors["hairline"]};
+            border-radius: 9px;
+        }}
+        QWidget#exportCanvasRowHeader,
+        QWidget#exportCanvasFolderHost,
+        QWidget#pathRow {{
+            background: transparent;
+        }}
+        QCheckBox#exportCanvasCheck {{
+            background: transparent;
+            color: {colors["text"]};
+            font-weight: 600;
+        }}
+        QLabel#exportCanvasMutedLabel {{
+            color: {colors["text_muted"]};
+            background: transparent;
+        }}
+        """
 
     def _canvas_label(self, canvas: CanvasData) -> str:
         name = canvas.name.strip() or "未命名画布"
@@ -394,6 +478,7 @@ class ExportCanvasCsvDialog(QDialog):
         self.result_data = {
             "folder": folder,
             "canvas_specs": specs,
+            "export_state": self.export_state(),
         }
         self.accept()
 

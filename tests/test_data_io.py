@@ -6,7 +6,16 @@ from pathlib import Path
 from gamedesigner.csv_io import CanvasCsvExportSpec, export_all_canvas_csv, export_game_csv
 from gamedesigner.canvas_io import import_canvas_sheet
 from gamedesigner.data_canvas import layout_data_canvas
-from gamedesigner.models import CanvasData, BlueprintGroup, Node, NodeField, NodeTemplate, ProjectData, default_templates
+from gamedesigner.models import (
+    CanvasData,
+    BlueprintGroup,
+    DesignNote,
+    Node,
+    NodeField,
+    NodeTemplate,
+    ProjectData,
+    default_templates,
+)
 from gamedesigner.project_files.linked_documents import (
     create_link_document,
     delete_link_document,
@@ -19,6 +28,7 @@ from gamedesigner.project_files.linked_documents import (
     write_link_document,
 )
 from gamedesigner.storage import (
+    AppSettings,
     load_project,
     load_project_window_layouts,
     project_bundle_dir,
@@ -51,6 +61,34 @@ class DataIoTests(unittest.TestCase):
                 load_project_window_layouts(project_path)["node_editor_dialog"]["width"],
                 1160.0,
             )
+
+    def test_app_settings_roundtrip_export_canvas_csv_dialog_state(self) -> None:
+        settings = AppSettings(
+            export_canvas_csv_dialog={
+                "projects": {
+                    "D:/GameDesigner/demo.gdc": {
+                        "folder": "D:/exports",
+                        "canvases": {
+                            "canvas_body": {
+                                "canvas_name": "BodyData",
+                                "enabled": False,
+                                "sort_mode": "x",
+                                "target_folder": "D:/body",
+                            }
+                        },
+                    }
+                }
+            }
+        )
+
+        loaded = AppSettings.from_dict(settings.to_dict())
+        state = loaded.export_canvas_csv_dialog["projects"]["D:/GameDesigner/demo.gdc"]
+        canvas_state = state["canvases"]["canvas_body"]
+
+        self.assertEqual(state["folder"], "D:/exports")
+        self.assertFalse(canvas_state["enabled"])
+        self.assertEqual(canvas_state["sort_mode"], "x")
+        self.assertEqual(canvas_state["target_folder"], "D:/body")
 
     def test_project_gdc_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -168,6 +206,31 @@ class DataIoTests(unittest.TestCase):
             canvas_file = path.parent / f"{path.name}.files" / "canvases" / f"{project.root_canvas_id}.json"
             self.assertIn('"ai_rules"', canvas_file.read_text(encoding="utf-8"))
 
+    def test_canvas_and_node_notes_roundtrip_in_split_canvas_file(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            tmp_path = Path(folder)
+            project = ProjectData(name="便签工程")
+            project.ensure_canvas_structure()
+            canvas = project.root_canvas()
+            canvas.notes.append(DesignNote(title="布局规则", content="科技树上面大部分是解锁，下面大部分是养成。"))
+            canvas.add_node(
+                Node(
+                    title="火球",
+                    notes=[DesignNote(title="调参", content="前期伤害可以偏高，验证手感后回调。")],
+                )
+            )
+
+            path = tmp_path / "notes.gdc"
+            save_project(project, path)
+            loaded = load_project(path)
+            loaded_canvas = loaded.root_canvas()
+
+            self.assertEqual(loaded_canvas.notes[0].title, "布局规则")
+            self.assertIn("上面大部分是解锁", loaded_canvas.notes[0].content)
+            self.assertEqual(loaded_canvas.nodes[0].notes[0].title, "调参")
+            canvas_file = path.parent / f"{path.name}.files" / "canvases" / f"{project.root_canvas_id}.json"
+            self.assertIn('"notes"', canvas_file.read_text(encoding="utf-8"))
+
     def test_game_csv_export_is_single_flat_table(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             tmp_path = Path(folder)
@@ -228,8 +291,8 @@ class DataIoTests(unittest.TestCase):
             child.add_node(Node(title="敌人A", order=2, x=100, fields=[NodeField("血量", "整数", "80")]))
 
             outputs = export_all_canvas_csv(project, tmp_path, sort_mode="x")
-            root_csv = tmp_path / "多画布CSV__主画布.csv"
-            child_csv = tmp_path / "多画布CSV__战斗画布.csv"
+            root_csv = tmp_path / "主画布.csv"
+            child_csv = tmp_path / "战斗画布.csv"
 
             self.assertEqual(outputs, [root_csv, child_csv])
             self.assertTrue(root_csv.exists())
@@ -277,10 +340,10 @@ class DataIoTests(unittest.TestCase):
                 ],
             )
 
-            root_csv = tmp_path / "导出设置测试__主画布.csv"
-            free_csv = tmp_path / "导出设置测试__自由画布.csv"
-            skipped_csv = tmp_path / "导出设置测试__跳过画布.csv"
-            data_csv = tmp_path / "导出设置测试__数据画布.csv"
+            root_csv = tmp_path / "主画布.csv"
+            free_csv = tmp_path / "自由画布.csv"
+            skipped_csv = tmp_path / "跳过画布.csv"
+            data_csv = tmp_path / "数据画布.csv"
 
             self.assertEqual(outputs, [root_csv, free_csv, data_csv])
             self.assertTrue(root_csv.exists())
@@ -318,12 +381,30 @@ class DataIoTests(unittest.TestCase):
                 ],
             )
 
-            root_csv = tmp_path / "分目录导出__主画布.csv"
-            free_csv = custom_folder / "分目录导出__自由画布.csv"
+            root_csv = tmp_path / "主画布.csv"
+            free_csv = custom_folder / "自由画布.csv"
 
             self.assertEqual(outputs, [root_csv, free_csv])
             self.assertTrue(root_csv.exists())
             self.assertTrue(free_csv.exists())
+
+    def test_all_canvas_csv_export_replaces_same_canvas_name_without_project_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            tmp_path = Path(folder)
+            project = ProjectData(name="导出前缀测试")
+            project.ensure_canvas_structure()
+            project.root_canvas().name = "BodyData"
+            project.root_canvas().add_node(Node(title="旧行"))
+            second = project.add_canvas("BodyData")
+            second.add_node(Node(title="新行"))
+
+            outputs = export_all_canvas_csv(project, tmp_path)
+            target = tmp_path / "BodyData.csv"
+
+            self.assertEqual(outputs, [target, target])
+            self.assertTrue(target.exists())
+            self.assertEqual(self._csv_names(target), ["新行"])
+            self.assertFalse((tmp_path / "导出前缀测试__BodyData.csv").exists())
 
     def test_delete_node_compacts_creation_order(self) -> None:
         project = ProjectData(name="删除排序")

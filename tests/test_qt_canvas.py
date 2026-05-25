@@ -53,6 +53,25 @@ class _ViewMouseEvent:
         self.accepted = True
 
 
+class _ViewWheelEvent:
+    def __init__(self, pos: QPoint, angle_delta_y: int) -> None:
+        self._pos = pos
+        self._angle_delta_y = angle_delta_y
+        self.accepted = False
+
+    def position(self) -> QPointF:
+        return QPointF(self._pos)
+
+    def pixelDelta(self) -> QPoint:
+        return QPoint(0, 0)
+
+    def angleDelta(self) -> QPoint:
+        return QPoint(0, self._angle_delta_y)
+
+    def accept(self) -> None:
+        self.accepted = True
+
+
 class _ViewContextMenuEvent:
     def __init__(self, pos: QPoint, global_pos: QPoint | None = None) -> None:
         self._pos = pos
@@ -436,6 +455,36 @@ class QtCanvasTests(unittest.TestCase):
 
         self.assertEqual(field.value, "5")
         self.assertEqual(changed, [])
+        view.deleteLater()
+
+    def test_wheel_over_inline_field_editor_scrolls_editor_instead_of_zooming_canvas(self) -> None:
+        canvas = CanvasData(name="主画布")
+        field = NodeField("说明", "长文本", "\n".join(f"第 {index} 行" for index in range(40)), x=20, y=10, width=260, height=86)
+        node = canvas.add_node(Node(title="视觉节点", width=360, height=220, fields=[field]))
+        view = NodeGraphView(canvas)
+        view.resize(720, 520)
+        view.show()
+        self.app.processEvents()
+        item = view.node_items[node.id]
+
+        view.start_inline_field_edit(item, field, item._editable_field_rects()[0][1])
+        self.assertIsNotNone(view._inline_editor)
+        self.assertIsNotNone(view._inline_proxy)
+        editor = view._inline_editor
+        scrollbar = editor.verticalScrollBar()
+        scrollbar.setRange(0, 100)
+        scrollbar.setSingleStep(10)
+        before_zoom = view.transform().m11()
+        view_pos = view.mapFromScene(view._inline_proxy.sceneBoundingRect().center())
+
+        wheel = _ViewWheelEvent(view_pos, -120)
+        view.wheelEvent(wheel)
+
+        self.assertTrue(wheel.accepted)
+        self.assertTrue(view.is_inline_field_editing())
+        self.assertEqual(view.transform().m11(), before_zoom)
+        self.assertGreater(scrollbar.value(), 0)
+        self.assertIn("width: 18px", editor.styleSheet())
         view.deleteLater()
 
     def test_inline_node_field_editor_enter_commits_shift_enter_adds_newline(self) -> None:
@@ -897,6 +946,29 @@ class QtCanvasTests(unittest.TestCase):
             view._show_context_menu(view_pos, QPoint(20, 20))
 
         self.assertEqual(emitted, [True])
+        self.assertEqual(view.selected_node_ids, {node.id})
+        view.deleteLater()
+
+    def test_node_context_menu_notes_action_emits_signal(self) -> None:
+        canvas = CanvasData(name="主画布")
+        node = canvas.add_node(Node(title="当前节点", x=0, y=0, width=320, height=180))
+        view = NodeGraphView(canvas)
+        emitted: list[str] = []
+        view.nodeNotesRequested.connect(lambda node_id: emitted.append(node_id))
+        item = view.node_items[node.id]
+        scene_pos = item.sceneBoundingRect().center()
+        view_pos = view.mapFromScene(scene_pos)
+
+        def fake_exec(menu: QMenu, _global_pos: QPoint):
+            for action in _iter_menu_actions(menu):
+                if action.text() == "便签...":
+                    return action
+            return None
+
+        with mock.patch.object(view, "_exec_context_menu", side_effect=fake_exec):
+            view._show_context_menu(view_pos, QPoint(20, 20))
+
+        self.assertEqual(emitted, [node.id])
         self.assertEqual(view.selected_node_ids, {node.id})
         view.deleteLater()
 

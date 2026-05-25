@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import defaultdict
+
 from .models import CanvasData, Node, NodeField, NodeTemplate, ProjectData
 
 
@@ -21,18 +23,26 @@ def apply_template_to_node(
     preserve_values: bool = True,
     force_lock: bool | None = None,
 ) -> None:
-    existing_fields = {field.id: field for field in node.fields}
+    original_fields = list(node.fields)
+    existing_fields = {field.id: field for field in original_fields}
+    existing_fields_by_name: dict[str, list[NodeField]] = defaultdict(list)
+    for field in original_fields:
+        existing_fields_by_name[_field_match_name(field)].append(field)
+    used_existing_ids: set[str] = set()
     cloned_fields: list[NodeField] = []
-    for template_field in template.fields:
+    for index, template_field in enumerate(template.fields):
         cloned = NodeField.from_dict(template_field.to_dict())
         if preserve_values:
-            existing = existing_fields.get(cloned.id)
+            existing = _matching_existing_field(
+                cloned,
+                index,
+                original_fields,
+                existing_fields,
+                existing_fields_by_name,
+                used_existing_ids,
+            )
             if existing:
-                if cloned.data_type == "图片":
-                    if existing.data_type == "图片":
-                        cloned.image_path = existing.image_path
-                elif existing.data_type != "图片":
-                    cloned.value = existing.value
+                _preserve_field_content(cloned, existing)
         cloned_fields.append(cloned)
 
     node.node_type = "普通"
@@ -47,6 +57,45 @@ def apply_template_to_node(
     node.title = _template_title(template, cloned_fields, title_field_id)
     if force_lock is not None:
         node.template_locked = force_lock
+
+
+def _matching_existing_field(
+    cloned: NodeField,
+    index: int,
+    original_fields: list[NodeField],
+    existing_fields: dict[str, NodeField],
+    existing_fields_by_name: dict[str, list[NodeField]],
+    used_existing_ids: set[str],
+) -> NodeField | None:
+    existing = existing_fields.get(cloned.id)
+    if existing is not None and existing.id not in used_existing_ids:
+        used_existing_ids.add(existing.id)
+        return existing
+
+    for candidate in existing_fields_by_name.get(_field_match_name(cloned), []):
+        if candidate.id not in used_existing_ids:
+            used_existing_ids.add(candidate.id)
+            return candidate
+
+    if 0 <= index < len(original_fields):
+        candidate = original_fields[index]
+        if candidate.id not in used_existing_ids:
+            used_existing_ids.add(candidate.id)
+            return candidate
+    return None
+
+
+def _field_match_name(field: NodeField) -> str:
+    return field.name.strip().casefold()
+
+
+def _preserve_field_content(cloned: NodeField, existing: NodeField) -> None:
+    if cloned.data_type == "图片":
+        if existing.data_type == "图片":
+            cloned.image_path = existing.image_path
+        return
+    if existing.data_type != "图片":
+        cloned.value = existing.value
 
 
 def sync_data_canvas(project: ProjectData, canvas: CanvasData) -> bool:
