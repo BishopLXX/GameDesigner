@@ -10,13 +10,21 @@ from typing import Any
 
 from PySide6.QtCore import QProcessEnvironment
 
+from .ai_presets import AI_FREE_MODEL_PRESETS
 from .models import FIELD_TYPES, NODE_TYPES, BlueprintGroup, CanvasData, DesignNote, Edge, Node, ProjectData
 from .storage import AppSettings, project_bundle_dir
 
 
 AI_PROVIDERS = {"codex", "claude"}
 AI_AUTH_MODES = {"official", "api_key"}
-AI_MODEL_PRESETS = ["gpt-5.4", "gpt-5.5", "gpt-5", "opus", "sonnet"]
+AI_MODEL_PRESETS = [
+    "gpt-5.4",
+    "gpt-5.5",
+    "gpt-5",
+    "opus",
+    "sonnet",
+    *(preset.model for preset in AI_FREE_MODEL_PRESETS),
+]
 AI_CHAT_DIR = "ai_chat"
 AI_CHAT_HISTORY_FILE = "history.json"
 AI_CHAT_HISTORY_LIMIT = 24

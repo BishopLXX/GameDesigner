@@ -25,6 +25,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..ai_presets import (
+    AI_CUSTOM_API_PROFILE_KEY,
+    AI_FREE_MODEL_PRESETS,
+    AI_OFFICIAL_PROFILE_KEY,
+    ai_connection_snapshot,
+    ai_profile_key_for_snapshot,
+    free_model_preset_by_key,
+)
 from ..ai_tools import (
     AI_MODEL_PRESETS,
     AiCanvasAction,
@@ -61,6 +69,21 @@ class AiSettingsDialog(QDialog):
         self.model_combo.addItems(AI_MODEL_PRESETS)
         self.model_combo.setEditText(settings.ai_model or AI_MODEL_PRESETS[0])
 
+        self.free_model_combo = QComboBox()
+        for preset in AI_FREE_MODEL_PRESETS:
+            self.free_model_combo.addItem(preset.label, preset.key)
+            self.free_model_combo.setItemData(self.free_model_combo.count() - 1, preset.description, Qt.ToolTipRole)
+        self.free_model_apply_button = QPushButton("一键使用")
+        self.free_model_apply_button.setToolTip("保存并切换到选中的免费模型配置")
+        self.free_model_apply_button.clicked.connect(self._use_free_model_preset)
+
+        self.official_profile_button = QPushButton("官方登录")
+        self.official_profile_button.setToolTip("切回 Codex/Claude CLI 官方登录模式")
+        self.official_profile_button.clicked.connect(self._use_official_profile)
+        self.api_profile_button = QPushButton("上次 API")
+        self.api_profile_button.setToolTip("恢复上次手动填写的 API Key 配置")
+        self.api_profile_button.clicked.connect(self._use_custom_api_profile)
+
         self.official_radio = QCheckBox("使用 CLI 官方登录状态")
         self.api_key_radio = QCheckBox("使用第三方 API Key")
         self.official_radio.toggled.connect(self._sync_auth_checks)
@@ -82,6 +105,8 @@ class AiSettingsDialog(QDialog):
         form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         form.addRow("工具", self.provider_combo)
         form.addRow("模型", self.model_combo)
+        form.addRow("免费模型", self._free_model_row())
+        form.addRow("快速切回", self._profile_row())
         form.addRow("认证", self._auth_row())
         form.addRow("", self.login_button)
         form.addRow("API Key", self.api_key_edit)
@@ -101,6 +126,25 @@ class AiSettingsDialog(QDialog):
         self.resize(560, 280)
         restore_window_layout(self, "ai_settings_dialog")
         self._refresh_auth_fields()
+
+    def _free_model_row(self) -> QWidget:
+        row = QWidget(self)
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        layout.addWidget(self.free_model_combo, 1)
+        layout.addWidget(self.free_model_apply_button)
+        return row
+
+    def _profile_row(self) -> QWidget:
+        row = QWidget(self)
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        layout.addWidget(self.official_profile_button)
+        layout.addWidget(self.api_profile_button)
+        layout.addStretch(1)
+        return row
 
     def _auth_row(self) -> QWidget:
         row = QWidget(self)
@@ -129,19 +173,103 @@ class AiSettingsDialog(QDialog):
         self._refresh_auth_fields()
 
     def _refresh_auth_fields(self) -> None:
+        if not hasattr(self, "api_key_edit"):
+            return
         enabled = self.api_key_radio.isChecked()
         self.api_key_edit.setEnabled(enabled)
         self.base_url_edit.setEnabled(enabled)
         self.login_button.setEnabled(not enabled)
 
     def _save(self) -> None:
-        self.settings.ai_provider = str(self.provider_combo.currentData() or "codex")
-        self.settings.ai_model = self.model_combo.currentText().strip() or "gpt-5.4"
-        self.settings.ai_auth_mode = "api_key" if self.api_key_radio.isChecked() else "official"
-        self.settings.ai_api_key = self.api_key_edit.text().strip()
-        self.settings.ai_base_url = self.base_url_edit.text().strip()
+        snapshot = self._current_snapshot()
+        self._store_snapshot(snapshot)
+        self._write_settings(snapshot)
         save_settings(self.settings)
         self.accept()
+
+    def _use_free_model_preset(self) -> None:
+        preset = free_model_preset_by_key(str(self.free_model_combo.currentData() or ""))
+        if preset is None:
+            return
+        self._store_snapshot(self._current_snapshot())
+        stored = self.settings.ai_saved_connections.get(preset.key, {})
+        snapshot = preset.to_snapshot(stored)
+        if preset.needs_api_key and not snapshot["ai_api_key"] and self._same_base_url(self.base_url_edit.text(), preset.base_url):
+            snapshot["ai_api_key"] = self.api_key_edit.text().strip()
+        self._apply_snapshot_to_controls(snapshot)
+        if preset.needs_api_key and not snapshot["ai_api_key"]:
+            QMessageBox.information(self, "需要 API Key", "已填好模型和 Base URL。这个免费额度服务需要粘贴自己的 API Key 后再保存。")
+            self.api_key_edit.setFocus(Qt.OtherFocusReason)
+            return
+        self._save()
+
+    def _use_official_profile(self) -> None:
+        self._store_snapshot(self._current_snapshot())
+        snapshot = self.settings.ai_saved_connections.get(
+            AI_OFFICIAL_PROFILE_KEY,
+            ai_connection_snapshot(
+                provider="codex",
+                model="gpt-5.4",
+                auth_mode="official",
+                api_key="",
+                base_url="",
+            ),
+        )
+        self._apply_snapshot_to_controls(snapshot)
+        self._save()
+
+    def _use_custom_api_profile(self) -> None:
+        self._store_snapshot(self._current_snapshot())
+        snapshot = self.settings.ai_saved_connections.get(AI_CUSTOM_API_PROFILE_KEY)
+        if snapshot is None:
+            snapshot = ai_connection_snapshot(
+                provider=str(self.provider_combo.currentData() or "codex"),
+                model=self.model_combo.currentText().strip() or "gpt-5.4",
+                auth_mode="api_key",
+                api_key="",
+                base_url="",
+            )
+        self._apply_snapshot_to_controls(snapshot)
+        if not snapshot["ai_api_key"] and not snapshot["ai_base_url"]:
+            QMessageBox.information(self, "填写 API", "已经切到 API Key 模式。填写 API Key 和 Base URL 后保存。")
+            self.api_key_edit.setFocus(Qt.OtherFocusReason)
+            return
+        self._save()
+
+    def _current_snapshot(self) -> dict[str, str]:
+        return ai_connection_snapshot(
+            provider=str(self.provider_combo.currentData() or "codex"),
+            model=self.model_combo.currentText().strip() or "gpt-5.4",
+            auth_mode="api_key" if self.api_key_radio.isChecked() else "official",
+            api_key=self.api_key_edit.text().strip(),
+            base_url=self.base_url_edit.text().strip(),
+        )
+
+    def _store_snapshot(self, snapshot: dict[str, str]) -> None:
+        key = ai_profile_key_for_snapshot(snapshot)
+        self.settings.ai_saved_connections[key] = dict(snapshot)
+
+    def _write_settings(self, snapshot: dict[str, str]) -> None:
+        self.settings.ai_provider = snapshot["ai_provider"]
+        self.settings.ai_model = snapshot["ai_model"] or "gpt-5.4"
+        self.settings.ai_auth_mode = snapshot["ai_auth_mode"]
+        self.settings.ai_api_key = snapshot["ai_api_key"]
+        self.settings.ai_base_url = snapshot["ai_base_url"]
+
+    def _apply_snapshot_to_controls(self, snapshot: dict[str, str]) -> None:
+        provider_index = self.provider_combo.findData(snapshot.get("ai_provider", "codex"))
+        self.provider_combo.setCurrentIndex(provider_index if provider_index >= 0 else 0)
+        self.model_combo.setEditText(snapshot.get("ai_model") or "gpt-5.4")
+        self.api_key_edit.setText(snapshot.get("ai_api_key", ""))
+        self.base_url_edit.setText(snapshot.get("ai_base_url", ""))
+        if snapshot.get("ai_auth_mode") == "api_key":
+            self.api_key_radio.setChecked(True)
+        else:
+            self.official_radio.setChecked(True)
+        self._refresh_auth_fields()
+
+    def _same_base_url(self, left: str, right: str) -> bool:
+        return left.strip().rstrip("/") == right.strip().rstrip("/")
 
     def _open_official_login(self) -> None:
         provider = str(self.provider_combo.currentData() or "codex")

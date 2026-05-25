@@ -19,6 +19,7 @@ from gamedesigner.ai_tools import (
     save_project_chat_history,
     split_ai_canvas_action_response,
 )
+from gamedesigner.ai_presets import AI_FREE_MODEL_PRESETS, clean_ai_saved_connections
 from gamedesigner.models import BlueprintGroup, CanvasData, DesignNote, Edge, Node, NodeField, ProjectData
 from gamedesigner.storage import AppSettings
 
@@ -50,6 +51,44 @@ class AiToolsTests(unittest.TestCase):
         self.assertEqual(invocation.arguments[:3], ["--print", "--model", "opus"])
         self.assertEqual(invocation.environment["ANTHROPIC_API_KEY"], "secret")
         self.assertEqual(invocation.environment["ANTHROPIC_BASE_URL"], "https://example.test")
+
+    def test_free_ollama_preset_uses_openai_compatible_environment(self) -> None:
+        preset = next(item for item in AI_FREE_MODEL_PRESETS if item.key == "free_ollama_gpt_oss_20b")
+        snapshot = preset.to_snapshot()
+        settings = AppSettings(
+            ai_provider=snapshot["ai_provider"],
+            ai_model=snapshot["ai_model"],
+            ai_auth_mode=snapshot["ai_auth_mode"],
+            ai_api_key=snapshot["ai_api_key"],
+            ai_base_url=snapshot["ai_base_url"],
+        )
+
+        invocation = build_ai_cli_invocation(settings, "hello", Path("D:/GameDesigner"))
+
+        self.assertEqual(invocation.program, "codex")
+        self.assertIn("gpt-oss:20b", invocation.arguments)
+        self.assertEqual(invocation.environment["OPENAI_API_KEY"], "ollama")
+        self.assertEqual(invocation.environment["OPENAI_BASE_URL"], "http://localhost:11434/v1")
+
+    def test_ai_saved_connections_are_sanitized(self) -> None:
+        cleaned = clean_ai_saved_connections(
+            {
+                "api_key": {
+                    "ai_provider": "bad",
+                    "ai_model": "model",
+                    "ai_auth_mode": "api_key",
+                    "ai_api_key": "secret",
+                    "ai_base_url": "https://example.test/v1",
+                },
+                "": {"ai_provider": "codex"},
+                "official": "invalid",
+            }
+        )
+
+        self.assertEqual(cleaned["api_key"]["ai_provider"], "codex")
+        self.assertEqual(cleaned["api_key"]["ai_auth_mode"], "api_key")
+        self.assertNotIn("", cleaned)
+        self.assertNotIn("official", cleaned)
 
     def test_qprocess_command_wraps_windows_cli_with_cmd(self) -> None:
         settings = AppSettings(ai_provider="codex", ai_model="gpt-5.5")

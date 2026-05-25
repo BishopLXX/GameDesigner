@@ -8,7 +8,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QEvent, QPointF, Qt
 from PySide6.QtGui import QKeyEvent, QTextCursor
-from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
+from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QWidget
 
 from gamedesigner.app import GameDesignerApp
 from gamedesigner.ai_tools import AiCanvasAction, AiCanvasFieldChange
@@ -18,6 +18,7 @@ from gamedesigner.qt_dialogs import HEADER_HEIGHT, InlineFieldEditor, NodeEditor
 from gamedesigner.models import BlueprintGroup, Node, NodeField, NodeTemplate, ProjectData
 from gamedesigner.storage import (
     AppSettings,
+    load_settings,
     load_project,
     load_project_window_layouts,
     save_project,
@@ -25,7 +26,7 @@ from gamedesigner.storage import (
     save_settings,
 )
 from gamedesigner.ui.link_document_dialog import LinkDocumentDialog
-from gamedesigner.ui.ai_chat_dialog import AiChatPanel
+from gamedesigner.ui.ai_chat_dialog import AiChatPanel, AiSettingsDialog
 from gamedesigner.ui.submit_text_edit import SubmitPlainTextEdit
 
 
@@ -155,6 +156,76 @@ class AppEditingTests(unittest.TestCase):
         self.assertEqual(window.ai_assistant_stack.width(), 42)
         self.assertIs(window.ai_assistant_stack.currentWidget(), window.ai_assistant_collapsed)
         window.deleteLater()
+
+    def test_ai_settings_dialog_one_click_uses_ollama_free_preset(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            settings = AppSettings(workspace_dir=folder, export_dir=str(Path(folder) / "exports"))
+            with mock.patch.dict(os.environ, {"APPDATA": folder}):
+                save_settings(settings)
+                dialog = AiSettingsDialog(None, settings)
+                index = dialog.free_model_combo.findData("free_ollama_gpt_oss_20b")
+                self.assertGreaterEqual(index, 0)
+                dialog.free_model_combo.setCurrentIndex(index)
+
+                dialog.free_model_apply_button.click()
+
+                self.assertEqual(dialog.result(), QDialog.Accepted)
+                self.assertEqual(settings.ai_provider, "codex")
+                self.assertEqual(settings.ai_model, "gpt-oss:20b")
+                self.assertEqual(settings.ai_auth_mode, "api_key")
+                self.assertEqual(settings.ai_api_key, "ollama")
+                self.assertEqual(settings.ai_base_url, "http://localhost:11434/v1")
+                loaded = load_settings()
+                self.assertEqual(loaded.ai_model, "gpt-oss:20b")
+                self.assertIn("free_ollama_gpt_oss_20b", loaded.ai_saved_connections)
+                dialog.deleteLater()
+
+    def test_ai_settings_dialog_can_restore_previous_custom_api_after_free_preset(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            settings = AppSettings(
+                workspace_dir=folder,
+                export_dir=str(Path(folder) / "exports"),
+                ai_provider="codex",
+                ai_model="gpt-5.5",
+                ai_auth_mode="api_key",
+                ai_api_key="paid-secret",
+                ai_base_url="https://api.example.test/v1",
+            )
+            with mock.patch.dict(os.environ, {"APPDATA": folder}):
+                save_settings(settings)
+                dialog = AiSettingsDialog(None, settings)
+                dialog.free_model_combo.setCurrentIndex(dialog.free_model_combo.findData("free_ollama_qwen3_8b"))
+                dialog.free_model_apply_button.click()
+                dialog.deleteLater()
+
+                reopened = AiSettingsDialog(None, settings)
+                reopened.api_profile_button.click()
+
+                self.assertEqual(reopened.result(), QDialog.Accepted)
+                self.assertEqual(settings.ai_model, "gpt-5.5")
+                self.assertEqual(settings.ai_auth_mode, "api_key")
+                self.assertEqual(settings.ai_api_key, "paid-secret")
+                self.assertEqual(settings.ai_base_url, "https://api.example.test/v1")
+                reopened.deleteLater()
+
+    def test_ai_settings_dialog_free_remote_preset_waits_for_api_key(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            settings = AppSettings(workspace_dir=folder, export_dir=str(Path(folder) / "exports"))
+            with mock.patch.dict(os.environ, {"APPDATA": folder}):
+                save_settings(settings)
+                dialog = AiSettingsDialog(None, settings)
+                dialog.free_model_combo.setCurrentIndex(dialog.free_model_combo.findData("free_openrouter_router"))
+
+                with mock.patch.object(QMessageBox, "information") as information:
+                    dialog.free_model_apply_button.click()
+
+                self.assertNotEqual(dialog.result(), QDialog.Accepted)
+                information.assert_called_once()
+                self.assertEqual(dialog.model_combo.currentText(), "openrouter/free")
+                self.assertEqual(dialog.base_url_edit.text(), "https://openrouter.ai/api/v1")
+                self.assertTrue(dialog.api_key_radio.isChecked())
+                self.assertTrue(dialog.api_key_edit.isEnabled())
+                dialog.deleteLater()
 
     def test_ai_panel_clear_screen_keeps_project_memory(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

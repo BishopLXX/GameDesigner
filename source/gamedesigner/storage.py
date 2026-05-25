@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .ai_presets import clean_ai_saved_connections
 from .models import EDGE_STYLES, ProjectData, default_project
 
 
@@ -30,6 +31,7 @@ class AppSettings:
     ai_auth_mode: str = "official"
     ai_api_key: str = ""
     ai_base_url: str = ""
+    ai_saved_connections: dict[str, dict[str, str]] = field(default_factory=dict)
     recent_projects: list[str] = field(default_factory=list)
     welcome_layout: dict[str, dict[str, float]] = field(default_factory=dict)
     welcome_recent_layouts: dict[str, dict[str, float]] = field(default_factory=dict)
@@ -48,6 +50,7 @@ class AppSettings:
             "ai_auth_mode": self.ai_auth_mode,
             "ai_api_key": self.ai_api_key,
             "ai_base_url": self.ai_base_url,
+            "ai_saved_connections": self.ai_saved_connections,
             "recent_projects": self.recent_projects,
             "welcome_layout": self.welcome_layout,
             "welcome_recent_layouts": self.welcome_recent_layouts,
@@ -80,6 +83,7 @@ class AppSettings:
             ai_auth_mode=ai_auth_mode,
             ai_api_key=str(raw.get("ai_api_key", "")),
             ai_base_url=str(raw.get("ai_base_url", "")),
+            ai_saved_connections=clean_ai_saved_connections(raw.get("ai_saved_connections")),
             recent_projects=[str(item) for item in recent if item],
             welcome_layout=_coerce_layout_map(raw.get("welcome_layout")),
             welcome_recent_layouts=_coerce_layout_map(raw.get("welcome_recent_layouts")),
