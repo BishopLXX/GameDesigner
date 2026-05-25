@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+
+from PySide6.QtCore import QByteArray, QMimeData, Qt
+from PySide6.QtGui import QDrag
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -15,6 +19,29 @@ from PySide6.QtWidgets import (
 )
 
 from ..models import DesignNote
+from ..qt_canvas import NOTE_MIME_TYPE
+
+
+class NoteListWidget(QListWidget):
+    def __init__(self, dialog: "NotesDialog") -> None:
+        super().__init__(dialog)
+        self.dialog = dialog
+        self.setDragEnabled(True)
+        self.setDefaultDropAction(Qt.CopyAction)
+
+    def startDrag(self, _supported_actions) -> None:  # type: ignore[override]
+        row = self.currentRow()
+        note = self.dialog.note_for_drag(row)
+        if note is None or note.is_empty():
+            return
+        mime = QMimeData()
+        mime.setData(
+            NOTE_MIME_TYPE,
+            QByteArray(json.dumps(note.to_dict(), ensure_ascii=False).encode("utf-8")),
+        )
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        drag.exec(Qt.CopyAction)
 
 
 class NotesDialog(QDialog):
@@ -26,7 +53,7 @@ class NotesDialog(QDialog):
         self._notes = [DesignNote.from_dict(note.to_dict()) for note in notes]
         self._updating = False
 
-        self.list_widget = QListWidget(self)
+        self.list_widget = NoteListWidget(self)
         self.list_widget.currentRowChanged.connect(self._load_note)
 
         add_button = QPushButton("新增", self)
@@ -150,3 +177,10 @@ class NotesDialog(QDialog):
         if 0 <= row < len(self._notes):
             return self._notes[row]
         return None
+
+    def note_for_drag(self, row: int) -> DesignNote | None:
+        self._update_current_note()
+        note = self._note_at(row)
+        if note is None:
+            return None
+        return DesignNote.from_dict(note.to_dict())

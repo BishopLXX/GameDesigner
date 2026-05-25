@@ -15,7 +15,7 @@ from gamedesigner.ai_tools import AiCanvasAction, AiCanvasFieldChange
 from gamedesigner.ai_tools import AiChatMessage, load_project_chat_history, save_project_chat_history
 from gamedesigner.canvas_io import import_canvas_sheet
 from gamedesigner.qt_dialogs import HEADER_HEIGHT, InlineFieldEditor, NodeEditorDialog
-from gamedesigner.models import BlueprintGroup, Node, NodeField, NodeTemplate, ProjectData
+from gamedesigner.models import BlueprintGroup, DesignNote, Node, NodeField, NodeTemplate, ProjectData
 from gamedesigner.storage import (
     AppSettings,
     load_settings,
@@ -1237,6 +1237,42 @@ class AppEditingTests(unittest.TestCase):
 
         self.assertEqual(dialog.result_notes, [])
         dialog.deleteLater()
+
+    def test_add_note_at_creates_canvas_and_node_notes(self) -> None:
+        window = GameDesignerApp()
+        project = ProjectData(name="便签创建测试")
+        project.ensure_canvas_structure()
+        canvas = project.root_canvas()
+        node = canvas.add_node(Node(title="目标节点", x=20, y=30))
+        page = window._add_page(project, None, dirty=False, canvas_data=canvas)
+        window.tabs.setCurrentWidget(page)
+
+        window._add_note_at(120, 160, None)
+        window._add_note_at(240, 260, node.id)
+
+        self.assertEqual(len(canvas.notes), 1)
+        self.assertEqual(len(node.notes), 1)
+        self.assertEqual(canvas.notes[0].x, 120)
+        self.assertEqual(node.notes[0].x, 240)
+        self.assertTrue(page.dirty)
+        window.deleteLater()
+
+    def test_delete_selected_removes_selected_note(self) -> None:
+        window = GameDesignerApp()
+        project = ProjectData(name="便签删除测试")
+        project.ensure_canvas_structure()
+        canvas = project.root_canvas()
+        note = DesignNote(title="待删", content="内容")
+        canvas.notes.append(note)
+        page = window._add_page(project, None, dirty=False, canvas_data=canvas)
+        window.tabs.setCurrentWidget(page)
+        page.canvas.select_note(note.id)
+
+        window._delete_selected()
+
+        self.assertEqual(canvas.notes, [])
+        self.assertTrue(page.dirty)
+        window.deleteLater()
 
     def test_convert_canvas_type_switches_between_normal_and_data(self) -> None:
         window = GameDesignerApp()

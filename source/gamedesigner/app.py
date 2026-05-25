@@ -57,6 +57,7 @@ from .models import (
     NodeField,
     NodeTemplate,
     ProjectData,
+    DesignNote,
     default_label_node,
     default_project,
     new_id,
@@ -807,6 +808,9 @@ class GameDesignerApp(QMainWindow):
         canvas.createDataCanvasRequested.connect(self._add_data_canvas_node_at)
         canvas.createLinkNodeRequested.connect(self._add_link_node_at)
         canvas.createGroupRequested.connect(self._add_blueprint_group_at)
+        canvas.createNoteRequested.connect(self._add_note_at)
+        canvas.noteEditRequested.connect(self._edit_canvas_note)
+        canvas.noteDeleteRequested.connect(self._delete_canvas_note)
         canvas.createTemplateNodeRequested.connect(self._add_node_from_template_at)
         canvas.dataCanvasLayoutRequested.connect(self._set_data_canvas_layout)
         canvas.dataCanvasTemplateRequested.connect(self._set_data_canvas_template)
@@ -1906,6 +1910,31 @@ class GameDesignerApp(QMainWindow):
         page.canvas.select_group(group.id)
         self._mark_dirty(page)
 
+    def _add_note_at(self, x: float, y: float, owner_node_id: object = None) -> None:
+        page = self._current_page()
+        if not page or page.is_welcome:
+            return
+        owner_id = str(owner_node_id or "")
+        if owner_id and page.canvas_data.find_node(owner_id) is None:
+            owner_id = ""
+        note = DesignNote(
+            title="便签",
+            content="",
+            pinned=True,
+            x=x,
+            y=y,
+        )
+        if owner_id:
+            node = page.canvas_data.find_node(owner_id)
+            if node is None:
+                return
+            node.notes.append(note)
+        else:
+            page.canvas_data.notes.append(note)
+        page.canvas.rebuild()
+        page.canvas.select_note(note.id, owner_id)
+        self._mark_dirty(page)
+
     def _add_node_from_template_at(self, x: float, y: float, template_id: str | None = None) -> None:
         page = self._current_page()
         if not page:
@@ -2312,6 +2341,54 @@ class GameDesignerApp(QMainWindow):
         page.canvas.select_group(group.id)
         self._mark_dirty(page)
 
+    def _edit_canvas_note(self, note_id: str, owner_node_id: object = None) -> None:
+        from .ui.notes_dialog import NotesDialog
+
+        page = self._current_page()
+        if not page or page.is_welcome:
+            return
+        owner_id = str(owner_node_id or "")
+        note = self._find_canvas_note(page, note_id, owner_id)
+        if note is None:
+            return
+        dialog = NotesDialog(self, f"{note.display_title()} 便签", [note])
+        if dialog.exec() != NotesDialog.Accepted or dialog.result_notes is None:
+            return
+        result = dialog.result_notes[0] if dialog.result_notes else None
+        if result is None:
+            self._delete_canvas_note(note_id, owner_id)
+            return
+        note.title = result.title
+        note.content = result.content
+        note.pinned = True
+        self._refresh_project_views(page.project)
+        page.canvas.rebuild()
+        page.canvas.select_note(note.id, owner_id)
+        self._mark_dirty(page)
+
+    def _delete_canvas_note(self, note_id: str, owner_node_id: object = None) -> None:
+        page = self._current_page()
+        if not page or page.is_welcome:
+            return
+        owner_id = str(owner_node_id or "")
+        if owner_id:
+            node = page.canvas_data.find_node(owner_id)
+            if node is not None:
+                node.notes[:] = [note for note in node.notes if note.id != note_id]
+        else:
+            page.canvas_data.notes[:] = [note for note in page.canvas_data.notes if note.id != note_id]
+        page.canvas.rebuild()
+        page.canvas.clear_selection()
+        self._mark_dirty(page)
+
+    def _find_canvas_note(self, page: ProjectPage, note_id: str, owner_node_id: str = "") -> DesignNote | None:
+        if owner_node_id:
+            node = page.canvas_data.find_node(owner_node_id)
+            if node is None:
+                return None
+            return next((note for note in node.notes if note.id == note_id), None)
+        return next((note for note in page.canvas_data.notes if note.id == note_id), None)
+
     def _set_edge_style(self, edge_id: str, style: str) -> None:
         page = self._current_page()
         if not page or page.is_welcome:
@@ -2331,7 +2408,10 @@ class GameDesignerApp(QMainWindow):
         page = self._current_page()
         if not page or page.is_welcome:
             return
-        if page.canvas.selected_node_ids:
+        if page.canvas.selected_note_key:
+            owner_node_id, note_id = page.canvas.selected_note_key
+            self._delete_canvas_note(note_id, owner_node_id)
+        elif page.canvas.selected_node_ids:
             self._delete_nodes_by_ids(set(page.canvas.selected_node_ids))
         elif page.canvas.selected_group_ids:
             self._delete_group_by_id(next(iter(page.canvas.selected_group_ids)))
@@ -2560,7 +2640,7 @@ class GameDesignerApp(QMainWindow):
             return
         page.canvas_data.notes = dialog.result_notes
         self._mark_dirty(page)
-        page.canvas.viewport().update()
+        page.canvas.rebuild()
 
     def _edit_node_notes(self, node_id: str) -> None:
         from .ui.notes_dialog import NotesDialog
@@ -2576,7 +2656,8 @@ class GameDesignerApp(QMainWindow):
             return
         node.notes = dialog.result_notes
         self._mark_dirty(page)
-        page.canvas.viewport().update()
+        page.canvas.rebuild()
+        page.canvas.select_node(node.id)
 
     def _current_ai_project_context(self) -> tuple[str, Path, Path]:
         from .ai_tools import build_project_chat_context

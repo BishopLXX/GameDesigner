@@ -39,6 +39,10 @@ TEXT_H_ALIGNMENTS = ["left", "center", "right"]
 TEXT_V_ALIGNMENTS = ["top", "center", "bottom"]
 DEFAULT_NODE_COLOR = "#ffffff"
 EDGE_STYLES = ["curve", "straight", "orthogonal"]
+NOTE_DEFAULT_WIDTH = 260.0
+NOTE_DEFAULT_HEIGHT = 140.0
+NOTE_MIN_WIDTH = 180.0
+NOTE_MIN_HEIGHT = 96.0
 
 
 def new_id(prefix: str) -> str:
@@ -50,6 +54,11 @@ class DesignNote:
     id: str = field(default_factory=lambda: new_id("note"))
     title: str = "便签"
     content: str = ""
+    pinned: bool = True
+    x: float = 0.0
+    y: float = 0.0
+    width: float = NOTE_DEFAULT_WIDTH
+    height: float = NOTE_DEFAULT_HEIGHT
 
     def is_empty(self) -> bool:
         return not self.title.strip() and not self.content.strip()
@@ -62,6 +71,11 @@ class DesignNote:
             "id": self.id,
             "title": self.title,
             "content": self.content,
+            "pinned": self.pinned,
+            "x": self.x,
+            "y": self.y,
+            "width": max(NOTE_MIN_WIDTH, self.width),
+            "height": max(NOTE_MIN_HEIGHT, self.height),
         }
 
     @classmethod
@@ -70,6 +84,11 @@ class DesignNote:
             id=str(raw.get("id") or new_id("note")),
             title=str(raw.get("title") or ""),
             content=str(raw.get("content") or ""),
+            pinned=bool(raw.get("pinned", True)),
+            x=_float_or(raw.get("x"), 0.0),
+            y=_float_or(raw.get("y"), 0.0),
+            width=max(NOTE_MIN_WIDTH, _float_or(raw.get("width"), NOTE_DEFAULT_WIDTH)),
+            height=max(NOTE_MIN_HEIGHT, _float_or(raw.get("height"), NOTE_DEFAULT_HEIGHT)),
         )
 
 

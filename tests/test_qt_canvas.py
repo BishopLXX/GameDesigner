@@ -10,7 +10,7 @@ from PySide6.QtGui import QAction, QImage, QKeyEvent, QPainter, QPixmap, QTextCu
 from PySide6.QtWidgets import QApplication, QMenu
 
 from gamedesigner.data_canvas import layout_data_canvas
-from gamedesigner.models import BlueprintGroup, CanvasData, Node, NodeField, NodeTemplate, ProjectData
+from gamedesigner.models import BlueprintGroup, CanvasData, DesignNote, Node, NodeField, NodeTemplate, ProjectData
 from gamedesigner.qt_canvas import InlineNodeFieldEditor, NodeGraphView
 
 
@@ -1041,6 +1041,82 @@ class QtCanvasTests(unittest.TestCase):
 
         self.assertEqual(emitted, [node.id])
         self.assertEqual(view.selected_node_ids, {node.id})
+        view.deleteLater()
+
+    def test_node_context_menu_create_note_emits_canvas_note_request(self) -> None:
+        canvas = CanvasData(name="主画布")
+        node = canvas.add_node(Node(title="当前节点", x=0, y=0, width=320, height=180))
+        view = NodeGraphView(canvas)
+        emitted: list[tuple[float, float, object]] = []
+        view.createNoteRequested.connect(lambda x, y, owner_id: emitted.append((x, y, owner_id)))
+        item = view.node_items[node.id]
+        scene_pos = item.sceneBoundingRect().center()
+        view_pos = view.mapFromScene(scene_pos)
+
+        def fake_exec(menu: QMenu, _global_pos: QPoint):
+            for action in _iter_menu_actions(menu):
+                if action.text() == "创建便签":
+                    return action
+            return None
+
+        with mock.patch.object(view, "_exec_context_menu", side_effect=fake_exec):
+            view._show_context_menu(view_pos, QPoint(20, 20))
+
+        self.assertEqual(len(emitted), 1)
+        self.assertEqual(emitted[0][2], node.id)
+        view.deleteLater()
+
+    def test_dragging_note_onto_node_moves_note_to_node(self) -> None:
+        canvas = CanvasData(name="主画布")
+        source = canvas.add_node(Node(title="源", x=0, y=0, width=320, height=180))
+        target = canvas.add_node(Node(title="目标", x=500, y=0, width=320, height=180))
+        note = DesignNote(title="参考", content="前期偏高")
+        canvas.notes.append(note)
+        view = NodeGraphView(canvas)
+        source_item = view.note_items[("", note.id)]
+        target_item = view.node_items[target.id]
+        view.begin_connection_drag(note.id, source_item.mapToScene(source_item._connection_handle_points()["right"]))
+        release_scene_pos = target_item.sceneBoundingRect().center()
+
+        source_item.mouseReleaseEvent(_ScenePointerEvent(source_item.mapFromScene(release_scene_pos), release_scene_pos))
+
+        self.assertEqual(canvas.notes, [])
+        self.assertEqual(len(target.notes), 1)
+        self.assertEqual(target.notes[0].id, note.id)
+        self.assertEqual(view.selected_note_key, (target.id, note.id))
+        view.deleteLater()
+
+    def test_node_note_visibility_tracks_selected_node(self) -> None:
+        canvas = CanvasData(name="主画布")
+        node = canvas.add_node(Node(title="当前节点", x=0, y=0, width=320, height=180))
+        note = DesignNote(title="节点便签", content="选中后显示")
+        node.notes.append(note)
+        view = NodeGraphView(canvas)
+
+        item = view.note_items[(node.id, note.id)]
+        self.assertFalse(item.isVisible())
+
+        view.select_node(node.id)
+
+        self.assertTrue(item.isVisible())
+        view.deleteLater()
+
+    def test_group_move_moves_attached_notes_once(self) -> None:
+        canvas = CanvasData(name="主画布")
+        group = canvas.add_group(BlueprintGroup(title="流程组", x=0, y=0, width=500, height=260))
+        node = canvas.add_node(Node(title="组内节点", x=40, y=50, group_id=group.id))
+        note = DesignNote(title="节点便签", content="跟随节点")
+        note.x = 80
+        note.y = 90
+        node.notes.append(note)
+        view = NodeGraphView(canvas)
+        note_item = view.note_items[(node.id, note.id)]
+
+        view.move_nodes_in_group(group.id, QPointF(20, 30))
+
+        self.assertEqual((node.x, node.y), (60, 80))
+        self.assertEqual((note.x, note.y), (100, 120))
+        self.assertEqual((note_item.pos().x(), note_item.pos().y()), (100, 120))
         view.deleteLater()
 
     def test_group_context_menu_ai_iteration_action_emits_signal(self) -> None:

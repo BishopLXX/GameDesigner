@@ -215,11 +215,29 @@ class DataIoTests(unittest.TestCase):
             project = ProjectData(name="便签工程")
             project.ensure_canvas_structure()
             canvas = project.root_canvas()
-            canvas.notes.append(DesignNote(title="布局规则", content="科技树上面大部分是解锁，下面大部分是养成。"))
+            canvas.notes.append(
+                DesignNote(
+                    title="布局规则",
+                    content="科技树上面大部分是解锁，下面大部分是养成。",
+                    x=120,
+                    y=240,
+                    width=300,
+                    height=160,
+                )
+            )
             canvas.add_node(
                 Node(
                     title="火球",
-                    notes=[DesignNote(title="调参", content="前期伤害可以偏高，验证手感后回调。")],
+                    notes=[
+                        DesignNote(
+                            title="调参",
+                            content="前期伤害可以偏高，验证手感后回调。",
+                            x=460,
+                            y=80,
+                            width=280,
+                            height=150,
+                        )
+                    ],
                 )
             )
 
@@ -230,7 +248,13 @@ class DataIoTests(unittest.TestCase):
 
             self.assertEqual(loaded_canvas.notes[0].title, "布局规则")
             self.assertIn("上面大部分是解锁", loaded_canvas.notes[0].content)
+            self.assertEqual((loaded_canvas.notes[0].x, loaded_canvas.notes[0].y), (120, 240))
+            self.assertEqual((loaded_canvas.notes[0].width, loaded_canvas.notes[0].height), (300, 160))
+            self.assertTrue(loaded_canvas.notes[0].pinned)
             self.assertEqual(loaded_canvas.nodes[0].notes[0].title, "调参")
+            self.assertEqual((loaded_canvas.nodes[0].notes[0].x, loaded_canvas.nodes[0].notes[0].y), (460, 80))
+            self.assertEqual((loaded_canvas.nodes[0].notes[0].width, loaded_canvas.nodes[0].notes[0].height), (280, 150))
+            self.assertTrue(loaded_canvas.nodes[0].notes[0].pinned)
             canvas_file = path.parent / f"{path.name}.files" / "canvases" / f"{project.root_canvas_id}.json"
             self.assertIn('"notes"', canvas_file.read_text(encoding="utf-8"))
 
