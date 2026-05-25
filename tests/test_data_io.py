@@ -14,6 +14,7 @@ from gamedesigner.models import (
     NodeField,
     NodeTemplate,
     ProjectData,
+    default_label_node,
     default_templates,
 )
 from gamedesigner.project_files.linked_documents import (
@@ -74,6 +75,7 @@ class DataIoTests(unittest.TestCase):
                                 "enabled": False,
                                 "sort_mode": "x",
                                 "target_folder": "D:/body",
+                                "export_edges": True,
                             }
                         },
                     }
@@ -89,6 +91,7 @@ class DataIoTests(unittest.TestCase):
         self.assertFalse(canvas_state["enabled"])
         self.assertEqual(canvas_state["sort_mode"], "x")
         self.assertEqual(canvas_state["target_folder"], "D:/body")
+        self.assertTrue(canvas_state["export_edges"])
 
     def test_project_gdc_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -276,6 +279,61 @@ class DataIoTests(unittest.TestCase):
             self.assertEqual(self._csv_names(created), ["创建一", "创建二", "创建三"])
             self.assertEqual(self._csv_names(by_x), ["创建一", "创建三", "创建二"])
             self.assertEqual(self._csv_names(by_y), ["创建二", "创建三", "创建一"])
+
+    def test_canvas_csv_export_can_append_outgoing_edge_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            tmp_path = Path(folder)
+            project = ProjectData(name="连线导出")
+            project.ensure_canvas_structure()
+            canvas = project.root_canvas()
+            source = canvas.add_node(Node(title="A", fields=[NodeField("值", "文本", "a")]))
+            target_c = canvas.add_node(Node(title="C"))
+            target_d = canvas.add_node(Node(title="D"))
+            canvas.add_edge(source.id, target_c.id)
+            canvas.add_edge(source.id, target_d.id)
+            canvas.add_edge(target_c.id, target_d.id)
+
+            outputs = export_all_canvas_csv(
+                project,
+                tmp_path,
+                canvas_specs=[CanvasCsvExportSpec(canvas_id=canvas.id, export_edges=True)],
+            )
+
+            with outputs[0].open("r", encoding="utf-8-sig", newline="") as file:
+                rows = list(csv.reader(file))
+
+            self.assertEqual(rows[0][-1], "连线")
+            self.assertEqual(rows[1][-1], "文本")
+            self.assertEqual(rows[2][0], "A")
+            self.assertEqual(rows[2][-1], "C|D")
+            self.assertEqual(rows[3][0], "C")
+            self.assertEqual(rows[3][-1], "D")
+            self.assertEqual(rows[4][0], "D")
+            self.assertEqual(rows[4][-1], "")
+
+    def test_data_canvas_csv_export_ignores_edge_export_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            tmp_path = Path(folder)
+            project = ProjectData(name="数据画布连线导出")
+            project.ensure_canvas_structure()
+            data_canvas = project.add_canvas("数据画布", canvas_type="data")
+            data_canvas.add_node(Node(title="A"))
+            data_canvas.add_node(Node(title="B"))
+            data_canvas.add_edge(data_canvas.nodes[0].id, data_canvas.nodes[1].id)
+
+            outputs = export_all_canvas_csv(
+                project,
+                tmp_path,
+                canvas_specs=[
+                    CanvasCsvExportSpec(canvas_id=project.root_canvas_id, enabled=False),
+                    CanvasCsvExportSpec(canvas_id=data_canvas.id, export_edges=True),
+                ],
+            )
+
+            with outputs[0].open("r", encoding="utf-8-sig", newline="") as file:
+                rows = list(csv.reader(file))
+
+            self.assertNotIn("连线", rows[0])
 
     def test_all_canvas_csv_export_writes_one_file_per_canvas(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -666,6 +724,31 @@ class DataIoTests(unittest.TestCase):
         self.assertTrue(loaded.show_label)
         self.assertEqual(loaded.name, "moveSpeed")
         self.assertEqual(loaded.value, "4")
+
+    def test_default_label_node_uses_single_long_text_card(self) -> None:
+        node = default_label_node(10, 20)
+
+        self.assertEqual(node.title, "Label节点")
+        self.assertEqual(node.icon, "")
+        self.assertFalse(node.icon_from_title)
+        self.assertEqual(len(node.fields), 1)
+        field = node.fields[0]
+        self.assertEqual(field.name, "描述")
+        self.assertEqual(field.data_type, "长文本")
+        self.assertEqual(field.value, "节点的描述")
+        self.assertTrue(field.has_visual_layout())
+
+    def test_default_label_template_uses_single_long_text_card(self) -> None:
+        template = next(item for item in default_templates() if item.name == "Label节点")
+        node = template.create_node(0, 0)
+
+        self.assertEqual(template.icon, "")
+        self.assertFalse(template.icon_from_title)
+        self.assertEqual(node.title, "Label节点")
+        self.assertEqual(node.icon, "")
+        self.assertEqual(len(node.fields), 1)
+        self.assertEqual(node.fields[0].data_type, "长文本")
+        self.assertTrue(node.fields[0].has_visual_layout())
 
     def test_default_tech_tree_template_uses_visual_cards(self) -> None:
         template = next(item for item in default_templates() if item.name == "科技树节点")

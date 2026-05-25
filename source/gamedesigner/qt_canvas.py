@@ -79,6 +79,15 @@ SCENE_EXTENT = 500000.0
 SCENE_MARGIN = 20000.0
 WRAP_FLAGS = Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap | Qt.TextWrapAnywhere
 RIGHT_DRAG_MENU_THRESHOLD = 8
+CONNECTION_AUTO_PAN_MARGIN = 46
+CONNECTION_AUTO_PAN_MIN_STEP = 5
+CONNECTION_AUTO_PAN_MAX_STEP = 34
+CONNECTION_AUTO_PAN_INTERVAL_MS = 16
+EDGE_LABEL_OFFSET = 16.0
+EDGE_LABEL_HEIGHT = 22.0
+EDGE_LABEL_MIN_WIDTH = 38.0
+EDGE_LABEL_MAX_WIDTH = 180.0
+EDGE_LABEL_PADDING_X = 10.0
 IMAGE_SOURCE_CACHE_LIMIT = 96
 IMAGE_SCALED_CACHE_LIMIT = 192
 INTERACTION_PREVIEW_DELAY_MS = 140
@@ -1136,6 +1145,13 @@ class EdgeItem(QGraphicsPathItem):
         self.setAcceptHoverEvents(True)
         self.update_path()
 
+    def boundingRect(self) -> QRectF:  # type: ignore[override]
+        rect = super().boundingRect()
+        label_rect = self._label_rect()
+        if label_rect.isValid():
+            rect = rect.united(label_rect.adjusted(-2, -2, 2, 2))
+        return rect
+
     def update_path(self) -> None:
         source_rect = self.source.sceneBoundingRect()
         target_rect = self.target.sceneBoundingRect()
@@ -1174,15 +1190,68 @@ class EdgeItem(QGraphicsPathItem):
         if selected and self.edge.style == "orthogonal":
             self._paint_bend_handles(painter, colors)
         if self.edge.label:
-            point = self.path().pointAtPercent(0.5)
-            painter.setPen(QColor(colors["edge_label"]))
-            painter.setFont(_font(9))
-            painter.drawText(QRectF(point.x() - 80, point.y() - 28, 160, 20), Qt.AlignCenter, self.edge.label)
+            self._paint_label(painter, colors)
+
+    def _paint_label(self, painter: QPainter, colors: dict[str, str]) -> None:
+        rect = self._label_rect()
+        if not rect.isValid():
+            return
+        label_font = _font(9)
+        metrics = QFontMetrics(label_font)
+        fill = QColor(colors["panel"])
+        fill.setAlpha(232)
+        path = QPainterPath()
+        path.addRoundedRect(rect, 7, 7)
+        painter.fillPath(path, fill)
+        painter.setPen(QPen(QColor(colors["hairline"]), 1))
+        painter.drawPath(path)
+        painter.setPen(QColor(colors["edge_label"]))
+        painter.setFont(label_font)
+        text_rect = rect.adjusted(EDGE_LABEL_PADDING_X, 0, -EDGE_LABEL_PADDING_X, 0)
+        painter.drawText(
+            text_rect,
+            Qt.AlignCenter | Qt.TextSingleLine,
+            metrics.elidedText(self.edge.label.strip(), Qt.ElideRight, max(1, int(text_rect.width()))),
+        )
+
+    def _label_rect(self) -> QRectF:
+        text = self.edge.label.strip()
+        if not text:
+            return QRectF()
+        metrics = QFontMetrics(_font(9))
+        width = min(
+            EDGE_LABEL_MAX_WIDTH,
+            max(EDGE_LABEL_MIN_WIDTH, float(metrics.horizontalAdvance(text) + EDGE_LABEL_PADDING_X * 2)),
+        )
+        center = self._label_center()
+        return QRectF(center.x() - width / 2, center.y() - EDGE_LABEL_HEIGHT / 2, width, EDGE_LABEL_HEIGHT)
+
+    def _label_center(self) -> QPointF:
+        path = self.path()
+        point = path.pointAtPercent(0.5)
+        before = path.pointAtPercent(0.48)
+        after = path.pointAtPercent(0.52)
+        dx = after.x() - before.x()
+        dy = after.y() - before.y()
+        length = math.hypot(dx, dy)
+        if length <= 0.001:
+            normal = QPointF(0.0, -1.0)
+        else:
+            normal = QPointF(-dy / length, dx / length)
+            if normal.y() > 0:
+                normal = QPointF(-normal.x(), -normal.y())
+            if abs(normal.y()) < 0.15:
+                normal = QPointF(0.0, -1.0)
+        return point + normal * EDGE_LABEL_OFFSET
 
     def shape(self) -> QPainterPath:
         stroker = QPainterPathStroker()
         stroker.setWidth(16)
-        return stroker.createStroke(self.path())
+        shape = stroker.createStroke(self.path())
+        label_rect = self._label_rect()
+        if label_rect.isValid():
+            shape.addRect(label_rect.adjusted(-3, -3, 3, 3))
+        return shape
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         if event.button() == Qt.LeftButton:
@@ -1844,6 +1913,10 @@ class NodeGraphView(QGraphicsView):
         self.connection_source: str | None = None
         self.connection_anchor_scene: QPointF | None = None
         self._connection_dragging = False
+        self._connection_auto_pan_view_pos: QPoint | None = None
+        self._connection_auto_pan_timer = QTimer(self)
+        self._connection_auto_pan_timer.setInterval(CONNECTION_AUTO_PAN_INTERVAL_MS)
+        self._connection_auto_pan_timer.timeout.connect(self._tick_connection_auto_pan)
         self._pending_drag_edge: tuple[str, str] | None = None
         self._inline_proxy: QGraphicsProxyWidget | None = None
         self._inline_editor: InlineNodeFieldEditor | None = None
@@ -2173,6 +2246,7 @@ class NodeGraphView(QGraphicsView):
                 self._right_drag_pending = False
                 self._end_interaction_preview()
                 self._refresh_interaction_cursor()
+            self._stop_connection_auto_pan()
             return False
         if event.type() not in (QEvent.KeyPress, QEvent.KeyRelease):
             return False
@@ -2438,6 +2512,7 @@ class NodeGraphView(QGraphicsView):
         self.connection_anchor_scene = QPointF(anchor_scene)
         self._connection_dragging = True
         self.mouse_scene = QPointF(anchor_scene)
+        self._connection_auto_pan_view_pos = self.mapFromScene(anchor_scene)
         if source_id in self.node_items:
             self.select_node(source_id)
         elif source_id in self.group_items:
@@ -2452,11 +2527,13 @@ class NodeGraphView(QGraphicsView):
         if not self._connection_dragging:
             return
         self.mouse_scene = QPointF(scene_pos)
+        self._update_connection_auto_pan(scene_pos)
         self.viewport().update()
 
     def finish_connection_drag(self, scene_pos: QPointF) -> None:
         if not self._connection_dragging:
             return
+        self._stop_connection_auto_pan()
         self.mouse_scene = QPointF(scene_pos)
         source = self.connection_source
         target_id = self._endpoint_id_at(self.mapFromScene(scene_pos), include_group_body=True)
@@ -2478,8 +2555,66 @@ class NodeGraphView(QGraphicsView):
         self.connection_source = None
         self.connection_anchor_scene = None
         self._connection_dragging = False
+        self._stop_connection_auto_pan()
         self._refresh_interaction_cursor()
         self.viewport().update()
+
+    def _update_connection_auto_pan(self, scene_pos: QPointF) -> None:
+        self._connection_auto_pan_view_pos = self.mapFromScene(scene_pos)
+        if self._connection_auto_pan_delta(self._connection_auto_pan_view_pos).isNull():
+            self._stop_connection_auto_pan()
+            return
+        if not self._connection_auto_pan_timer.isActive():
+            self._connection_auto_pan_timer.start()
+
+    def _stop_connection_auto_pan(self) -> None:
+        if self._connection_auto_pan_timer.isActive():
+            self._connection_auto_pan_timer.stop()
+        self._connection_auto_pan_view_pos = None
+
+    def _tick_connection_auto_pan(self) -> None:
+        if not self._connection_dragging or self._connection_auto_pan_view_pos is None:
+            self._stop_connection_auto_pan()
+            return
+        delta = self._connection_auto_pan_delta(self._connection_auto_pan_view_pos)
+        if delta.isNull():
+            self._stop_connection_auto_pan()
+            return
+        horizontal = self.horizontalScrollBar()
+        vertical = self.verticalScrollBar()
+        old_h = horizontal.value()
+        old_v = vertical.value()
+        horizontal.setValue(old_h + delta.x())
+        vertical.setValue(old_v + delta.y())
+        if horizontal.value() == old_h and vertical.value() == old_v:
+            self._stop_connection_auto_pan()
+            return
+        self.mouse_scene = self.mapToScene(self._connection_auto_pan_view_pos)
+        self.viewport().update()
+
+    def _connection_auto_pan_delta(self, view_pos: QPoint) -> QPoint:
+        rect = self.viewport().rect()
+        return QPoint(
+            self._connection_auto_pan_axis_delta(view_pos.x(), rect.left(), rect.right()),
+            self._connection_auto_pan_axis_delta(view_pos.y(), rect.top(), rect.bottom()),
+        )
+
+    def _connection_auto_pan_axis_delta(self, value: int, minimum: int, maximum: int) -> int:
+        low_edge = minimum + CONNECTION_AUTO_PAN_MARGIN
+        high_edge = maximum - CONNECTION_AUTO_PAN_MARGIN
+        distance = 0
+        direction = 0
+        if value < low_edge:
+            distance = low_edge - value
+            direction = -1
+        elif value > high_edge:
+            distance = value - high_edge
+            direction = 1
+        if not direction:
+            return 0
+        ratio = min(1.0, max(0.0, distance / CONNECTION_AUTO_PAN_MARGIN))
+        step = CONNECTION_AUTO_PAN_MIN_STEP + int((CONNECTION_AUTO_PAN_MAX_STEP - CONNECTION_AUTO_PAN_MIN_STEP) * ratio)
+        return direction * step
 
     def select_node(self, node_id: str | None) -> None:
         self.selected_node_id = node_id
@@ -3195,7 +3330,7 @@ class NodeGraphView(QGraphicsView):
                 menu.addSeparator()
             else:
                 delete_route_point = None
-            edit_edge = menu.addAction("编辑连接标签")
+            edit_edge = menu.addAction("编辑连线文本" if edge.edge.label else "添加连线文本")
             style_menu = menu.addMenu("连线样式")
             curve = style_menu.addAction("曲线")
             curve.setCheckable(True)

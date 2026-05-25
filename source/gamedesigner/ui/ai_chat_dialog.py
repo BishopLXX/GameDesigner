@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..ai_attachments import AiImageAttachment, save_ai_chat_image_attachment
 from ..ai_presets import (
     AI_CUSTOM_API_PROFILE_KEY,
     AI_FREE_MODEL_PRESETS,
@@ -70,6 +71,8 @@ class AiSettingsDialog(QDialog):
         self.model_combo.setEditText(settings.ai_model or AI_MODEL_PRESETS[0])
 
         self.free_model_combo = QComboBox()
+        self.free_model_combo.addItem("不使用", "")
+        self.free_model_combo.setItemData(0, "当前使用官方登录或手动 API Key 配置。", Qt.ToolTipRole)
         for preset in AI_FREE_MODEL_PRESETS:
             self.free_model_combo.addItem(preset.label, preset.key)
             self.free_model_combo.setItemData(self.free_model_combo.count() - 1, preset.description, Qt.ToolTipRole)
@@ -126,6 +129,7 @@ class AiSettingsDialog(QDialog):
         self.resize(560, 280)
         restore_window_layout(self, "ai_settings_dialog")
         self._refresh_auth_fields()
+        self._sync_free_model_combo_to_snapshot(self._current_snapshot())
 
     def _free_model_row(self) -> QWidget:
         row = QWidget(self)
@@ -267,6 +271,14 @@ class AiSettingsDialog(QDialog):
         else:
             self.official_radio.setChecked(True)
         self._refresh_auth_fields()
+        self._sync_free_model_combo_to_snapshot(snapshot)
+
+    def _sync_free_model_combo_to_snapshot(self, snapshot: dict[str, str]) -> None:
+        key = ai_profile_key_for_snapshot(snapshot)
+        if key in {AI_OFFICIAL_PROFILE_KEY, AI_CUSTOM_API_PROFILE_KEY}:
+            key = ""
+        index = self.free_model_combo.findData(key)
+        self.free_model_combo.setCurrentIndex(index if index >= 0 else 0)
 
     def _same_base_url(self, left: str, right: str) -> bool:
         return left.strip().rstrip("/") == right.strip().rstrip("/")
@@ -314,6 +326,7 @@ class AiChatPanel(QWidget):
         self._activity_base = "就绪"
         self._activity_step = 0
         self._activity_log_lines: list[str] = []
+        self._pending_image_attachments: list[AiImageAttachment] = []
 
         title_label = QLabel("AI 助手")
         title_label.setObjectName("aiAssistantTitle")
@@ -352,6 +365,11 @@ class AiChatPanel(QWidget):
         self.input.setPlaceholderText("询问当前工程，例如：帮我检查当前科技树节奏、给选中节点补字段、分析蓝图结构。")
         self.input.setFixedHeight(94)
         self.input.submitted.connect(self._send)
+        self.input.imagePasted.connect(self._attach_clipboard_image)
+        self.attachments_label = QLabel()
+        self.attachments_label.setObjectName("mutedLabel")
+        self.attachments_label.setWordWrap(True)
+        self.attachments_label.hide()
 
         self.settings_button = QPushButton("AI 设置")
         self.settings_button.clicked.connect(self._open_settings)
@@ -384,6 +402,7 @@ class AiChatPanel(QWidget):
         layout.addWidget(self.busy_bar)
         layout.addWidget(self.activity_log)
         layout.addWidget(self.transcript, 1)
+        layout.addWidget(self.attachments_label)
         layout.addWidget(self.input)
         layout.addLayout(tools)
         self._append_system("AI 助手会带上当前工程、当前画布、选中对象和低权重参考文档；需要改画布时会自动把可执行操作应用到当前画布。")
@@ -437,7 +456,8 @@ class AiChatPanel(QWidget):
 
     def _send(self) -> None:
         message = self.input.toPlainText().strip()
-        if not message or self._process is not None:
+        attachments = list(self._pending_image_attachments)
+        if (not message and not attachments) or self._process is not None:
             return
         try:
             context, cwd, project_path = self.context_provider()
@@ -445,7 +465,10 @@ class AiChatPanel(QWidget):
             QMessageBox.information(self, "没有可用工程", str(exc))
             return
         self._ensure_history_loaded(project_path)
-        prompt_message = self._iteration_prompt(message) if self._iteration_mode else message
+        if not message and attachments:
+            message = "请分析这张图片。"
+        message_with_attachments = self._message_with_image_attachments(message, attachments)
+        prompt_message = self._iteration_prompt(message_with_attachments) if self._iteration_mode else message_with_attachments
         prompt = build_ai_assistant_prompt(context, prompt_message, self._history)
         invocation = build_ai_cli_invocation(self.settings, prompt, cwd)
         output_file = self._new_output_file() if invocation.program == "codex" else None
@@ -461,14 +484,16 @@ class AiChatPanel(QWidget):
         process.readyReadStandardError.connect(self._read_stderr)
         process.finished.connect(self._process_finished)
         self._process = process
-        self._pending_user_message = message
+        self._pending_user_message = prompt_message
         self._pending_output_chunks = []
         self._pending_error_chunks = []
         self._pending_output_file = output_file
         self._pending_actions = []
         self._clear_activity_log()
-        self._append_user(message)
+        self._append_user(self._display_user_message(message, attachments))
         self.input.clear()
+        self._pending_image_attachments = []
+        self._refresh_attachments_label()
         self.send_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self._start_activity(f"{invocation.program} 正在思考")
@@ -478,6 +503,7 @@ class AiChatPanel(QWidget):
                 f"已启动 {invocation.program} CLI",
                 f"工作目录: {invocation.cwd}",
                 f"模型: {self.settings.ai_model or '未设置'}",
+                f"图片附件: {len(attachments)}" if attachments else "",
             ],
             "运行状态",
         )
@@ -492,6 +518,48 @@ class AiChatPanel(QWidget):
             return
         process.write(invocation.stdin.encode("utf-8"))
         process.closeWriteChannel()
+
+    def _attach_clipboard_image(self, image) -> None:
+        if image.isNull():
+            return
+        try:
+            _context, _cwd, project_path = self.context_provider()
+        except ValueError as exc:
+            QMessageBox.information(self, "没有可用工程", str(exc))
+            return
+        try:
+            attachment = save_ai_chat_image_attachment(project_path, image)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "图片粘贴失败", str(exc))
+            return
+        self._pending_image_attachments.append(attachment)
+        self._refresh_attachments_label()
+        self._append_system(f"已附加图片：{attachment.path.name}（{attachment.width}x{attachment.height}）")
+
+    def _refresh_attachments_label(self) -> None:
+        if not self._pending_image_attachments:
+            self.attachments_label.clear()
+            self.attachments_label.hide()
+            return
+        names = [attachment.path.name for attachment in self._pending_image_attachments]
+        self.attachments_label.setText(f"已附加图片：{'、'.join(names)}")
+        self.attachments_label.show()
+
+    def _message_with_image_attachments(self, message: str, attachments: list[AiImageAttachment]) -> str:
+        if not attachments:
+            return message
+        lines = [message.strip(), "", "【用户附加图片】"]
+        for index, attachment in enumerate(attachments, start=1):
+            lines.append(f"{index}. 文件: {attachment.path.resolve()}")
+            lines.append(f"   尺寸: {attachment.width}x{attachment.height}")
+        lines.append("请先读取或查看这些本地图片，再结合当前工程上下文回答；如果当前 CLI 或模型无法读取图片，请明确说明，不要编造图片内容。")
+        return "\n".join(line for line in lines if line)
+
+    def _display_user_message(self, message: str, attachments: list[AiImageAttachment]) -> str:
+        if not attachments:
+            return message
+        names = "、".join(attachment.path.name for attachment in attachments)
+        return f"{message.strip()}\n[图片附件: {names}]"
 
     def _read_stdout(self) -> None:
         if self._process is None:
@@ -605,6 +673,7 @@ class AiChatPanel(QWidget):
         return lines
 
     def _append_activity_lines(self, lines: list[str], title: str) -> None:
+        lines = [line for line in lines if line]
         if not lines:
             return
         self._activity_log_lines.append(f"[{title}]")

@@ -19,7 +19,12 @@ from gamedesigner.ai_tools import (
     save_project_chat_history,
     split_ai_canvas_action_response,
 )
-from gamedesigner.ai_presets import AI_FREE_MODEL_PRESETS, clean_ai_saved_connections
+from gamedesigner.ai_presets import (
+    AI_CUSTOM_API_PROFILE_KEY,
+    AI_FREE_MODEL_PRESETS,
+    ai_profile_key_for_snapshot,
+    clean_ai_saved_connections,
+)
 from gamedesigner.models import BlueprintGroup, CanvasData, DesignNote, Edge, Node, NodeField, ProjectData
 from gamedesigner.storage import AppSettings
 
@@ -89,6 +94,19 @@ class AiToolsTests(unittest.TestCase):
         self.assertEqual(cleaned["api_key"]["ai_auth_mode"], "api_key")
         self.assertNotIn("", cleaned)
         self.assertNotIn("official", cleaned)
+
+    def test_own_api_key_matching_free_provider_is_stored_as_custom_api(self) -> None:
+        key = ai_profile_key_for_snapshot(
+            {
+                "ai_provider": "codex",
+                "ai_model": "openrouter/free",
+                "ai_auth_mode": "api_key",
+                "ai_api_key": "user-openrouter-key",
+                "ai_base_url": "https://openrouter.ai/api/v1",
+            }
+        )
+
+        self.assertEqual(key, AI_CUSTOM_API_PROFILE_KEY)
 
     def test_qprocess_command_wraps_windows_cli_with_cmd(self) -> None:
         settings = AppSettings(ai_provider="codex", ai_model="gpt-5.5")
@@ -183,6 +201,12 @@ class AiToolsTests(unittest.TestCase):
         self.assertIn("update_canvas_rules", prompt)
         self.assertIn("当前画布规则记忆是高权重上下文", prompt)
         self.assertIn("自动应用到当前画布", prompt)
+        self.assertIn("子节点放到父节点右侧", prompt)
+        self.assertIn("文案设计", prompt)
+        self.assertIn("迭代设计", prompt)
+        self.assertIn("迭代必须基于这些文案和现有内容", prompt)
+        self.assertIn("Label 节点结构", prompt)
+        self.assertIn("只保留一个长文本描述卡片", prompt)
 
     def test_parse_ai_canvas_actions_supports_create_update_group_and_canvas_rules(self) -> None:
         actions = parse_ai_canvas_actions(

@@ -6,11 +6,11 @@ from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEvent, QPointF, Qt
-from PySide6.QtGui import QKeyEvent, QTextCursor
+from PySide6.QtCore import QEvent, QMimeData, QPointF, Qt
+from PySide6.QtGui import QImage, QKeyEvent, QTextCursor
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QWidget
 
-from gamedesigner.app import GameDesignerApp
+from gamedesigner.app import EDGE_LABEL_MAX_LENGTH, GameDesignerApp
 from gamedesigner.ai_tools import AiCanvasAction, AiCanvasFieldChange
 from gamedesigner.ai_tools import AiChatMessage, load_project_chat_history, save_project_chat_history
 from gamedesigner.canvas_io import import_canvas_sheet
@@ -163,6 +163,7 @@ class AppEditingTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"APPDATA": folder}):
                 save_settings(settings)
                 dialog = AiSettingsDialog(None, settings)
+                self.assertEqual(dialog.free_model_combo.currentData(), "")
                 index = dialog.free_model_combo.findData("free_ollama_gpt_oss_20b")
                 self.assertGreaterEqual(index, 0)
                 dialog.free_model_combo.setCurrentIndex(index)
@@ -194,6 +195,7 @@ class AppEditingTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"APPDATA": folder}):
                 save_settings(settings)
                 dialog = AiSettingsDialog(None, settings)
+                self.assertEqual(dialog.free_model_combo.currentData(), "")
                 dialog.free_model_combo.setCurrentIndex(dialog.free_model_combo.findData("free_ollama_qwen3_8b"))
                 dialog.free_model_apply_button.click()
                 dialog.deleteLater()
@@ -206,7 +208,23 @@ class AppEditingTests(unittest.TestCase):
                 self.assertEqual(settings.ai_auth_mode, "api_key")
                 self.assertEqual(settings.ai_api_key, "paid-secret")
                 self.assertEqual(settings.ai_base_url, "https://api.example.test/v1")
+                self.assertEqual(reopened.free_model_combo.currentData(), "")
                 reopened.deleteLater()
+
+    def test_ai_settings_dialog_shows_no_free_model_for_own_api_key(self) -> None:
+        settings = AppSettings(
+            ai_provider="codex",
+            ai_model="openrouter/free",
+            ai_auth_mode="api_key",
+            ai_api_key="user-openrouter-key",
+            ai_base_url="https://openrouter.ai/api/v1",
+        )
+
+        dialog = AiSettingsDialog(None, settings)
+
+        self.assertEqual(dialog.free_model_combo.currentText(), "不使用")
+        self.assertEqual(dialog.free_model_combo.currentData(), "")
+        dialog.deleteLater()
 
     def test_ai_settings_dialog_free_remote_preset_waits_for_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -320,6 +338,47 @@ class AppEditingTests(unittest.TestCase):
         self.assertEqual(submitted, [True])
         editor.deleteLater()
 
+    def test_submit_plain_text_edit_pasted_image_emits_signal(self) -> None:
+        editor = SubmitPlainTextEdit()
+        image = QImage(18, 12, QImage.Format_ARGB32)
+        image.fill(Qt.red)
+        mime = QMimeData()
+        mime.setImageData(image)
+        captured: list[QImage] = []
+        editor.imagePasted.connect(captured.append)
+
+        editor.insertFromMimeData(mime)
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0].width(), 18)
+        self.assertEqual(captured[0].height(), 12)
+        self.assertEqual(editor.toPlainText(), "")
+        editor.deleteLater()
+
+    def test_ai_panel_pasted_image_is_saved_and_added_to_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "ImageChatProject.gdc"
+            panel = AiChatPanel(
+                None,
+                AppSettings(ai_provider="codex", ai_model="gpt-5.4"),
+                lambda: ("项目上下文", project_path.parent, project_path),
+            )
+            image = QImage(24, 16, QImage.Format_ARGB32)
+            image.fill(Qt.blue)
+
+            panel._attach_clipboard_image(image)
+
+            self.assertEqual(len(panel._pending_image_attachments), 1)
+            attachment = panel._pending_image_attachments[0]
+            self.assertTrue(attachment.path.exists())
+            self.assertIn("ai_chat", attachment.path.parts)
+            self.assertIn("attachments", attachment.path.parts)
+            self.assertIn(attachment.path.name, panel.attachments_label.text())
+            prompt = panel._message_with_image_attachments("看这张图", panel._pending_image_attachments)
+            self.assertIn(str(attachment.path.resolve()), prompt)
+            self.assertIn("24x16", prompt)
+            panel.deleteLater()
+
     def test_inline_field_editor_enter_commits_shift_enter_inserts_newline(self) -> None:
         editor = InlineFieldEditor()
         committed: list[bool] = []
@@ -374,10 +433,64 @@ class AppEditingTests(unittest.TestCase):
         self.assertEqual(created.title, "延伸节点")
         self.assertEqual(created.fields[0].value, "基于参考节点继续迭代")
         self.assertGreater(created.x, source.x)
+        self.assertEqual(len(canvas.edges), 1)
+        self.assertEqual((canvas.edges[0].source, canvas.edges[0].target), (source.id, created.id))
         self.assertEqual(source.title, "参考节点强化版")
         self.assertEqual(source.fields[0].value, "更新后的内容")
         self.assertEqual(page.canvas.selected_node_ids, {source.id, created.id})
         self.assertTrue(page.dirty)
+        window.deleteLater()
+
+    def test_ai_child_node_is_created_to_the_right_and_connected(self) -> None:
+        window = GameDesignerApp()
+        project = ProjectData(name="AI子节点位置测试")
+        project.ensure_canvas_structure()
+        canvas = project.root_canvas()
+        parent = canvas.add_node(Node(title="父节点", x=100, y=120, width=520, height=300))
+        page = window._add_page(project, None, dirty=False, canvas_data=canvas)
+        window.tabs.setCurrentWidget(page)
+        page.canvas.select_node(parent.id)
+
+        window._apply_ai_canvas_actions(
+            [
+                AiCanvasAction(
+                    type="create_node",
+                    title="子节点",
+                    width=220,
+                    height=140,
+                    fields=[AiCanvasFieldChange("内容信息", "长文本", "子节点内容")],
+                )
+            ]
+        )
+
+        child = next(node for node in canvas.nodes if node.id != parent.id)
+        self.assertEqual(child.title, "子节点")
+        self.assertEqual(child.x, parent.x + parent.width + 100)
+        self.assertEqual(child.y, parent.y + (parent.height - 140) / 2)
+        self.assertEqual(len(canvas.edges), 1)
+        self.assertEqual(canvas.edges[0].source, parent.id)
+        self.assertEqual(canvas.edges[0].target, child.id)
+        window.deleteLater()
+
+    def test_ai_untemplated_create_node_uses_label_default(self) -> None:
+        window = GameDesignerApp()
+        project = ProjectData(name="AI默认Label节点")
+        project.ensure_canvas_structure()
+        canvas = project.root_canvas()
+        page = window._add_page(project, None, dirty=False, canvas_data=canvas)
+        window.tabs.setCurrentWidget(page)
+
+        window._apply_ai_canvas_actions([AiCanvasAction(type="create_node", title="玩法描述")])
+
+        created = canvas.nodes[-1]
+        self.assertEqual(created.title, "玩法描述")
+        self.assertEqual(created.icon, "")
+        self.assertFalse(created.icon_from_title)
+        self.assertEqual(len(created.fields), 1)
+        self.assertEqual(created.fields[0].name, "描述")
+        self.assertEqual(created.fields[0].data_type, "长文本")
+        self.assertEqual(created.fields[0].value, "节点的描述")
+        self.assertTrue(created.fields[0].has_visual_layout())
         window.deleteLater()
 
     def test_ai_create_node_inherits_selected_node_template(self) -> None:
@@ -516,6 +629,26 @@ class AppEditingTests(unittest.TestCase):
         self.assertEqual(created.group_id, group.id)
         window.deleteLater()
 
+    def test_add_node_uses_default_label_node(self) -> None:
+        window = GameDesignerApp()
+        project = ProjectData(name="默认Label节点测试")
+        project.ensure_canvas_structure()
+        page = window._add_page(project, None, dirty=False, canvas_data=project.root_canvas())
+        window.tabs.setCurrentWidget(page)
+
+        window._add_node_at(260, 180)
+
+        created = project.root_canvas().nodes[-1]
+        self.assertEqual(created.title, "Label节点")
+        self.assertEqual(created.icon, "")
+        self.assertFalse(created.icon_from_title)
+        self.assertEqual(len(created.fields), 1)
+        self.assertEqual(created.fields[0].name, "描述")
+        self.assertEqual(created.fields[0].data_type, "长文本")
+        self.assertEqual(created.fields[0].value, "节点的描述")
+        self.assertTrue(created.fields[0].has_visual_layout())
+        window.deleteLater()
+
     def test_new_edges_use_last_selected_edge_style(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             tmp_path = Path(folder)
@@ -579,6 +712,44 @@ class AppEditingTests(unittest.TestCase):
                 self.assertEqual(reopened.settings.last_edge_style, "orthogonal")
                 self.assertEqual(reopened_canvas.edges[0].style, "orthogonal")
                 reopened.deleteLater()
+
+    def test_edit_edge_sets_trimmed_short_label(self) -> None:
+        window = GameDesignerApp()
+        project = ProjectData(name="连线文本测试")
+        project.ensure_canvas_structure()
+        canvas = project.root_canvas()
+        first = canvas.add_node(Node(title="A"))
+        second = canvas.add_node(Node(title="B", x=420))
+        edge = canvas.add_edge(first.id, second.id)
+        page = window._add_page(project, None, dirty=False, canvas_data=canvas)
+        window.tabs.setCurrentWidget(page)
+
+        with mock.patch("gamedesigner.app.QInputDialog.getText", return_value=("  解锁   高级   订单 后续文字超出长度  ", True)):
+            window._edit_edge(edge.id)
+
+        self.assertEqual(edge.label, "解锁 高级 订单 后续文字超出长度"[:EDGE_LABEL_MAX_LENGTH])
+        self.assertTrue(page.dirty)
+        self.assertEqual(page.canvas.selected_edge_id, edge.id)
+        window.deleteLater()
+
+    def test_edit_edge_can_clear_label(self) -> None:
+        window = GameDesignerApp()
+        project = ProjectData(name="清空连线文本")
+        project.ensure_canvas_structure()
+        canvas = project.root_canvas()
+        first = canvas.add_node(Node(title="A"))
+        second = canvas.add_node(Node(title="B", x=420))
+        edge = canvas.add_edge(first.id, second.id)
+        edge.label = "解锁"
+        page = window._add_page(project, None, dirty=False, canvas_data=canvas)
+        window.tabs.setCurrentWidget(page)
+
+        with mock.patch("gamedesigner.app.QInputDialog.getText", return_value=("   ", True)):
+            window._edit_edge(edge.id)
+
+        self.assertEqual(edge.label, "")
+        self.assertTrue(page.dirty)
+        window.deleteLater()
 
     def test_add_data_canvas_creates_templated_child_canvas(self) -> None:
         window = GameDesignerApp()
@@ -818,15 +989,17 @@ class AppEditingTests(unittest.TestCase):
         link.canvas_id = child.id
 
         dialog = ExportCanvasCsvDialog(None, project, "D:/default")
-        checkbox, combo, folder_edit = dialog._canvas_rows[child.id]
+        checkbox, combo, folder_edit, edge_check = dialog._canvas_rows[child.id]
         self.assertIn("自由画布", checkbox.text())
         folder_edit.setText("D:/custom")
+        edge_check.setChecked(True)
         dialog._accept()
 
         self.assertIsNotNone(dialog.result_data)
         specs = dialog.result_data["canvas_specs"]
         child_spec = next(spec for spec in specs if spec.canvas_id == child.id)
         self.assertEqual(child_spec.target_folder, "D:/custom")
+        self.assertTrue(child_spec.export_edges)
         dialog.deleteLater()
 
     def test_export_canvas_csv_dialog_restores_saved_state(self) -> None:
@@ -845,19 +1018,22 @@ class AppEditingTests(unittest.TestCase):
                     "enabled": False,
                     "sort_mode": "x",
                     "target_folder": "D:/body",
+                    "export_edges": True,
                 }
             },
         }
 
         dialog = ExportCanvasCsvDialog(None, project, "D:/default", export_state=state)
-        checkbox, combo, folder_edit = dialog._canvas_rows[child.id]
+        checkbox, combo, folder_edit, edge_check = dialog._canvas_rows[child.id]
 
         self.assertEqual(dialog.folder_edit.text(), "D:/saved")
         self.assertFalse(checkbox.isChecked())
         self.assertEqual(combo.currentData(), "x")
         self.assertEqual(folder_edit.text(), "D:/body")
+        self.assertTrue(edge_check.isChecked())
 
         checkbox.setChecked(True)
+        edge_check.setChecked(False)
         folder_edit.setText("D:/changed")
         dialog._accept()
 
@@ -865,7 +1041,37 @@ class AppEditingTests(unittest.TestCase):
         saved = dialog.result_data["export_state"]
         self.assertEqual(saved["folder"], "D:/saved")
         self.assertTrue(saved["canvases"][child.id]["enabled"])
+        self.assertFalse(saved["canvases"][child.id]["export_edges"])
         self.assertEqual(saved["canvases"][child.id]["target_folder"], "D:/changed")
+        dialog.deleteLater()
+
+    def test_export_canvas_csv_dialog_disables_edge_export_for_data_canvas(self) -> None:
+        from gamedesigner.qt_dialogs import ExportCanvasCsvDialog
+
+        project = ProjectData(name="数据画布导出连线")
+        project.ensure_canvas_structure()
+        data_canvas = project.add_canvas("数据画布", canvas_type="data")
+
+        dialog = ExportCanvasCsvDialog(
+            None,
+            project,
+            "D:/default",
+            export_state={
+                "canvases": {
+                    data_canvas.id: {
+                        "canvas_name": data_canvas.name,
+                        "export_edges": True,
+                    }
+                }
+            },
+        )
+        _checkbox, _combo, _folder_edit, edge_check = dialog._canvas_rows[data_canvas.id]
+
+        self.assertFalse(edge_check.isEnabled())
+        self.assertFalse(edge_check.isChecked())
+        dialog._accept()
+        spec = next(item for item in dialog.result_data["canvas_specs"] if item.canvas_id == data_canvas.id)
+        self.assertFalse(spec.export_edges)
         dialog.deleteLater()
 
     def test_export_canvas_csv_dialog_uses_dark_list_colors(self) -> None:

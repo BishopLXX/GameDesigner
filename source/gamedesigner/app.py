@@ -51,14 +51,15 @@ from .models import (
     NodeField,
     NodeTemplate,
     ProjectData,
+    default_label_node,
     default_project,
-    default_tech_tree_node,
     new_id,
 )
 from .project_history import ProjectHistory, ProjectSnapshot
 from .qt_canvas import NodeGraphView
 from .qt_fonts import configure_fonts
 from .qt_theme import stylesheet
+from .node_visuals import visual_node_size
 from .storage import (
     PROJECT_SUFFIX,
     LEGACY_PROJECT_SUFFIX,
@@ -68,6 +69,13 @@ from .storage import (
     save_project,
     save_settings,
 )
+
+
+AI_CHILD_NODE_GAP_X = 100.0
+AI_CHILD_NODE_GAP_Y = 44.0
+AI_NODE_FALLBACK_WIDTH = 310.0
+AI_NODE_FALLBACK_HEIGHT = 140.0
+EDGE_LABEL_MAX_LENGTH = 24
 from .ui.data_canvas_table import DataCanvasTableWidget
 from .window_layouts import restore_window_layout, save_window_layout
 
@@ -1732,7 +1740,10 @@ class GameDesignerApp(QMainWindow):
             template = self._data_canvas_template_for_page(page)
             self._add_node_from_template_at(x, y, template.id if template is not None else None)
             return
-        node = default_tech_tree_node(x - 255, y - 165)
+        node = default_label_node()
+        node_width, node_height = visual_node_size(node.fields, node.width, node.height)
+        node.x = x - node_width / 2
+        node.y = y - node_height / 2
         node.group_id = page.canvas.group_id_at_scene_pos(QPointF(x, y))
         page.canvas_data.add_node(node)
         page.canvas.rebuild()
@@ -2233,13 +2244,16 @@ class GameDesignerApp(QMainWindow):
         edge = next((item for item in page.canvas_data.edges if item.id == edge_id), None)
         if not edge:
             return
-        label, ok = QInputDialog.getText(self, "连接标签", "标签（可留空）", text=edge.label)
+        label, ok = QInputDialog.getText(self, "连线文本", "短文本（可留空）", text=edge.label)
         if not ok:
             return
-        edge.label = label.strip()
+        edge.label = self._normalize_edge_label(label)
         page.canvas.rebuild()
         page.canvas.select_edge(edge.id)
         self._mark_dirty(page)
+
+    def _normalize_edge_label(self, label: str) -> str:
+        return " ".join(label.split())[:EDGE_LABEL_MAX_LENGTH]
 
     def _edit_group(self, group_id: str) -> None:
         page = self._current_page()
@@ -2560,6 +2574,12 @@ class GameDesignerApp(QMainWindow):
         selected_ids: set[str] = set()
         selected_group_ids: set[str] = set()
         base = self._ai_action_base_position(page)
+        child_parent = self._ai_child_parent_node(page)
+        top_level_create_count = sum(
+            1
+            for action in actions
+            if isinstance(action, AiCanvasAction) and action.type == "create_node"
+        )
         create_index = 0
         for action in actions:
             if not isinstance(action, AiCanvasAction):
@@ -2588,7 +2608,11 @@ class GameDesignerApp(QMainWindow):
             if action.type == "create_node":
                 create_index += 1
                 node = self._node_from_ai_action(page, action, base, create_index)
+                if child_parent is not None and action.x is None and action.y is None:
+                    self._position_ai_child_node(page, child_parent, node, create_index, top_level_create_count)
                 page.canvas_data.add_node(node)
+                if child_parent is not None and not page.canvas_data.is_data_canvas():
+                    page.canvas_data.add_edge(child_parent.id, node.id)
                 selected_ids.add(node.id)
                 created += 1
             elif action.type == "update_node":
@@ -2646,6 +2670,36 @@ class GameDesignerApp(QMainWindow):
         center = page.canvas.center_world()
         return QPointF(center.x() - 180, center.y() - 90)
 
+    def _ai_child_parent_node(self, page: ProjectPage) -> Node | None:
+        if page.canvas_data.is_data_canvas() or len(page.canvas.selected_node_ids) != 1:
+            return None
+        parent_id = next(iter(page.canvas.selected_node_ids))
+        return page.canvas_data.find_node(parent_id)
+
+    def _position_ai_child_node(
+        self,
+        page: ProjectPage,
+        parent: Node,
+        child: Node,
+        index: int,
+        total: int,
+    ) -> None:
+        parent_width, parent_height = self._estimated_node_size(parent)
+        _child_width, child_height = self._estimated_node_size(child)
+        total = max(1, total)
+        stack_height = total * child_height + max(0, total - 1) * AI_CHILD_NODE_GAP_Y
+        child.x = parent.x + parent_width + AI_CHILD_NODE_GAP_X
+        child.y = parent.y + (parent_height - stack_height) / 2 + (index - 1) * (child_height + AI_CHILD_NODE_GAP_Y)
+        child.group_id = page.canvas.group_id_at_scene_pos(QPointF(child.x, child.y))
+
+    def _estimated_node_size(self, node: Node) -> tuple[float, float]:
+        visual_fields = [field for field in node.fields if field.has_visual_layout()]
+        if visual_fields:
+            return visual_node_size(visual_fields, node.width, node.height)
+        width = max(AI_NODE_FALLBACK_WIDTH, float(node.width or 0.0))
+        height = max(AI_NODE_FALLBACK_HEIGHT, float(node.height or 0.0))
+        return width, height
+
     def _group_from_ai_action(
         self,
         page: ProjectPage,
@@ -2680,7 +2734,8 @@ class GameDesignerApp(QMainWindow):
         x = action.x if action.x is not None else base.x() + ((index - 1) % 2) * 460
         y = action.y if action.y is not None else base.y() + ((index - 1) // 2) * 240
         template = self._template_for_ai_action(page, action)
-        if template is not None and action.node_type not in {"画布", "超文本"}:
+        node_type = action.node_type if action.node_type in {"普通", "画布", "超文本"} else "普通"
+        if template is not None and node_type not in {"画布", "超文本"}:
             node = template.create_node(float(x), float(y))
             node.template_locked = page.canvas_data.is_data_canvas()
             node.title = action.title or node.title
@@ -2690,7 +2745,7 @@ class GameDesignerApp(QMainWindow):
             if action.color:
                 node.color = action.color
             self._apply_ai_fields_to_node(node, action)
-        else:
+        elif node_type in {"画布", "超文本"}:
             fields = [
                 NodeField(field.name, field.data_type, field.value)
                 for field in action.fields
@@ -2699,9 +2754,9 @@ class GameDesignerApp(QMainWindow):
                 fields = [NodeField("内容信息", "长文本", "")]
             node = Node(
                 title=action.title or "AI 节点",
-                node_type=action.node_type if action.node_type in {"普通", "画布", "超文本"} else "普通",
-                icon=action.icon or (action.title[:1] if action.title else "AI"),
-                icon_from_title=not bool(action.icon),
+                node_type=node_type,
+                icon=action.icon or ("画" if node_type == "画布" else "链"),
+                icon_from_title=False,
                 x=float(x),
                 y=float(y),
                 width=max(0.0, float(action.width or 0.0)),
@@ -2710,6 +2765,20 @@ class GameDesignerApp(QMainWindow):
                 group_id=action.group_id,
                 fields=fields,
             )
+        else:
+            node = default_label_node(
+                float(x),
+                float(y),
+                title=action.title or "AI 节点",
+            )
+            if action.icon:
+                node.icon = action.icon
+                node.icon_from_title = False
+            node.width = max(0.0, float(action.width or 0.0))
+            node.height = max(0.0, float(action.height or 0.0))
+            node.color = action.color or "#ffffff"
+            node.group_id = action.group_id
+            self._apply_ai_fields_to_label_node(node, action)
         node.x = float(x)
         node.y = float(y)
         if action.width is not None:
@@ -2780,6 +2849,22 @@ class GameDesignerApp(QMainWindow):
             title_field = next((item for item in node.fields if item.id == node.title_field_id), None)
             if title_field is not None and title_field.value.strip() and not action.title:
                 node.title = title_field.value.strip()
+
+    def _apply_ai_fields_to_label_node(self, node: Node, action: Any) -> None:
+        if not action.fields or not node.fields:
+            return
+        label_field = node.fields[0]
+        label_field.data_type = "长文本"
+        if len(action.fields) == 1:
+            field_change = action.fields[0]
+            label_field.name = field_change.name or label_field.name
+            label_field.value = field_change.value
+            return
+        label_field.name = "描述"
+        label_field.value = "\n".join(
+            f"{field_change.name}: {field_change.value}" if field_change.name else field_change.value
+            for field_change in action.fields
+        )
 
     def _reset_view(self) -> None:
         page = self._current_page()

@@ -106,7 +106,11 @@ def ai_profile_key_for_snapshot(snapshot: dict[str, str]) -> str:
     model = snapshot.get("ai_model", "")
     base_url = _normalize_base_url(snapshot.get("ai_base_url", ""))
     for preset in AI_FREE_MODEL_PRESETS:
-        if model == preset.model and base_url == _normalize_base_url(preset.base_url):
+        if (
+            model == preset.model
+            and base_url == _normalize_base_url(preset.base_url)
+            and snapshot.get("ai_api_key", "") == preset.api_key
+        ):
             return preset.key
     return AI_CUSTOM_API_PROFILE_KEY
 

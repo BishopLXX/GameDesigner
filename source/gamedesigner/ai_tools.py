@@ -33,6 +33,14 @@ AI_LINKED_DOC_CHARS = 1200
 AI_ACTION_BLOCK_START = "【GD_ACTIONS】"
 AI_ACTION_BLOCK_END = "【/GD_ACTIONS】"
 AI_CANVAS_ACTION_TYPES = {"create_node", "update_node", "create_group", "update_canvas_rules"}
+AI_DESIGN_MODE_PROTOCOL = (
+    "设计模式协议：当用户说文案、描述、玩法、系统、规则、流程时，按文案设计处理；"
+    "文案设计是游戏玩法、系统、规则、流程、目标和体验的自然语言描述。"
+    "当用户说迭代、变体、类型、数值、成长、阶段、等级、倍率、掉落、解锁时，按迭代设计处理；"
+    "迭代设计是在现有设计基础上生成数值、类型、阶段、成长或差异化版本。"
+    "只要上下文里有参考节点、参考画布、便签、画布规则或现有内容，迭代必须基于这些文案和现有内容继续扩展，"
+    "不要脱离参考另起一套设定。\n"
+)
 
 
 @dataclass
@@ -137,6 +145,7 @@ def build_project_chat_prompt(context: str, user_message: str, history: list[AiC
         "默认只提供设计建议、分析、文案、节点规划和可执行步骤；不要声称你已经直接修改了工程文件。\n"
         "如果需要用户在画布中操作，请给出简洁明确的操作建议。\n"
         "你可以参考历史对话保持连续性，但当前工程上下文优先级最高。\n\n"
+        f"{AI_DESIGN_MODE_PROTOCOL}\n"
         "【当前工程上下文】\n"
         f"{context.strip()}\n\n"
         "【历史对话】\n"
@@ -152,7 +161,11 @@ def build_ai_assistant_prompt(context: str, user_message: str, history: list[AiC
     return (
         "你是 GameDesigner 内置 AI 助手。请基于下面的工程上下文帮助用户迭代当前设计工程。\n"
         "优先级规则：当前画布与当前选中对象最高；历史对话次之；低权重参考文档只用于补充灵感，不能覆盖当前画布事实。\n"
+        f"{AI_DESIGN_MODE_PROTOCOL}"
         "当用户从节点或蓝图组进入迭代助手模式时，必须优先参考当前选中对象；创建新节点时默认沿用选中节点的模板、字段结构和当前数据画布模板。\n"
+        "没有可继承模板的普通 create_node 默认使用 Label 节点结构：标题简洁、icon 留空、只保留一个长文本描述卡片。\n"
+        "当用户要求基于当前选中节点创建子节点、下级节点、延伸节点或后续节点时，create_node 的 x/y 默认留空；"
+        "GameDesigner 会把子节点放到父节点右侧并自动创建从父节点到子节点的连接。\n"
         "如果用户要求参考某个蓝图组继续迭代，可以创建新的蓝图组，并在其中创建一批结构相近但内容迭代后的节点。\n"
         "你可以给出设计建议、文案、节点规划，也可以在用户要求改画布时输出可执行的画布动作。\n"
         "不要声称你自己直接改了工程文件；如果输出画布动作，GameDesigner 会在回复结束后自动应用到当前画布，不需要用户再点击确认。\n\n"
@@ -169,13 +182,13 @@ def build_ai_assistant_prompt(context: str, user_message: str, history: list[AiC
         "    {\n"
         '      "type": "create_node",\n'
         '      "title": "节点标题",\n'
-        '      "icon": "一到两个字",\n'
+        '      "icon": "",\n'
         '      "template_id": "可选，通常留空以继承当前选中节点模板",\n'
         '      "node_type": "普通",\n'
         '      "x": null,\n'
         '      "y": null,\n'
         '      "fields": [\n'
-        '        {"name": "内容信息", "data_type": "长文本", "value": "节点内容"}\n'
+        '        {"name": "描述", "data_type": "长文本", "value": "节点内容"}\n'
         "      ]\n"
         "    },\n"
         "    {\n"
@@ -190,7 +203,7 @@ def build_ai_assistant_prompt(context: str, user_message: str, history: list[AiC
         '          "type": "create_node",\n'
         '          "title": "组内节点",\n'
         '          "fields": [\n'
-        '            {"name": "内容信息", "data_type": "长文本", "value": "节点内容"}\n'
+        '            {"name": "描述", "data_type": "长文本", "value": "节点内容"}\n'
         "          ]\n"
         "        }\n"
         "      ]\n"
@@ -210,6 +223,8 @@ def build_ai_assistant_prompt(context: str, user_message: str, history: list[AiC
         "update_canvas_rules 只写入当前画布规则，rules 必须是完整合并后的规则文本，不要只写增量片段；"
         "update_node 必须使用上下文中真实存在的 node_id；"
         "字段 data_type 优先用 文本、长文本、整数、数字、布尔、枚举、日期、资源路径；"
+        "普通默认节点不要生成图标，也不要拆出多个字段，除非用户明确要求复杂模板或当前选中节点已有模板；"
+        "基于选中节点生成子节点时不要手写右上角坐标，除非用户明确要求固定位置；"
         "如果是迭代新节点或新蓝图组，请直接输出动作块；如果用户只是咨询，不要输出动作块。\n\n"
         "【当前工程上下文】\n"
         f"{context.strip()}\n\n"

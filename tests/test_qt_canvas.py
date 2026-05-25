@@ -183,6 +183,35 @@ class QtCanvasTests(unittest.TestCase):
         self.assertFalse(view.connecting)
         view.deleteLater()
 
+    def test_connection_drag_near_viewport_edge_auto_pans_canvas(self) -> None:
+        canvas = CanvasData(name="主画布")
+        source = canvas.add_node(Node(title="源", x=0, y=0, width=320, height=180))
+        view = NodeGraphView(canvas)
+        view.resize(420, 280)
+        view.show()
+        view.centerOn(source.x, source.y)
+        self.app.processEvents()
+        source_item = view.node_items[source.id]
+        handle_pos = source_item._connection_handle_points()["right"]
+        anchor_scene = source_item.mapToScene(handle_pos)
+        edge_view_pos = QPoint(view.viewport().width() - 2, view.viewport().height() // 2)
+        edge_scene_pos = view.mapToScene(edge_view_pos)
+
+        view.begin_connection_drag(source.id, anchor_scene)
+        view.update_connection_drag(edge_scene_pos)
+        before_scroll = view.horizontalScrollBar().value()
+
+        view._tick_connection_auto_pan()
+
+        self.assertGreater(view.horizontalScrollBar().value(), before_scroll)
+        self.assertEqual(view._connection_auto_pan_view_pos, edge_view_pos)
+        self.assertAlmostEqual(view.mouse_scene.x(), view.mapToScene(edge_view_pos).x(), delta=0.01)
+        self.assertAlmostEqual(view.mouse_scene.y(), view.mapToScene(edge_view_pos).y(), delta=0.01)
+
+        view.cancel_connection()
+        self.assertFalse(view._connection_auto_pan_timer.isActive())
+        view.deleteLater()
+
     def test_drag_edge_from_node_to_pasted_node_defers_rebuild_until_release_returns(self) -> None:
         canvas = CanvasData(name="主画布")
         source = canvas.add_node(Node(title="源", x=0, y=0, width=320, height=180))
@@ -379,6 +408,48 @@ class QtCanvasTests(unittest.TestCase):
         self.assertTrue(delete.accepted)
         self.assertEqual(deleted_edges, [edge.id])
         self.assertEqual(edge.orthogonal_route, [{"x": 410.0, "y": 170.0}])
+        view.deleteLater()
+
+    def test_edge_context_menu_add_label_action_emits_edit_signal(self) -> None:
+        canvas = CanvasData(name="主画布")
+        source = canvas.add_node(Node(title="源", x=0, y=0, width=320, height=180))
+        target = canvas.add_node(Node(title="目标", x=560, y=80, width=320, height=180))
+        edge = canvas.add_edge(source.id, target.id)
+        view = NodeGraphView(canvas)
+        emitted: list[str] = []
+        view.edgeEditRequested.connect(lambda edge_id: emitted.append(edge_id))
+        item = view.edge_items[edge.id]
+        view_pos = view.mapFromScene(item.path().pointAtPercent(0.5))
+
+        def fake_exec(menu: QMenu, _global_pos: QPoint):
+            for action in _iter_menu_actions(menu):
+                if action.text() == "添加连线文本":
+                    return action
+            return None
+
+        with mock.patch.object(view, "_exec_context_menu", side_effect=fake_exec):
+            view._show_context_menu(view_pos, QPoint(20, 20))
+
+        self.assertEqual(emitted, [edge.id])
+        self.assertEqual(view.selected_edge_id, edge.id)
+        view.deleteLater()
+
+    def test_edge_label_rect_sits_just_above_line_and_is_clickable(self) -> None:
+        canvas = CanvasData(name="主画布")
+        source = canvas.add_node(Node(title="源", x=0, y=0, width=320, height=180))
+        target = canvas.add_node(Node(title="目标", x=560, y=0, width=320, height=180))
+        edge = canvas.add_edge(source.id, target.id)
+        edge.style = "straight"
+        edge.label = "解锁"
+        view = NodeGraphView(canvas)
+        item = view.edge_items[edge.id]
+        middle = item.path().pointAtPercent(0.5)
+        label_rect = item._label_rect()
+
+        self.assertTrue(label_rect.isValid())
+        self.assertLess(label_rect.bottom(), middle.y())
+        self.assertLess(middle.y() - label_rect.bottom(), 8.0)
+        self.assertTrue(item.shape().contains(label_rect.center()))
         view.deleteLater()
 
     def test_curve_edge_enters_target_instead_of_running_parallel(self) -> None:

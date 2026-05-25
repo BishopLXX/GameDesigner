@@ -769,6 +769,26 @@ def default_project() -> ProjectData:
     return project
 
 
+def default_label_node(x: float = 0.0, y: float = 0.0, title: str = "Label节点") -> Node:
+    return Node(
+        title=title.strip() or "Label节点",
+        x=x,
+        y=y,
+        width=0.0,
+        height=0.0,
+        color=DEFAULT_NODE_COLOR,
+        icon="",
+        icon_from_title=False,
+        fields=default_label_fields(),
+    )
+
+
+def default_label_fields() -> list[NodeField]:
+    return [
+        _visual_field("描述", "长文本", "节点的描述", 10, 0, 450, 230, 13),
+    ]
+
+
 def default_tech_tree_node(x: float = 0.0, y: float = 0.0) -> Node:
     fields = default_tech_tree_fields()
     return Node(
@@ -822,16 +842,15 @@ def _visual_field(
 
 
 def default_templates() -> list[NodeTemplate]:
+    label_fields = default_label_fields()
     tech_fields = default_tech_tree_fields()
     return [
         NodeTemplate(
-            name="设计节点",
+            name="Label节点",
             color=DEFAULT_NODE_COLOR,
-            icon="设",
-            fields=[
-                NodeField("内容信息", "长文本", ""),
-                NodeField("数据类型", "枚举", "普通"),
-            ],
+            icon="",
+            icon_from_title=False,
+            fields=label_fields,
         ),
         NodeTemplate(
             name="科技树节点",

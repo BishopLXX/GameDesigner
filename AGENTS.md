@@ -15,8 +15,16 @@
 - Blank canvas right-click creates or imports node content.
 - Node right-click exposes node-specific actions only.
 - Edge right-click exposes edge-specific actions only.
+- When creating a child or follow-up node from a selected node, place the new node to the right of the parent and connect parent to child.
 - In the node editor, blank preview-area right-click adds sub-cards, and selected sub-card right-click exposes sub-card actions.
 - Keyboard shortcuts should remain available, but visible UI should stay compact.
+
+## AI Design Defaults
+
+- AI must distinguish copywriting design from iteration design. Copywriting design describes gameplay, systems, rules, flow, goals, tone, and player experience in natural language.
+- Iteration design creates variants, types, numbers, growth stages, unlocks, drops, balancing changes, and other structured extensions.
+- When reference nodes, canvas rules, notes, or existing canvas content are present, iteration must be based on the existing copywriting and content before extending or differentiating it.
+- Default normal nodes should use the Label node structure: a simple title, blank icon, and exactly one long-text description card.
 
 ## Persistence Defaults
 

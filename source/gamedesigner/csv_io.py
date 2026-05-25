@@ -57,6 +57,7 @@ class CanvasCsvExportSpec:
     enabled: bool = True
     sort_mode: str = "created"
     target_folder: str = ""
+    export_edges: bool = False
 
 
 def export_game_csv(
@@ -64,6 +65,7 @@ def export_game_csv(
     target: str | Path,
     canvas: CanvasData | None = None,
     sort_mode: str = "created",
+    export_edges: bool = False,
 ) -> Path:
     path = Path(target)
     if path.suffix.lower() != ".csv":
@@ -72,7 +74,7 @@ def export_game_csv(
 
     project.ensure_canvas_structure()
     source_canvas = canvas or project.root_canvas()
-    return _write_canvas_csv(path, source_canvas, sort_mode)
+    return _write_canvas_csv(path, source_canvas, sort_mode, export_edges=export_edges)
 
 
 def export_all_canvas_csv(
@@ -97,14 +99,14 @@ def export_all_canvas_csv(
             export_folder = export_folder.parent
         export_folder.mkdir(parents=True, exist_ok=True)
         path = export_folder / _canvas_csv_filename(canvas)
-        paths.append(_write_canvas_csv(path, canvas, spec.sort_mode))
+        paths.append(_write_canvas_csv(path, canvas, spec.sort_mode, export_edges=spec.export_edges))
     return paths
 
 
-def _write_canvas_csv(path: Path, source_canvas: CanvasData, sort_mode: str) -> Path:
+def _write_canvas_csv(path: Path, source_canvas: CanvasData, sort_mode: str, export_edges: bool = False) -> Path:
     source_canvas.normalize_node_order()
     nodes = _sorted_nodes(source_canvas.nodes, _resolved_sort_mode(source_canvas, sort_mode))
-    columns = _build_columns(nodes)
+    columns = _build_columns(nodes, source_canvas if export_edges and not source_canvas.is_data_canvas() else None)
     with path.open("w", encoding="utf-8-sig", newline="") as file:
         writer = csv.writer(file)
         writer.writerow([column.header for column in columns])
@@ -114,7 +116,7 @@ def _write_canvas_csv(path: Path, source_canvas: CanvasData, sort_mode: str) -> 
     return path
 
 
-def _build_columns(nodes: list[Node]) -> list[Column]:
+def _build_columns(nodes: list[Node], edge_canvas: CanvasData | None = None) -> list[Column]:
     columns = [
         Column(header, data_type, getter)
         for header, data_type, getter in BASE_COLUMNS
@@ -144,6 +146,16 @@ def _build_columns(nodes: list[Node]) -> list[Column]:
                 _unique_header(columns, f"{label}.{PROP_LABELS.get(prop, prop)}"),
                 PROP_TYPES.get(prop, "文本"),
                 lambda node, key=key, prop=prop: _property_value(_field_by_key(node, key), prop),
+            )
+        )
+
+    if edge_canvas is not None:
+        edge_targets = _edge_targets_by_source(edge_canvas)
+        columns.append(
+            Column(
+                _unique_header(columns, "连线"),
+                "文本",
+                lambda node, edge_targets=edge_targets: edge_targets.get(node.id, ""),
             )
         )
 
@@ -184,10 +196,32 @@ def _resolved_canvas_specs(
                     enabled=bool(spec.enabled),
                     sort_mode=_resolved_sort_mode(canvas, spec.sort_mode),
                     target_folder=str(spec.target_folder or ""),
+                    export_edges=bool(spec.export_edges) and not canvas.is_data_canvas(),
                 ),
             )
         )
     return result
+
+
+def _edge_targets_by_source(canvas: CanvasData) -> dict[str, str]:
+    titles_by_id: dict[str, str] = {
+        node.id: node.title.strip() or "未命名节点"
+        for node in canvas.nodes
+    }
+    titles_by_id.update(
+        {
+            group.id: group.title.strip() or "未命名蓝图组"
+            for group in canvas.groups
+        }
+    )
+    targets: dict[str, list[str]] = defaultdict(list)
+    for edge in canvas.valid_edges():
+        if edge.source not in titles_by_id:
+            continue
+        target_name = titles_by_id.get(edge.target)
+        if target_name:
+            targets[edge.source].append(target_name)
+    return {source: "|".join(names) for source, names in targets.items()}
 
 
 def _field_keys(node: Node) -> list[tuple[str, NodeField]]:
