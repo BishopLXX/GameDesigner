@@ -169,6 +169,9 @@ def _coerce_layout(raw: dict[str, Any], *, include_geometry: bool = False) -> di
     geometry = raw.get("geometry")
     if include_geometry and isinstance(geometry, str) and geometry:
         result["geometry"] = geometry
+    fullscreen = raw.get("fullscreen")
+    if include_geometry and isinstance(fullscreen, bool):
+        result["fullscreen"] = fullscreen
     return result
 
 

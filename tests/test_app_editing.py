@@ -2123,6 +2123,39 @@ class AppEditingTests(unittest.TestCase):
                 layout = saved.window_layouts["main_window"]
                 self.assertEqual(layout["width"], float(normal_geometry.width()))
                 self.assertEqual(layout["height"], float(normal_geometry.height()))
+                self.assertTrue(layout["fullscreen"])
+                window.deleteLater()
+
+    def test_main_window_restores_saved_fullscreen_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            tmp_path = Path(folder)
+            settings = AppSettings(
+                workspace_dir=folder,
+                export_dir=str(tmp_path / "exports"),
+                window_layouts={
+                    "main_window": {
+                        "x": 96,
+                        "y": 118,
+                        "width": 1280,
+                        "height": 760,
+                        "fullscreen": True,
+                    },
+                },
+            )
+            with mock.patch.dict(os.environ, {"APPDATA": folder}):
+                save_settings(settings)
+
+                window = GameDesignerApp()
+
+                self.assertTrue(window.is_window_fullscreen())
+                self.assertEqual(window.titlebar.window_mode_button.text(), "窗口")
+
+                window.toggle_window_mode()
+
+                self.assertFalse(window.is_window_fullscreen())
+                self.assertEqual(window.titlebar.window_mode_button.text(), "全屏")
+                self.assertEqual(window.width(), 1280)
+                self.assertEqual(window.height(), 760)
                 window.deleteLater()
 
 

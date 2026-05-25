@@ -70,13 +70,30 @@ def _apply_window_layout(widget: QWidget, layout: dict[str, Any] | None) -> None
 
 def _capture_window_layout(widget: QWidget, *, geometry_override: QRect | None = None) -> dict[str, Any]:
     geometry = geometry_override or widget.geometry()
-    return {
+    layout: dict[str, Any] = {
         "x": float(geometry.x()),
         "y": float(geometry.y()),
         "width": float(geometry.width()),
         "height": float(geometry.height()),
-        "geometry": bytes(widget.saveGeometry().toBase64()).decode("ascii"),
     }
+    if geometry_override is None or geometry_override == widget.geometry():
+        layout["geometry"] = bytes(widget.saveGeometry().toBase64()).decode("ascii")
+    fullscreen = _window_fullscreen_state(widget)
+    if fullscreen is not None:
+        layout["fullscreen"] = fullscreen
+    return layout
+
+
+def _window_fullscreen_state(widget: QWidget) -> bool | None:
+    custom_state = getattr(widget, "is_window_fullscreen", None)
+    if callable(custom_state):
+        try:
+            return bool(custom_state())
+        except (RuntimeError, TypeError):
+            return None
+    if widget.isFullScreen():
+        return True
+    return None
 
 
 def _window_settings(widget: QWidget) -> AppSettings | None:

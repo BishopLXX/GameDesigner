@@ -564,6 +564,7 @@ class GameDesignerApp(QMainWindow):
             self.setWindowIcon(QIcon(str(self.icon_path)))
         self.resize(1360, 860)
         self.setMinimumSize(1020, 640)
+        restored_layout = self.settings.window_layouts.get("main_window", {})
         restore_window_layout(self, "main_window")
         self._normal_window_geometry = QRect(self.geometry())
         self.setStyleSheet(stylesheet(self.theme))
@@ -599,6 +600,8 @@ class GameDesignerApp(QMainWindow):
         self._build_actions()
         self._build_menu()
         self._build_toolbar()
+        if bool(restored_layout.get("fullscreen")):
+            self._enter_window_fullscreen()
         self._bind_shortcuts()
         self._report_startup_progress(82, "加载开始页...")
         self._load_start_project()
