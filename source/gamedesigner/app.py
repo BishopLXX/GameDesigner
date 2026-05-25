@@ -41,6 +41,12 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from .ai_canvas_tools import (
+    AI_READ_ONLY_TOOL_NAMES,
+    execute_read_only_ai_canvas_tool,
+    format_ai_tool_results,
+    validate_ai_canvas_tool_call,
+)
 from .canvas_io import import_canvas_sheet
 from .data_canvas import apply_template_to_node, data_canvas_template, sync_data_canvas, sync_locked_template_nodes
 from .models import (
@@ -76,6 +82,36 @@ AI_CHILD_NODE_GAP_Y = 44.0
 AI_NODE_FALLBACK_WIDTH = 310.0
 AI_NODE_FALLBACK_HEIGHT = 140.0
 EDGE_LABEL_MAX_LENGTH = 24
+AI_REFERENCE_COLOR_TERMS = [
+    "绿色",
+    "黄色",
+    "红色",
+    "蓝色",
+    "紫色",
+    "橙色",
+    "黑色",
+    "白色",
+    "灰色",
+    "金色",
+    "银色",
+    "粉色",
+    "青色",
+    "棕色",
+    "绿",
+    "黄",
+    "红",
+    "蓝",
+    "紫",
+    "橙",
+    "黑",
+    "白",
+    "灰",
+    "金",
+    "银",
+    "粉",
+    "青",
+    "棕",
+]
 from .ui.data_canvas_table import DataCanvasTableWidget
 from .window_layouts import restore_window_layout, save_window_layout
 
@@ -2570,9 +2606,14 @@ class GameDesignerApp(QMainWindow):
         created = 0
         updated = 0
         created_groups = 0
+        created_edges = 0
+        updated_edges = 0
         updated_rules = 0
+        validation_errors: list[str] = []
+        tool_results = []
         selected_ids: set[str] = set()
         selected_group_ids: set[str] = set()
+        selected_edge_id = ""
         base = self._ai_action_base_position(page)
         child_parent = self._ai_child_parent_node(page)
         top_level_create_count = sum(
@@ -2583,6 +2624,16 @@ class GameDesignerApp(QMainWindow):
         create_index = 0
         for action in actions:
             if not isinstance(action, AiCanvasAction):
+                continue
+            if action.type in AI_READ_ONLY_TOOL_NAMES:
+                if action.type == "validate_actions":
+                    tool_results.extend(self._validate_ai_canvas_actions(actions, page))
+                else:
+                    tool_results.append(execute_read_only_ai_canvas_tool(action, page.project, page.canvas_data))
+                continue
+            validation = validate_ai_canvas_tool_call(action, page.canvas_data)
+            if not validation.success:
+                validation_errors.append(validation.message)
                 continue
             if action.type == "update_canvas_rules":
                 rules = str(action.rules).strip()
@@ -2622,21 +2673,43 @@ class GameDesignerApp(QMainWindow):
                 self._apply_ai_update_to_node(node, action)
                 selected_ids.add(node.id)
                 updated += 1
-        if not created and not updated and not created_groups and not updated_rules:
+            elif action.type == "create_edge":
+                edge, error = self._create_ai_edge(page, action)
+                if error:
+                    validation_errors.append(error)
+                    continue
+                if edge is not None:
+                    selected_edge_id = edge.id
+                    created_edges += 1
+            elif action.type == "update_edge_label":
+                edge, error = self._update_ai_edge_label(page, action)
+                if error:
+                    validation_errors.append(error)
+                    continue
+                if edge is not None:
+                    selected_edge_id = edge.id
+                    updated_edges += 1
+        mutated = bool(created or updated or created_groups or updated_rules or created_edges or updated_edges)
+        if not mutated and not tool_results:
+            if validation_errors:
+                raise ValueError("AI 工具调用未通过校验：\n" + "\n".join(validation_errors))
             raise ValueError("AI 没有提供能应用到当前画布的操作。")
-        if page.canvas_data.is_data_canvas():
+        if page.canvas_data.is_data_canvas() and mutated:
             self._sync_canvas_state(page)
             page.table_view.set_canvas(page.project, page.canvas_data)
-        page.canvas.rebuild()
-        if selected_ids:
-            page.canvas.select_nodes(selected_ids)
-            if selected_group_ids:
-                page.canvas.selected_group_ids = set(selected_group_ids)
-                for group_id, item in page.canvas.group_items.items():
-                    item.setSelected(group_id in selected_group_ids)
-        elif selected_group_ids:
-            page.canvas.select_group(next(iter(selected_group_ids)))
-        self._mark_dirty(page)
+        if mutated:
+            page.canvas.rebuild()
+            if selected_ids:
+                page.canvas.select_nodes(selected_ids)
+                if selected_group_ids:
+                    page.canvas.selected_group_ids = set(selected_group_ids)
+                    for group_id, item in page.canvas.group_items.items():
+                        item.setSelected(group_id in selected_group_ids)
+            elif selected_group_ids:
+                page.canvas.select_group(next(iter(selected_group_ids)))
+            elif selected_edge_id:
+                page.canvas.select_edge(selected_edge_id)
+            self._mark_dirty(page)
         parts: list[str] = []
         if created_groups:
             parts.append(f"创建 {created_groups} 个蓝图组")
@@ -2644,9 +2717,101 @@ class GameDesignerApp(QMainWindow):
             parts.append(f"创建 {created} 个节点")
         if updated:
             parts.append(f"更新 {updated} 个节点")
+        if created_edges:
+            parts.append(f"创建 {created_edges} 条连线")
+        if updated_edges:
+            parts.append(f"更新 {updated_edges} 条连线文本")
         if updated_rules:
             parts.append("写入当前画布规则记忆")
-        return "已应用到当前画布：" + "，".join(parts) + "。"
+        if validation_errors:
+            parts.append(f"跳过 {len(validation_errors)} 个无效工具调用")
+        result_prefix = "已应用到当前画布：" if mutated else "已执行画布工具："
+        message = result_prefix + ("，".join(parts) if parts else "无写入操作") + "。"
+        tool_text = format_ai_tool_results(tool_results)
+        if tool_text:
+            message += "\n工具结果：\n" + tool_text
+        if validation_errors:
+            message += "\n校验提示：\n" + "\n".join(f"- {error}" for error in validation_errors)
+        return message
+
+    def _validate_ai_canvas_actions(self, actions: list[Any], page: ProjectPage) -> list[Any]:
+        results = []
+        for action in actions:
+            action_type = str(getattr(action, "type", "") or "")
+            if action_type == "validate_actions":
+                continue
+            result = validate_ai_canvas_tool_call(action, page.canvas_data)
+            if result.success and action_type == "create_edge":
+                source = self._resolve_ai_endpoint_id(page, getattr(action, "source_node_id", ""))
+                target = self._resolve_ai_endpoint_id(page, getattr(action, "target_node_id", ""))
+                if not source or not target:
+                    result.success = False
+                    result.message = "create_edge 找不到源或目标端点。"
+            elif result.success and action_type == "update_edge_label":
+                edge = self._find_ai_edge_for_action(page, action)
+                if edge is None:
+                    result.success = False
+                    result.message = "update_edge_label 找不到目标连线。"
+            results.append(result)
+        return results
+
+    def _create_ai_edge(self, page: ProjectPage, action: Any):
+        if page.canvas_data.is_data_canvas():
+            return None, "排序画布不支持 create_edge。"
+        source = self._resolve_ai_endpoint_id(page, getattr(action, "source_node_id", ""))
+        target = self._resolve_ai_endpoint_id(page, getattr(action, "target_node_id", ""))
+        if not source or not target:
+            return None, "create_edge 找不到源或目标端点。"
+        edge = page.canvas_data.add_edge(source, target)
+        if edge is None:
+            return None, "create_edge 无法创建连线。"
+        label = str(getattr(action, "label", "") or "")
+        if label:
+            edge.label = self._normalize_edge_label(label)
+        style = str(getattr(action, "style", "") or "")
+        if style in EDGE_STYLES:
+            edge.style = style
+            self._remember_last_edge_style(style)
+        return edge, ""
+
+    def _update_ai_edge_label(self, page: ProjectPage, action: Any):
+        edge = self._find_ai_edge_for_action(page, action)
+        if edge is None:
+            return None, "update_edge_label 找不到目标连线。"
+        edge.label = self._normalize_edge_label(str(getattr(action, "label", "") or ""))
+        return edge, ""
+
+    def _find_ai_edge_for_action(self, page: ProjectPage, action: Any):
+        edge_id = str(getattr(action, "edge_id", "") or "").strip()
+        if edge_id:
+            return next((edge for edge in page.canvas_data.edges if edge.id == edge_id), None)
+        source = self._resolve_ai_endpoint_id(page, getattr(action, "source_node_id", ""))
+        target = self._resolve_ai_endpoint_id(page, getattr(action, "target_node_id", ""))
+        if not source or not target:
+            return None
+        return next(
+            (
+                edge
+                for edge in page.canvas_data.edges
+                if edge.source == source and edge.target == target
+            ),
+            None,
+        )
+
+    def _resolve_ai_endpoint_id(self, page: ProjectPage, value: str) -> str:
+        value = str(value or "").strip()
+        if not value:
+            return ""
+        if page.canvas_data.find_node(value) is not None or page.canvas_data.find_group(value) is not None:
+            return value
+        normalized = value.casefold()
+        for node in page.canvas_data.nodes:
+            if node.title.casefold() == normalized:
+                return node.id
+        for group in page.canvas_data.groups:
+            if group.title.casefold() == normalized:
+                return group.id
+        return ""
 
     def _ai_action_base_position(self, page: ProjectPage) -> QPointF:
         selected = [
@@ -2734,6 +2899,7 @@ class GameDesignerApp(QMainWindow):
         x = action.x if action.x is not None else base.x() + ((index - 1) % 2) * 460
         y = action.y if action.y is not None else base.y() + ((index - 1) // 2) * 240
         template = self._template_for_ai_action(page, action)
+        reference_node = self._reference_node_for_ai_action(page, action) if template is None else None
         node_type = action.node_type if action.node_type in {"普通", "画布", "超文本"} else "普通"
         if template is not None and node_type not in {"画布", "超文本"}:
             node = template.create_node(float(x), float(y))
@@ -2765,6 +2931,8 @@ class GameDesignerApp(QMainWindow):
                 group_id=action.group_id,
                 fields=fields,
             )
+        elif reference_node is not None:
+            node = self._node_from_reference_for_ai_action(reference_node, action, float(x), float(y))
         else:
             node = default_label_node(
                 float(x),
@@ -2822,6 +2990,152 @@ class GameDesignerApp(QMainWindow):
                 if template is not None:
                     return template
         return None
+
+    def _reference_node_for_ai_action(self, page: ProjectPage, action: Any) -> Node | None:
+        if page.canvas_data.is_data_canvas():
+            return None
+        reference_id = str(getattr(action, "reference_node_id", "") or "").strip()
+        if reference_id:
+            reference = page.canvas_data.find_node(reference_id)
+            if reference is not None and reference.node_type == "普通":
+                return reference
+        selected_nodes = [
+            node
+            for node in page.canvas_data.nodes
+            if node.id in page.canvas.selected_node_ids and node.node_type == "普通"
+        ]
+        if selected_nodes:
+            return sorted(selected_nodes, key=lambda node: (node.order, node.title))[0]
+        target_title = str(getattr(action, "title", "") or "").strip()
+        if not target_title:
+            return None
+        best: tuple[int, int, Node] | None = None
+        for node in page.canvas_data.nodes:
+            if node.node_type != "普通" or node.title.strip() == target_title:
+                continue
+            score = self._semantic_reference_score(target_title, node.title)
+            if score <= 0:
+                continue
+            visual_priority = 1 if any(field.has_visual_layout() for field in node.fields) else 0
+            candidate = (score, visual_priority, node)
+            if best is None or candidate[:2] > best[:2]:
+                best = candidate
+        return best[2] if best and best[0] >= 12 else None
+
+    def _semantic_reference_score(self, target_title: str, source_title: str) -> int:
+        target_key = self._semantic_node_key(target_title)
+        source_key = self._semantic_node_key(source_title)
+        if len(target_key) < 2 or len(source_key) < 2:
+            return 0
+        if target_key == source_key:
+            return 100 + len(target_key)
+        if target_key in source_key or source_key in target_key:
+            return 60 + min(len(target_key), len(source_key))
+        common = self._longest_common_substring_length(target_key, source_key)
+        return 10 + common if common >= 2 else 0
+
+    def _semantic_node_key(self, title: str) -> str:
+        key = title.lower()
+        for term in AI_REFERENCE_COLOR_TERMS:
+            key = key.replace(term.lower(), "")
+        key = re.sub(r"第?[0-9０-９一二三四五六七八九十百千万]+", "", key)
+        key = re.sub(r"[\s\-_·•:：,，.。()\[\]【】（）]", "", key)
+        for generic in ("节点", "普通", "基础", "初级", "高级", "新", "旧"):
+            key = key.replace(generic, "")
+        return key
+
+    def _longest_common_substring_length(self, left: str, right: str) -> int:
+        best = 0
+        for start in range(len(left)):
+            for end in range(start + best + 1, len(left) + 1):
+                if left[start:end] in right:
+                    best = end - start
+        return best
+
+    def _node_from_reference_for_ai_action(self, reference: Node, action: Any, x: float, y: float) -> Node:
+        field_id_map: dict[str, str] = {}
+        fields: list[NodeField] = []
+        for field in reference.fields:
+            raw = field.to_dict()
+            raw.pop("id", None)
+            cloned = NodeField.from_dict(raw)
+            field_id_map[field.id] = cloned.id
+            fields.append(cloned)
+        title_field_id = field_id_map.get(reference.title_field_id, "")
+        node = Node(
+            title=action.title or self._retarget_reference_text(reference.title, reference.title, action.title),
+            node_type="普通",
+            x=x,
+            y=y,
+            width=reference.width,
+            height=reference.height,
+            color=action.color or reference.color,
+            icon=self._retarget_reference_icon(reference, action),
+            icon_from_title=reference.icon_from_title if not action.icon else False,
+            title_field_id=title_field_id,
+            template_id=reference.template_id,
+            fields=fields,
+        )
+        self._apply_ai_fields_to_reference_node(node, action, reference)
+        return node
+
+    def _retarget_reference_icon(self, reference: Node, action: Any) -> str:
+        if action.icon:
+            return action.icon
+        old_color, new_color = self._reference_color_pair(reference.title, action.title)
+        icon = reference.icon
+        if old_color and new_color and icon == old_color[:1]:
+            return new_color[:1]
+        return icon
+
+    def _apply_ai_fields_to_reference_node(self, node: Node, action: Any, reference: Node) -> None:
+        updated_ids: set[str] = set()
+        if action.fields and len(action.fields) == len(node.fields):
+            for field, field_change in zip(node.fields, action.fields):
+                field.data_type = field_change.data_type or field.data_type
+                field.value = field_change.value
+                updated_ids.add(field.id)
+        else:
+            for field_change in action.fields:
+                field = next((item for item in node.fields if item.name == field_change.name), None)
+                if field is None and len(node.fields) == 1:
+                    field = node.fields[0]
+                if field is None and len(action.fields) == 1:
+                    field = next((item for item in node.fields if item.data_type == "长文本"), None)
+                if field is None:
+                    continue
+                field.data_type = field_change.data_type or field.data_type
+                field.value = field_change.value
+                updated_ids.add(field.id)
+        for field in node.fields:
+            if field.id not in updated_ids:
+                field.value = self._retarget_reference_text(field.value, reference.title, action.title)
+            if field.id == node.title_field_id and action.title:
+                field.value = action.title
+
+    def _retarget_reference_text(self, value: str, reference_title: str, target_title: str) -> str:
+        old_color, new_color = self._reference_color_pair(reference_title, target_title)
+        text = value
+        if old_color and new_color:
+            text = text.replace(old_color, new_color)
+            old_short = old_color[:1]
+            new_short = new_color[:1]
+            if old_short != new_short:
+                text = text.replace(old_short, new_short)
+        return text
+
+    def _reference_color_pair(self, reference_title: str, target_title: str) -> tuple[str, str]:
+        old_color = self._first_color_term(reference_title)
+        new_color = self._first_color_term(target_title)
+        if not old_color or not new_color or old_color == new_color:
+            return "", ""
+        return old_color, new_color
+
+    def _first_color_term(self, text: str) -> str:
+        for term in AI_REFERENCE_COLOR_TERMS:
+            if term in text:
+                return term
+        return ""
 
     def _apply_ai_update_to_node(self, node: Node, action: Any) -> None:
         if action.title:

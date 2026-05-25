@@ -24,6 +24,8 @@
 - AI must distinguish copywriting design from iteration design. Copywriting design describes gameplay, systems, rules, flow, goals, tone, and player experience in natural language.
 - Iteration design creates variants, types, numbers, growth stages, unlocks, drops, balancing changes, and other structured extensions.
 - When reference nodes, canvas rules, notes, or existing canvas content are present, iteration must be based on the existing copywriting and content before extending or differentiating it.
+- When iterating a new color, type, stage, or variant and the canvas already has a same-kind node, use that existing node as the reference. Preserve its node size, field names, field count, visual card layout, and design logic; only change the variant-specific content.
+- AI canvas mutations must go through the internal validated tool layer. Prefer explicit tool calls such as create_node, update_node, create_edge, update_edge_label, query_canvas, search_nodes, and validate_actions over ad hoc JSON.
 - Default normal nodes should use the Label node structure: a simple title, blank icon, and exactly one long-text description card.
 
 ## Persistence Defaults

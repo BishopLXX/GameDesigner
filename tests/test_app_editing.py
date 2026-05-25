@@ -493,6 +493,83 @@ class AppEditingTests(unittest.TestCase):
         self.assertTrue(created.fields[0].has_visual_layout())
         window.deleteLater()
 
+    def test_ai_create_node_with_reference_id_clones_reference_layout(self) -> None:
+        window = GameDesignerApp()
+        project = ProjectData(name="AI参考节点布局")
+        project.ensure_canvas_structure()
+        canvas = project.root_canvas()
+        reference = canvas.add_node(
+            Node(
+                title="绿色史莱姆",
+                x=120,
+                y=100,
+                width=320,
+                height=180,
+                fields=[
+                    NodeField("行为", "长文本", "被攻击后追近玩家", x=10, y=0, width=280, height=74),
+                    NodeField("掉落", "长文本", "100%绿色粘液", x=10, y=84, width=280, height=74),
+                ],
+            )
+        )
+        page = window._add_page(project, None, dirty=False, canvas_data=canvas)
+        window.tabs.setCurrentWidget(page)
+
+        window._apply_ai_canvas_actions(
+            [
+                AiCanvasAction(
+                    type="create_node",
+                    title="黄色史莱姆",
+                    reference_node_id=reference.id,
+                    fields=[
+                        AiCanvasFieldChange("行为", "长文本", "会吐出减速泡沫并靠近玩家"),
+                        AiCanvasFieldChange("掉落", "长文本", "100%黄色粘液"),
+                    ],
+                )
+            ]
+        )
+
+        created = next(node for node in canvas.nodes if node.id != reference.id)
+        self.assertEqual(created.title, "黄色史莱姆")
+        self.assertEqual((created.width, created.height), (reference.width, reference.height))
+        self.assertEqual([field.name for field in created.fields], ["行为", "掉落"])
+        self.assertEqual([field.value for field in created.fields], ["会吐出减速泡沫并靠近玩家", "100%黄色粘液"])
+        self.assertEqual(
+            [(field.x, field.y, field.width, field.height) for field in created.fields],
+            [(field.x, field.y, field.width, field.height) for field in reference.fields],
+        )
+        window.deleteLater()
+
+    def test_ai_create_node_semantically_reuses_existing_same_kind_node(self) -> None:
+        window = GameDesignerApp()
+        project = ProjectData(name="AI同类节点参考")
+        project.ensure_canvas_structure()
+        canvas = project.root_canvas()
+        reference = canvas.add_node(
+            Node(
+                title="绿色史莱姆",
+                width=320,
+                height=180,
+                fields=[
+                    NodeField("行为", "长文本", "行为简单，被攻击后会追近玩家进行攻击。", x=10, y=0, width=280, height=74),
+                    NodeField("掉落", "长文本", "100%绿色粘液", x=10, y=84, width=280, height=74),
+                ],
+            )
+        )
+        canvas.add_node(Node(title="绿色森林1", x=420, fields=[NodeField("产出", "长文本", "绿色史莱姆100%")]))
+        page = window._add_page(project, None, dirty=False, canvas_data=canvas)
+        window.tabs.setCurrentWidget(page)
+
+        window._apply_ai_canvas_actions([AiCanvasAction(type="create_node", title="黄色史莱姆")])
+
+        created = next(node for node in canvas.nodes if node.title == "黄色史莱姆")
+        self.assertEqual((created.width, created.height), (reference.width, reference.height))
+        self.assertEqual([field.name for field in created.fields], ["行为", "掉落"])
+        self.assertEqual(created.fields[0].value, "行为简单，被攻击后会追近玩家进行攻击。")
+        self.assertEqual(created.fields[1].value, "100%黄色粘液")
+        self.assertEqual(created.fields[0].width, reference.fields[0].width)
+        self.assertEqual(created.fields[1].y, reference.fields[1].y)
+        window.deleteLater()
+
     def test_ai_create_node_inherits_selected_node_template(self) -> None:
         window = GameDesignerApp()
         name_field = NodeField("节点名字", "文本", "原技能")
@@ -749,6 +826,66 @@ class AppEditingTests(unittest.TestCase):
 
         self.assertEqual(edge.label, "")
         self.assertTrue(page.dirty)
+        window.deleteLater()
+
+    def test_ai_tool_layer_can_create_edge_and_update_edge_label(self) -> None:
+        window = GameDesignerApp()
+        project = ProjectData(name="AI连线工具")
+        project.ensure_canvas_structure()
+        canvas = project.root_canvas()
+        first = canvas.add_node(Node(title="前置节点"))
+        second = canvas.add_node(Node(title="后续节点", x=420))
+        page = window._add_page(project, None, dirty=False, canvas_data=canvas)
+        window.tabs.setCurrentWidget(page)
+
+        message = window._apply_ai_canvas_actions(
+            [
+                AiCanvasAction(
+                    type="create_edge",
+                    source_node_id=first.id,
+                    target_node_id=second.id,
+                    label="解锁",
+                    style="straight",
+                )
+            ]
+        )
+
+        self.assertIn("创建 1 条连线", message)
+        self.assertEqual(len(canvas.edges), 1)
+        edge = canvas.edges[0]
+        self.assertEqual((edge.source, edge.target), (first.id, second.id))
+        self.assertEqual(edge.label, "解锁")
+        self.assertEqual(edge.style, "straight")
+        self.assertEqual(page.canvas.selected_edge_id, edge.id)
+
+        message = window._apply_ai_canvas_actions(
+            [AiCanvasAction(type="update_edge_label", edge_id=edge.id, label="前置")]
+        )
+
+        self.assertIn("更新 1 条连线文本", message)
+        self.assertEqual(edge.label, "前置")
+        window.deleteLater()
+
+    def test_ai_read_only_tools_return_results_without_dirtying_canvas(self) -> None:
+        window = GameDesignerApp()
+        project = ProjectData(name="AI只读工具")
+        project.ensure_canvas_structure()
+        canvas = project.root_canvas()
+        canvas.add_node(Node(title="绿色史莱姆", fields=[NodeField("掉落", "长文本", "100%绿色粘液")]))
+        page = window._add_page(project, None, dirty=False, canvas_data=canvas)
+        window.tabs.setCurrentWidget(page)
+
+        message = window._apply_ai_canvas_actions(
+            [
+                AiCanvasAction(type="query_canvas", include_nodes=True),
+                AiCanvasAction(type="search_nodes", query="史莱姆", limit=5),
+            ]
+        )
+
+        self.assertIn("已执行画布工具", message)
+        self.assertIn("当前画布", message)
+        self.assertIn("绿色史莱姆", message)
+        self.assertFalse(page.dirty)
         window.deleteLater()
 
     def test_add_data_canvas_creates_templated_child_canvas(self) -> None:

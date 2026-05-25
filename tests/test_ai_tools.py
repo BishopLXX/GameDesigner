@@ -19,6 +19,10 @@ from gamedesigner.ai_tools import (
     save_project_chat_history,
     split_ai_canvas_action_response,
 )
+from gamedesigner.ai_canvas_tools import (
+    AI_CANVAS_TOOL_NAMES,
+    ai_canvas_tool_protocol_text,
+)
 from gamedesigner.ai_presets import (
     AI_CUSTOM_API_PROFILE_KEY,
     AI_FREE_MODEL_PRESETS,
@@ -207,6 +211,25 @@ class AiToolsTests(unittest.TestCase):
         self.assertIn("迭代必须基于这些文案和现有内容", prompt)
         self.assertIn("Label 节点结构", prompt)
         self.assertIn("只保留一个长文本描述卡片", prompt)
+        self.assertIn("迭代黄色史莱姆", prompt)
+        self.assertIn("reference_node_id", prompt)
+        self.assertIn("字段、尺寸、视觉卡片布局", prompt)
+
+    def test_ai_canvas_tool_protocol_lists_standard_internal_tools(self) -> None:
+        protocol = ai_canvas_tool_protocol_text()
+
+        for name in (
+            "create_node",
+            "update_node",
+            "create_edge",
+            "update_edge_label",
+            "query_canvas",
+            "search_nodes",
+            "validate_actions",
+        ):
+            self.assertIn(name, AI_CANVAS_TOOL_NAMES)
+            self.assertIn(name, protocol)
+        self.assertIn("受控工具调用", protocol)
 
     def test_parse_ai_canvas_actions_supports_create_update_group_and_canvas_rules(self) -> None:
         actions = parse_ai_canvas_actions(
@@ -222,6 +245,7 @@ class AiToolsTests(unittest.TestCase):
                   "title": "冲刺技能",
                   "icon": "冲",
                   "template_id": "template_skill",
+                  "reference_node_id": "node_reference",
                   "fields": [
                     {"name": "内容信息", "data_type": "长文本", "value": "向前突进"}
                   ]
@@ -259,10 +283,41 @@ class AiToolsTests(unittest.TestCase):
         self.assertIn("Boss 设计节点", actions[0].rules)
         self.assertEqual(actions[1].title, "冲刺技能")
         self.assertEqual(actions[1].template_id, "template_skill")
+        self.assertEqual(actions[1].reference_node_id, "node_reference")
         self.assertEqual(actions[1].fields[0], AiCanvasFieldChange("内容信息", "长文本", "向前突进"))
         self.assertEqual(actions[2].title, "冲刺流派")
         self.assertEqual(actions[2].nodes[0].title, "冲刺强化")
         self.assertEqual(actions[3].node_id, "node_a")
+
+    def test_parse_ai_canvas_actions_supports_tool_calls_shape(self) -> None:
+        actions = parse_ai_canvas_actions(
+            """
+            {
+              "tool_calls": [
+                {
+                  "function": {
+                    "name": "create_edge",
+                    "arguments": "{\\"source_node_id\\": \\"node_a\\", \\"target_node_id\\": \\"node_b\\", \\"label\\": \\"解锁\\"}"
+                  }
+                },
+                {
+                  "name": "search_nodes",
+                  "arguments": {
+                    "query": "史莱姆",
+                    "limit": 5
+                  }
+                }
+              ]
+            }
+            """
+        )
+
+        self.assertEqual([action.type for action in actions], ["create_edge", "search_nodes"])
+        self.assertEqual(actions[0].source_node_id, "node_a")
+        self.assertEqual(actions[0].target_node_id, "node_b")
+        self.assertEqual(actions[0].label, "解锁")
+        self.assertEqual(actions[1].query, "史莱姆")
+        self.assertEqual(actions[1].limit, 5)
 
     def test_project_chat_context_includes_canvas_rules_as_high_priority_memory(self) -> None:
         canvas = CanvasData(
@@ -278,6 +333,21 @@ class AiToolsTests(unittest.TestCase):
         self.assertIn("当前画布规则记忆（高权重", context)
         self.assertIn("几何 Boss Rush 风格", context)
         self.assertIn("每个 Boss 必须有清晰弱点", context)
+
+    def test_project_chat_context_includes_node_size_and_visual_layout(self) -> None:
+        field = NodeField("掉落", "长文本", "100%绿色粘液", x=10, y=70, width=280, height=82)
+        canvas = CanvasData(
+            id="canvas_visual",
+            name="怪物画布",
+            nodes=[Node(title="绿色史莱姆", x=100, y=120, width=320, height=180, fields=[field])],
+        )
+        project = ProjectData(name="布局上下文测试", root_canvas_id=canvas.id, canvases=[canvas])
+
+        context = build_project_chat_context(project, canvas)
+
+        self.assertIn("绿色史莱姆", context)
+        self.assertIn("尺寸 (320x180)", context)
+        self.assertIn("布局(10,70,280x82)", context)
 
     def test_project_chat_context_includes_canvas_and_node_notes(self) -> None:
         node = Node(

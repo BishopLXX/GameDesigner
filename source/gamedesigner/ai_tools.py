@@ -10,6 +10,7 @@ from typing import Any
 
 from PySide6.QtCore import QProcessEnvironment
 
+from .ai_canvas_tools import AI_CANVAS_TOOL_NAMES, ai_canvas_tool_protocol_text
 from .ai_presets import AI_FREE_MODEL_PRESETS
 from .models import FIELD_TYPES, NODE_TYPES, BlueprintGroup, CanvasData, DesignNote, Edge, Node, ProjectData
 from .storage import AppSettings, project_bundle_dir
@@ -32,7 +33,7 @@ AI_LINKED_DOC_LIMIT = 8
 AI_LINKED_DOC_CHARS = 1200
 AI_ACTION_BLOCK_START = "【GD_ACTIONS】"
 AI_ACTION_BLOCK_END = "【/GD_ACTIONS】"
-AI_CANVAS_ACTION_TYPES = {"create_node", "update_node", "create_group", "update_canvas_rules"}
+AI_CANVAS_ACTION_TYPES = set(AI_CANVAS_TOOL_NAMES)
 AI_DESIGN_MODE_PROTOCOL = (
     "设计模式协议：当用户说文案、描述、玩法、系统、规则、流程时，按文案设计处理；"
     "文案设计是游戏玩法、系统、规则、流程、目标和体验的自然语言描述。"
@@ -86,6 +87,7 @@ class AiCanvasAction:
     node_id: str = ""
     rules: str = ""
     template_id: str = ""
+    reference_node_id: str = ""
     icon: str = ""
     node_type: str = "普通"
     x: float | None = None
@@ -94,6 +96,15 @@ class AiCanvasAction:
     height: float | None = None
     color: str = ""
     group_id: str = ""
+    source_node_id: str = ""
+    target_node_id: str = ""
+    edge_id: str = ""
+    label: str = ""
+    style: str = ""
+    query: str = ""
+    limit: int = 12
+    include_nodes: bool = False
+    include_edges: bool = False
     fields: list[AiCanvasFieldChange] = field(default_factory=list)
     nodes: list["AiCanvasAction"] = field(default_factory=list)
 
@@ -163,6 +174,9 @@ def build_ai_assistant_prompt(context: str, user_message: str, history: list[AiC
         "优先级规则：当前画布与当前选中对象最高；历史对话次之；低权重参考文档只用于补充灵感，不能覆盖当前画布事实。\n"
         f"{AI_DESIGN_MODE_PROTOCOL}"
         "当用户从节点或蓝图组进入迭代助手模式时，必须优先参考当前选中对象；创建新节点时默认沿用选中节点的模板、字段结构和当前数据画布模板。\n"
+        "当用户要求迭代某个新颜色、新类型或新阶段，而当前画布已有同类节点时，必须把同类节点作为参考；"
+        "例如“迭代黄色史莱姆”且已有“绿色史莱姆”，必须参考绿色史莱姆的字段、尺寸、视觉卡片布局和已有机制，只做差异化内容。\n"
+        "参考同类节点创建 create_node 时，必须填写 reference_node_id；新节点字段数量、字段名、视觉结构应与参考节点一致，内容要在参考效果基础上变化。\n"
         "没有可继承模板的普通 create_node 默认使用 Label 节点结构：标题简洁、icon 留空、只保留一个长文本描述卡片。\n"
         "当用户要求基于当前选中节点创建子节点、下级节点、延伸节点或后续节点时，create_node 的 x/y 默认留空；"
         "GameDesigner 会把子节点放到父节点右侧并自动创建从父节点到子节点的连接。\n"
@@ -172,6 +186,7 @@ def build_ai_assistant_prompt(context: str, user_message: str, history: list[AiC
         "每个画布都有自己的规则记忆。当前画布规则记忆是高权重上下文，生成与迭代必须优先遵守；"
         "当用户说“记住、规则、以后都按、这个画布要遵守”等内容时，应优先输出 update_canvas_rules 动作写入当前画布规则。\n\n"
         "当需要创建或更新节点、蓝图组或当前画布规则时，请在自然语言回复后追加一个严格 JSON 动作块，格式如下：\n"
+        f"{ai_canvas_tool_protocol_text()}\n"
         f"{AI_ACTION_BLOCK_START}\n"
         "{\n"
         '  "actions": [\n'
@@ -184,6 +199,7 @@ def build_ai_assistant_prompt(context: str, user_message: str, history: list[AiC
         '      "title": "节点标题",\n'
         '      "icon": "",\n'
         '      "template_id": "可选，通常留空以继承当前选中节点模板",\n'
+        '      "reference_node_id": "可选，迭代当前画布同类节点时填写参考节点id",\n'
         '      "node_type": "普通",\n'
         '      "x": null,\n'
         '      "y": null,\n'
@@ -209,6 +225,22 @@ def build_ai_assistant_prompt(context: str, user_message: str, history: list[AiC
         "      ]\n"
         "    },\n"
         "    {\n"
+        '      "type": "create_edge",\n'
+        '      "source_node_id": "源节点或蓝图组id",\n'
+        '      "target_node_id": "目标节点或蓝图组id",\n'
+        '      "label": "可选短文本"\n'
+        "    },\n"
+        "    {\n"
+        '      "type": "update_edge_label",\n'
+        '      "edge_id": "edge_xxx",\n'
+        '      "label": "可留空以清除连线文本"\n'
+        "    },\n"
+        "    {\n"
+        '      "type": "search_nodes",\n'
+        '      "query": "史莱姆",\n'
+        '      "limit": 8\n'
+        "    },\n"
+        "    {\n"
         '      "type": "update_node",\n'
         '      "node_id": "node_xxx",\n'
         '      "title": "可选新标题",\n'
@@ -219,10 +251,13 @@ def build_ai_assistant_prompt(context: str, user_message: str, history: list[AiC
         "  ]\n"
         "}\n"
         f"{AI_ACTION_BLOCK_END}\n\n"
-        "动作块要求：只使用 create_node、update_node、create_group 或 update_canvas_rules；create_group 的 nodes 只放 create_node；"
+        "动作块要求：只使用内部画布工具层列出的工具；create_group 的 nodes 只放 create_node；"
         "update_canvas_rules 只写入当前画布规则，rules 必须是完整合并后的规则文本，不要只写增量片段；"
         "update_node 必须使用上下文中真实存在的 node_id；"
+        "create_edge 必须使用当前画布真实节点或蓝图组 id，update_edge_label 必须使用真实 edge_id；"
+        "query_canvas、search_nodes、validate_actions 是只读工具；需要实际改画布时不要只输出只读工具。\n"
         "字段 data_type 优先用 文本、长文本、整数、数字、布尔、枚举、日期、资源路径；"
+        "迭代已有同类节点时不要改字段结构、节点尺寸或视觉布局，除非用户明确要求改模板；"
         "普通默认节点不要生成图标，也不要拆出多个字段，除非用户明确要求复杂模板或当前选中节点已有模板；"
         "基于选中节点生成子节点时不要手写右上角坐标，除非用户明确要求固定位置；"
         "如果是迭代新节点或新蓝图组，请直接输出动作块；如果用户只是咨询，不要输出动作块。\n\n"
@@ -344,7 +379,15 @@ def parse_ai_canvas_actions(text: str) -> list[AiCanvasAction]:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise ValueError(f"无法解析 AI 画布动作 JSON：{exc}") from exc
-    items = data.get("actions") if isinstance(data, dict) else data
+    items = None
+    if isinstance(data, dict):
+        items = data.get("actions")
+        if items is None:
+            items = data.get("tool_calls")
+        if items is None:
+            items = data.get("tools")
+    else:
+        items = data
     if not isinstance(items, list):
         raise ValueError("AI 画布动作必须是列表，或包含 actions 列表的对象。")
     actions: list[AiCanvasAction] = []
@@ -372,6 +415,17 @@ def describe_ai_canvas_actions(actions: list[AiCanvasAction]) -> list[str]:
             lines.append(f"创建蓝图组：{action.title or '未命名蓝图组'}{node_text}")
         elif action.type == "update_canvas_rules":
             lines.append("写入当前画布规则记忆")
+        elif action.type == "create_edge":
+            lines.append(f"创建连线：{action.source_node_id or '未知源'} -> {action.target_node_id or '未知目标'}")
+        elif action.type == "update_edge_label":
+            target = action.edge_id or f"{action.source_node_id}->{action.target_node_id}"
+            lines.append(f"更新连线文本：{target}")
+        elif action.type == "query_canvas":
+            lines.append("查询当前画布")
+        elif action.type == "search_nodes":
+            lines.append(f"搜索节点：{action.query or '空'}")
+        elif action.type == "validate_actions":
+            lines.append("校验画布工具调用")
     return lines
 
 
@@ -391,6 +445,7 @@ def _extract_json_text(text: str) -> str:
 
 
 def _ai_canvas_action_from_dict(raw: dict[str, Any]) -> AiCanvasAction | None:
+    raw = _normalized_action_raw(raw)
     action_type = str(raw.get("type") or "").strip()
     if action_type not in AI_CANVAS_ACTION_TYPES:
         return None
@@ -405,6 +460,7 @@ def _ai_canvas_action_from_dict(raw: dict[str, Any]) -> AiCanvasAction | None:
         node_id=str(raw.get("node_id") or "").strip(),
         rules=str(raw.get("rules") or raw.get("content") or "").strip(),
         template_id=str(raw.get("template_id") or "").strip(),
+        reference_node_id=str(raw.get("reference_node_id") or raw.get("reference_id") or "").strip(),
         icon=str(raw.get("icon") or "").strip()[:4],
         node_type=node_type,
         x=_optional_number(raw.get("x")),
@@ -413,9 +469,44 @@ def _ai_canvas_action_from_dict(raw: dict[str, Any]) -> AiCanvasAction | None:
         height=_optional_number(raw.get("height")),
         color=str(raw.get("color") or "").strip(),
         group_id=str(raw.get("group_id") or "").strip(),
+        source_node_id=str(raw.get("source_node_id") or raw.get("source_id") or raw.get("source") or "").strip(),
+        target_node_id=str(raw.get("target_node_id") or raw.get("target_id") or raw.get("target") or "").strip(),
+        edge_id=str(raw.get("edge_id") or "").strip(),
+        label=str(raw.get("label") or raw.get("text") or "").strip(),
+        style=str(raw.get("style") or "").strip(),
+        query=str(raw.get("query") or raw.get("keyword") or "").strip(),
+        limit=max(1, min(50, int(_optional_number(raw.get("limit")) or 12))),
+        include_nodes=bool(raw.get("include_nodes", False)),
+        include_edges=bool(raw.get("include_edges", False)),
         fields=fields,
         nodes=nodes,
     )
+
+
+def _normalized_action_raw(raw: dict[str, Any]) -> dict[str, Any]:
+    function = raw.get("function")
+    if isinstance(function, dict):
+        arguments = function.get("arguments")
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except json.JSONDecodeError:
+                arguments = {}
+        normalized = dict(arguments) if isinstance(arguments, dict) else {}
+        normalized.setdefault("type", function.get("name") or raw.get("name") or raw.get("type"))
+        return normalized
+    action_type = raw.get("type") or raw.get("name") or raw.get("tool")
+    arguments = raw.get("arguments")
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            arguments = {}
+    if isinstance(arguments, dict):
+        normalized = dict(arguments)
+        normalized.setdefault("type", action_type)
+        return normalized
+    return raw
 
 
 def _ai_canvas_nodes_from_raw(raw: Any) -> list[AiCanvasAction]:
@@ -577,6 +668,7 @@ def _node_summary(node: Node, project: ProjectData | None = None, *, detailed: b
     summary = (
         f"{node.title} ({node.id}), 类型 {node.normalized_node_type()}, "
         f"图标 {node.display_icon() or '无'}, 位置 ({node.x:.0f}, {node.y:.0f})"
+        f", 尺寸 ({node.width:.0f}x{node.height:.0f})"
         f"{template_text}{lock_text}"
     )
     if node.group_id:
@@ -684,7 +776,14 @@ def _field_summary(raw: dict[str, Any]) -> str:
     value = value.replace("\n", " ").strip()
     if len(value) > 48:
         value = f"{value[:45]}..."
-    return f"{name}/{data_type}={value or '空'}"
+    layout = ""
+    width = _optional_number(raw.get("width"))
+    height = _optional_number(raw.get("height"))
+    if width is not None and height is not None and width > 0 and height > 0:
+        x = _optional_number(raw.get("x")) or 0.0
+        y = _optional_number(raw.get("y")) or 0.0
+        layout = f", 布局({x:.0f},{y:.0f},{width:.0f}x{height:.0f})"
+    return f"{name}/{data_type}={value or '空'}{layout}"
 
 
 def _edge_summary(edge: Edge, canvas: CanvasData) -> str:
