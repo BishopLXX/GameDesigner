@@ -17,6 +17,11 @@ PROJECT_BUNDLE_SUFFIX = ".files"
 CANVASES_DIR = "canvases"
 TEMPLATES_FILE = "templates.json"
 WINDOW_LAYOUTS_FILE = "window_layouts.json"
+AI_REASONING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh"]
+
+
+def _normalized_ai_reasoning_effort(value: str) -> str:
+    return value if value in AI_REASONING_EFFORTS else "xhigh"
 
 
 @dataclass
@@ -28,6 +33,7 @@ class AppSettings:
     last_edge_style: str = "curve"
     ai_provider: str = "codex"
     ai_model: str = "gpt-5.4"
+    ai_reasoning_effort: str = "xhigh"
     ai_auth_mode: str = "official"
     ai_api_key: str = ""
     ai_base_url: str = ""
@@ -47,6 +53,7 @@ class AppSettings:
             "last_edge_style": self.last_edge_style,
             "ai_provider": self.ai_provider,
             "ai_model": self.ai_model,
+            "ai_reasoning_effort": self.ai_reasoning_effort,
             "ai_auth_mode": self.ai_auth_mode,
             "ai_api_key": self.ai_api_key,
             "ai_base_url": self.ai_base_url,
@@ -69,6 +76,7 @@ class AppSettings:
         ai_provider = str(raw.get("ai_provider", "codex") or "codex")
         if ai_provider not in {"codex", "claude"}:
             ai_provider = "codex"
+        ai_reasoning_effort = _normalized_ai_reasoning_effort(str(raw.get("ai_reasoning_effort", "xhigh") or "xhigh"))
         ai_auth_mode = str(raw.get("ai_auth_mode", "official") or "official")
         if ai_auth_mode not in {"official", "api_key"}:
             ai_auth_mode = "official"
@@ -80,6 +88,7 @@ class AppSettings:
             last_edge_style=last_edge_style,
             ai_provider=ai_provider,
             ai_model=str(raw.get("ai_model", "gpt-5.4") or "gpt-5.4"),
+            ai_reasoning_effort=ai_reasoning_effort,
             ai_auth_mode=ai_auth_mode,
             ai_api_key=str(raw.get("ai_api_key", "")),
             ai_base_url=str(raw.get("ai_base_url", "")),

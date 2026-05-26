@@ -25,6 +25,8 @@
 - Iteration design creates variants, types, numbers, growth stages, unlocks, drops, balancing changes, and other structured extensions.
 - When reference nodes, canvas rules, notes, or existing canvas content are present, iteration must be based on the existing copywriting and content before extending or differentiating it.
 - When iterating a new color, type, stage, or variant and the canvas already has a same-kind node, use that existing node as the reference. Preserve its node size, field names, field count, visual card layout, and design logic; only change the variant-specific content.
+- When iterating a blueprint group, module, mod, or any same-kind group of nodes, treat the reference group as a structural blueprint. Preserve the group bounds, member count, member ordering, relative node positions, field names, field count, visual card layout, internal edge topology, edge labels, edge style, and manual route points unless the user explicitly asks to rearrange, redesign the layout, or change connections.
+- When a new blueprint group is based on an existing same-kind group, use the existing group as the reference and clone its structure first; only change variant-specific titles, copywriting, numbers, and naming. Do not flatten the reference into unrelated standalone nodes.
 - AI canvas mutations must go through the internal validated tool layer. Prefer explicit tool calls such as create_node, update_node, create_edge, update_edge_label, query_canvas, search_nodes, and validate_actions over ad hoc JSON.
 - Default normal nodes should use the Label node structure: a simple title, blank icon, and exactly one long-text description card.
 

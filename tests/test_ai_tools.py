@@ -13,6 +13,7 @@ from gamedesigner.ai_tools import (
     build_project_chat_prompt,
     invocation_with_last_message_output,
     load_project_chat_history,
+    load_project_chat_memory,
     parse_ai_canvas_actions,
     project_chat_history_path,
     qprocess_command,
@@ -44,6 +45,15 @@ class AiToolsTests(unittest.TestCase):
         self.assertIn("gpt-5.5", invocation.arguments)
         self.assertEqual(invocation.stdin, "hello")
         self.assertEqual(invocation.cwd, Path("D:/GameDesigner"))
+
+    def test_codex_invocation_includes_reasoning_effort_config(self) -> None:
+        settings = AppSettings(ai_provider="codex", ai_model="gpt-5.5", ai_reasoning_effort="medium")
+
+        invocation = build_ai_cli_invocation(settings, "hello", Path("D:/GameDesigner"))
+
+        self.assertIn("-c", invocation.arguments)
+        config_index = invocation.arguments.index("-c")
+        self.assertEqual(invocation.arguments[config_index + 1], 'model_reasoning_effort="medium"')
 
     def test_claude_invocation_can_pass_api_key_environment(self) -> None:
         settings = AppSettings(
@@ -253,6 +263,7 @@ class AiToolsTests(unittest.TestCase):
                 {
                   "type": "create_group",
                   "title": "冲刺流派",
+                  "reference_group_id": "group_reference",
                   "nodes": [
                     {
                       "type": "create_node",
@@ -286,8 +297,17 @@ class AiToolsTests(unittest.TestCase):
         self.assertEqual(actions[1].reference_node_id, "node_reference")
         self.assertEqual(actions[1].fields[0], AiCanvasFieldChange("内容信息", "长文本", "向前突进"))
         self.assertEqual(actions[2].title, "冲刺流派")
+        self.assertEqual(actions[2].reference_group_id, "group_reference")
         self.assertEqual(actions[2].nodes[0].title, "冲刺强化")
         self.assertEqual(actions[3].node_id, "node_a")
+
+    def test_ai_assistant_prompt_requires_blueprint_group_structure_cloning(self) -> None:
+        prompt = build_ai_assistant_prompt("当前画布: 主画布", "参考蓝图组继续迭代")
+
+        self.assertIn("结构蓝图来克隆", prompt)
+        self.assertIn("边界尺寸", prompt)
+        self.assertIn("内部连接拓扑", prompt)
+        self.assertIn("reference_group_id", prompt)
 
     def test_parse_ai_canvas_actions_supports_tool_calls_shape(self) -> None:
         actions = parse_ai_canvas_actions(
@@ -393,6 +413,24 @@ class AiToolsTests(unittest.TestCase):
             loaded = load_project_chat_history(project_path)
             self.assertEqual([message.role for message in loaded], ["user", "assistant"])
             self.assertEqual([message.content for message in loaded], ["你好", "在"])
+        finally:
+            shutil.rmtree(project_path.parent, ignore_errors=True)
+
+    def test_project_chat_memory_preserves_full_history_while_short_history_limits_visible_slice(self) -> None:
+        project_path = Path(self._testMethodName) / "MemoryProject.gdc"
+        messages = [AiChatMessage("user" if index % 2 == 0 else "assistant", f"消息{index}") for index in range(30)]
+        try:
+            save_project_chat_history(project_path, messages)
+
+            loaded_memory = load_project_chat_memory(project_path)
+            loaded_history = load_project_chat_history(project_path)
+
+            self.assertEqual(len(loaded_memory), 30)
+            self.assertEqual(len(loaded_history), 24)
+            self.assertEqual(loaded_memory[0].content, "消息0")
+            self.assertEqual(loaded_memory[-1].content, "消息29")
+            self.assertEqual(loaded_history[0].content, "消息6")
+            self.assertEqual(loaded_history[-1].content, "消息29")
         finally:
             shutil.rmtree(project_path.parent, ignore_errors=True)
 

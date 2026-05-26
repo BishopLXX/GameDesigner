@@ -188,6 +188,7 @@ class AppEditingTests(unittest.TestCase):
                 export_dir=str(Path(folder) / "exports"),
                 ai_provider="codex",
                 ai_model="gpt-5.5",
+                ai_reasoning_effort="high",
                 ai_auth_mode="api_key",
                 ai_api_key="paid-secret",
                 ai_base_url="https://api.example.test/v1",
@@ -205,11 +206,29 @@ class AppEditingTests(unittest.TestCase):
 
                 self.assertEqual(reopened.result(), QDialog.Accepted)
                 self.assertEqual(settings.ai_model, "gpt-5.5")
+                self.assertEqual(settings.ai_reasoning_effort, "high")
                 self.assertEqual(settings.ai_auth_mode, "api_key")
                 self.assertEqual(settings.ai_api_key, "paid-secret")
                 self.assertEqual(settings.ai_base_url, "https://api.example.test/v1")
                 self.assertEqual(reopened.free_model_combo.currentData(), "")
                 reopened.deleteLater()
+
+    def test_ai_settings_dialog_persists_reasoning_effort(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            settings = AppSettings(workspace_dir=folder, export_dir=str(Path(folder) / "exports"))
+            with mock.patch.dict(os.environ, {"APPDATA": folder}):
+                save_settings(settings)
+                dialog = AiSettingsDialog(None, settings)
+                index = dialog.reasoning_combo.findData("low")
+                self.assertGreaterEqual(index, 0)
+                dialog.reasoning_combo.setCurrentIndex(index)
+
+                dialog._save()
+
+                self.assertEqual(settings.ai_reasoning_effort, "low")
+                loaded = load_settings()
+                self.assertEqual(loaded.ai_reasoning_effort, "low")
+                dialog.deleteLater()
 
     def test_ai_settings_dialog_shows_no_free_model_for_own_api_key(self) -> None:
         settings = AppSettings(
@@ -269,6 +288,30 @@ class AppEditingTests(unittest.TestCase):
             loaded = load_project_chat_history(project_path)
             self.assertEqual([message.content for message in loaded], ["上一轮", "上一答"])
             self.assertEqual([message.content for message in panel._history], ["上一轮", "上一答"])
+            panel.deleteLater()
+
+    def test_ai_memory_dialog_loads_full_history_and_supports_earlier_pages(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "MemoryProject.gdc"
+            messages = [AiChatMessage("user" if index % 2 == 0 else "assistant", f"消息{index}") for index in range(45)]
+            save_project_chat_history(project_path, messages)
+
+            panel = AiChatPanel(
+                None,
+                AppSettings(ai_provider="codex", ai_model="gpt-5.4"),
+                lambda: ("项目上下文", project_path.parent, project_path),
+            )
+            panel._open_memory_view()
+
+            dialog = panel._memory_dialog
+            self.assertIsNotNone(dialog)
+            self.assertIn("消息44", dialog.memory_view.toPlainText())
+            self.assertNotIn("消息0", dialog.memory_view.toPlainText())
+
+            dialog.load_previous_page()
+
+            self.assertIn("消息0", dialog.memory_view.toPlainText())
+            self.assertIn("消息44", dialog.memory_view.toPlainText())
             panel.deleteLater()
 
     def test_ai_panel_activity_log_and_busy_state_are_visible(self) -> None:
@@ -650,6 +693,75 @@ class AppEditingTests(unittest.TestCase):
         self.assertEqual([node.title for node in created_nodes], ["迭代节点A", "迭代节点B"])
         self.assertEqual(page.canvas.selected_node_ids, {node.id for node in created_nodes})
         self.assertEqual(page.canvas.selected_group_ids, {created_group.id})
+        window.deleteLater()
+
+    def test_ai_create_group_with_reference_group_clones_structure_and_internal_edges(self) -> None:
+        window = GameDesignerApp()
+        project = ProjectData(name="AI蓝图组结构克隆")
+        project.ensure_canvas_structure()
+        canvas = project.root_canvas()
+        reference_group = canvas.add_group(BlueprintGroup(title="基础攻击模块", x=120, y=140, width=720, height=360))
+        reference_a = canvas.add_node(
+            Node(
+                title="攻击起手",
+                group_id=reference_group.id,
+                x=160,
+                y=200,
+                width=260,
+                height=120,
+                fields=[NodeField("内容信息", "长文本", "起手动作")],
+            )
+        )
+        reference_b = canvas.add_node(
+            Node(
+                title="攻击收尾",
+                group_id=reference_group.id,
+                x=460,
+                y=200,
+                width=260,
+                height=120,
+                fields=[NodeField("内容信息", "长文本", "收尾动作")],
+            )
+        )
+        canvas.add_edge(reference_a.id, reference_b.id)
+        page = window._add_page(project, None, dirty=False, canvas_data=canvas)
+        window.tabs.setCurrentWidget(page)
+        page.canvas.select_group(reference_group.id)
+
+        window._apply_ai_canvas_actions(
+            [
+                AiCanvasAction(
+                    type="create_group",
+                    title="基础防御模块",
+                    reference_group_id=reference_group.id,
+                    nodes=[
+                        AiCanvasAction(
+                            type="create_node",
+                            title="防御起手",
+                            fields=[AiCanvasFieldChange("内容信息", "长文本", "起手防御动作")],
+                        ),
+                        AiCanvasAction(
+                            type="create_node",
+                            title="防御收尾",
+                            fields=[AiCanvasFieldChange("内容信息", "长文本", "收尾防御动作")],
+                        ),
+                    ],
+                )
+            ]
+        )
+
+        created_group = next(group for group in canvas.groups if group.id != reference_group.id)
+        created_nodes = [node for node in canvas.nodes if node.group_id == created_group.id]
+        created_edges = [edge for edge in canvas.edges if edge.source in {node.id for node in created_nodes} and edge.target in {node.id for node in created_nodes}]
+        self.assertEqual(created_group.width, reference_group.width)
+        self.assertEqual(created_group.height, reference_group.height)
+        self.assertEqual([node.title for node in created_nodes], ["防御起手", "防御收尾"])
+        self.assertEqual(
+            [(round(node.x - created_group.x), round(node.y - created_group.y)) for node in created_nodes],
+            [(round(reference_a.x - reference_group.x), round(reference_a.y - reference_group.y)), (round(reference_b.x - reference_group.x), round(reference_b.y - reference_group.y))],
+        )
+        self.assertEqual(len(created_edges), 1)
+        self.assertEqual((created_edges[0].source, created_edges[0].target), (created_nodes[0].id, created_nodes[1].id))
         window.deleteLater()
 
     def test_ai_canvas_actions_can_write_current_canvas_rules_memory(self) -> None:
