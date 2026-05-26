@@ -35,6 +35,7 @@ from ..ai_presets import (
     free_model_preset_by_key,
 )
 from ..ai_tools import (
+    AI_REASONING_EFFORTS,
     AI_MODEL_PRESETS,
     AiCanvasAction,
     AiChatMessage,
@@ -42,7 +43,7 @@ from ..ai_tools import (
     build_ai_assistant_prompt,
     describe_ai_canvas_actions,
     invocation_with_last_message_output,
-    load_project_chat_history,
+    load_project_chat_memory,
     process_environment,
     qprocess_command,
     save_project_chat_history,
@@ -51,6 +52,116 @@ from ..ai_tools import (
 from ..storage import AppSettings, save_settings
 from ..window_layouts import restore_window_layout, save_window_layout
 from .submit_text_edit import SubmitPlainTextEdit
+
+
+AI_MEMORY_PAGE_SIZE = 30
+
+
+class AiMemoryDialog(QDialog):
+    def __init__(self, parent: QWidget | None, project_path: Path, messages: list[AiChatMessage]) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("AI 记忆")
+        self.setModal(False)
+        self.project_path = project_path
+        self.messages = list(messages)
+        self._loaded_from = len(self.messages)
+        self._loading_previous = False
+
+        self.summary_label = QLabel()
+        self.summary_label.setObjectName("mutedLabel")
+        self.summary_label.setWordWrap(True)
+
+        self.load_previous_button = QPushButton("加载更早")
+        self.load_previous_button.clicked.connect(self.load_previous_page)
+
+        self.memory_view = QTextBrowser()
+        self.memory_view.setOpenExternalLinks(False)
+        self.memory_view.verticalScrollBar().valueChanged.connect(self._maybe_load_previous)
+
+        close_button = QPushButton("关闭")
+        close_button.clicked.connect(self.accept)
+
+        top_row = QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
+        top_row.addWidget(self.summary_label, 1)
+        top_row.addWidget(self.load_previous_button)
+
+        buttons = QHBoxLayout()
+        buttons.setContentsMargins(0, 0, 0, 0)
+        buttons.addStretch(1)
+        buttons.addWidget(close_button)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 16)
+        layout.setSpacing(12)
+        layout.addLayout(top_row)
+        layout.addWidget(self.memory_view, 1)
+        layout.addLayout(buttons)
+        self.resize(760, 620)
+        restore_window_layout(self, "ai_memory_dialog")
+        self.load_previous_page(scroll_to_bottom=True)
+
+    def load_previous_page(self, *, scroll_to_bottom: bool = False) -> None:
+        if self._loaded_from <= 0:
+            self._loaded_from = 0
+            self._render_loaded_messages()
+            bar = self.memory_view.verticalScrollBar()
+            if scroll_to_bottom:
+                bar.setValue(bar.maximum())
+            return
+        old_bar = self.memory_view.verticalScrollBar()
+        old_maximum = old_bar.maximum()
+        old_value = old_bar.value()
+        self._loaded_from = max(0, self._loaded_from - AI_MEMORY_PAGE_SIZE)
+        self._render_loaded_messages()
+        bar = self.memory_view.verticalScrollBar()
+        if scroll_to_bottom:
+            bar.setValue(bar.maximum())
+        else:
+            bar.setValue(max(0, old_value + bar.maximum() - old_maximum))
+
+    def _maybe_load_previous(self, value: int) -> None:
+        if value > 0 or self._loaded_from <= 0 or self._loading_previous:
+            return
+        self._loading_previous = True
+        try:
+            self.load_previous_page()
+        finally:
+            self._loading_previous = False
+
+    def _render_loaded_messages(self) -> None:
+        self.memory_view.clear()
+        loaded = self.messages[self._loaded_from :]
+        if not loaded:
+            self.memory_view.append("<p style='color:#8E8E93;'>当前项目还没有 AI 会话记忆。</p>")
+        for index, message in enumerate(loaded, start=self._loaded_from + 1):
+            speaker = "用户" if message.role == "user" else "AI"
+            color = "#E8E8EA" if message.role == "user" else "#CFE1FF"
+            content = self._html(message.content).replace(chr(10), "<br>")
+            self.memory_view.append(
+                f"<p><span style='color:#8E8E93;'>#{index}</span> "
+                f"<b style='color:{color};'>{speaker}</b><br>{content}</p>"
+            )
+        self._refresh_summary()
+
+    def _refresh_summary(self) -> None:
+        loaded_count = len(self.messages) - self._loaded_from
+        self.summary_label.setText(
+            f"工程：{self.project_path.name}    已显示 {loaded_count}/{len(self.messages)} 条"
+        )
+        self.load_previous_button.setEnabled(self._loaded_from > 0)
+
+    def _html(self, text: str) -> str:
+        return (
+            text.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+        )
+
+    def done(self, result: int) -> None:  # type: ignore[override]
+        save_window_layout(self, "ai_memory_dialog")
+        super().done(result)
 
 
 class AiSettingsDialog(QDialog):
@@ -69,6 +180,21 @@ class AiSettingsDialog(QDialog):
         self.model_combo.setEditable(True)
         self.model_combo.addItems(AI_MODEL_PRESETS)
         self.model_combo.setEditText(settings.ai_model or AI_MODEL_PRESETS[0])
+        self.model_combo.setToolTip("模型名会原样传给 CLI。必须是当前 Provider 支持的真实模型 ID，例如 gpt-5.5。")
+
+        self.reasoning_combo = QComboBox()
+        self.reasoning_combo.addItems([
+            "极快 / minimal",
+            "快速 / low",
+            "均衡 / medium",
+            "聪明 / high",
+            "最强 / xhigh",
+        ])
+        for index, effort in enumerate(AI_REASONING_EFFORTS):
+            self.reasoning_combo.setItemData(index, effort)
+        reasoning_index = self.reasoning_combo.findData(settings.ai_reasoning_effort)
+        self.reasoning_combo.setCurrentIndex(reasoning_index if reasoning_index >= 0 else self.reasoning_combo.findData("xhigh"))
+        self.reasoning_combo.setToolTip("Codex 的推理强度。模型名仍只填模型 ID，智能等级在这里单独设置。")
 
         self.free_model_combo = QComboBox()
         self.free_model_combo.addItem("不使用", "")
@@ -108,6 +234,7 @@ class AiSettingsDialog(QDialog):
         form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         form.addRow("工具", self.provider_combo)
         form.addRow("模型", self.model_combo)
+        form.addRow("智能等级", self.reasoning_combo)
         form.addRow("免费模型", self._free_model_row())
         form.addRow("快速切回", self._profile_row())
         form.addRow("认证", self._auth_row())
@@ -214,6 +341,7 @@ class AiSettingsDialog(QDialog):
             ai_connection_snapshot(
                 provider="codex",
                 model="gpt-5.4",
+                reasoning_effort=str(self.reasoning_combo.currentData() or "xhigh"),
                 auth_mode="official",
                 api_key="",
                 base_url="",
@@ -229,6 +357,7 @@ class AiSettingsDialog(QDialog):
             snapshot = ai_connection_snapshot(
                 provider=str(self.provider_combo.currentData() or "codex"),
                 model=self.model_combo.currentText().strip() or "gpt-5.4",
+                reasoning_effort=str(self.reasoning_combo.currentData() or "xhigh"),
                 auth_mode="api_key",
                 api_key="",
                 base_url="",
@@ -244,6 +373,7 @@ class AiSettingsDialog(QDialog):
         return ai_connection_snapshot(
             provider=str(self.provider_combo.currentData() or "codex"),
             model=self.model_combo.currentText().strip() or "gpt-5.4",
+            reasoning_effort=str(self.reasoning_combo.currentData() or "xhigh"),
             auth_mode="api_key" if self.api_key_radio.isChecked() else "official",
             api_key=self.api_key_edit.text().strip(),
             base_url=self.base_url_edit.text().strip(),
@@ -256,6 +386,7 @@ class AiSettingsDialog(QDialog):
     def _write_settings(self, snapshot: dict[str, str]) -> None:
         self.settings.ai_provider = snapshot["ai_provider"]
         self.settings.ai_model = snapshot["ai_model"] or "gpt-5.4"
+        self.settings.ai_reasoning_effort = snapshot.get("ai_reasoning_effort") or "xhigh"
         self.settings.ai_auth_mode = snapshot["ai_auth_mode"]
         self.settings.ai_api_key = snapshot["ai_api_key"]
         self.settings.ai_base_url = snapshot["ai_base_url"]
@@ -264,6 +395,8 @@ class AiSettingsDialog(QDialog):
         provider_index = self.provider_combo.findData(snapshot.get("ai_provider", "codex"))
         self.provider_combo.setCurrentIndex(provider_index if provider_index >= 0 else 0)
         self.model_combo.setEditText(snapshot.get("ai_model") or "gpt-5.4")
+        reasoning_index = self.reasoning_combo.findData(snapshot.get("ai_reasoning_effort") or "xhigh")
+        self.reasoning_combo.setCurrentIndex(reasoning_index if reasoning_index >= 0 else self.reasoning_combo.findData("xhigh"))
         self.api_key_edit.setText(snapshot.get("ai_api_key", ""))
         self.base_url_edit.setText(snapshot.get("ai_base_url", ""))
         if snapshot.get("ai_auth_mode") == "api_key":
@@ -373,6 +506,9 @@ class AiChatPanel(QWidget):
 
         self.settings_button = QPushButton("AI 设置")
         self.settings_button.clicked.connect(self._open_settings)
+        self.memory_button = QPushButton("查阅记忆")
+        self.memory_button.setToolTip("打开当前项目的 AI 会话记忆，向上滚动可继续加载更早内容")
+        self.memory_button.clicked.connect(self._open_memory_view)
         self.clear_button = QPushButton("清空屏幕")
         self.clear_button.setToolTip("只清空当前显示，不删除本项目的 AI 会话记忆")
         self.clear_button.clicked.connect(self._clear_screen)
@@ -387,6 +523,7 @@ class AiChatPanel(QWidget):
 
         tools = QHBoxLayout()
         tools.addWidget(self.settings_button)
+        tools.addWidget(self.memory_button)
         tools.addWidget(self.clear_button)
         tools.addStretch(1)
         tools.addWidget(self.cancel_button)
@@ -410,7 +547,10 @@ class AiChatPanel(QWidget):
         self._ensure_history_loaded()
 
     def _refresh_header(self) -> None:
-        self.header_label.setText(f"工具: {self.settings.ai_provider}    模型: {self.settings.ai_model or '未设置'}")
+        reasoning = getattr(self.settings, "ai_reasoning_effort", "xhigh") or "xhigh"
+        self.header_label.setText(
+            f"工具: {self.settings.ai_provider}    模型: {self.settings.ai_model or '未设置'}    智能: {reasoning}"
+        )
 
     def _start_activity(self, text: str) -> None:
         self._activity_base = text.strip() or "正在思考"
@@ -503,6 +643,7 @@ class AiChatPanel(QWidget):
                 f"已启动 {invocation.program} CLI",
                 f"工作目录: {invocation.cwd}",
                 f"模型: {self.settings.ai_model or '未设置'}",
+                f"智能等级: {getattr(self.settings, 'ai_reasoning_effort', 'xhigh') or 'xhigh'}",
                 f"图片附件: {len(attachments)}" if attachments else "",
             ],
             "运行状态",
@@ -691,7 +832,7 @@ class AiChatPanel(QWidget):
         return (
             "【迭代助手模式】\n"
             "用户是从当前画布的节点或蓝图组右键进入的。请优先基于当前选中对象迭代新内容。\n"
-            "如果选中节点有模板，新建节点必须沿用相同模板和字段结构；如果选中蓝图组，请可以参考其成员结构创建新的蓝图组和组内节点。\n"
+            "如果选中节点有模板，新建节点必须沿用相同模板和字段结构；如果选中蓝图组，请把它当作结构蓝图来克隆，新蓝图组必须优先继承成员顺序、相对位置、组内连线和字段结构。\n"
             "请在自然语言后输出动作块，让 GameDesigner 自动创建或更新画布内容。\n\n"
             f"用户输入：{message.strip()}"
         )
@@ -716,7 +857,7 @@ class AiChatPanel(QWidget):
         if self._history_project_path == project_path:
             return
         self._history_project_path = project_path
-        self._history = load_project_chat_history(project_path)
+        self._history = load_project_chat_memory(project_path)
         self._render_history()
 
     def _render_history(self) -> None:
@@ -725,15 +866,19 @@ class AiChatPanel(QWidget):
         if not self._history:
             self._append_system("当前项目还没有历史对话。")
             return
-        self._append_system(f"已载入 {len(self._history)} 条历史消息。")
-        for message in self._history:
+        visible_history = self._history[-24:]
+        hidden_count = max(0, len(self._history) - len(visible_history))
+        self._append_system(f"已载入 {len(self._history)} 条历史消息，当前显示最近 {len(visible_history)} 条。")
+        if hidden_count > 0:
+            self._append_system(f"更早的 {hidden_count} 条可通过“查阅记忆”打开查看。")
+        for message in visible_history:
             if message.role == "user":
                 self._append_user(message.content)
             else:
                 self._append_ai(message.content)
 
     def _trim_history(self) -> None:
-        self._history = self._history[-24:]
+        return
 
     def _save_history(self) -> None:
         if self._history_project_path is not None:
@@ -744,6 +889,19 @@ class AiChatPanel(QWidget):
         self._clear_activity_log()
         self._append_system("已清空当前屏幕显示，项目 AI 会话记忆仍保留。")
         self._pending_actions = []
+
+    def _open_memory_view(self) -> None:
+        try:
+            _context, _cwd, project_path = self.context_provider()
+        except ValueError as exc:
+            QMessageBox.information(self, "没有可用工程", str(exc))
+            return
+        memory = load_project_chat_memory(project_path)
+        dialog = AiMemoryDialog(self, project_path, memory)
+        self._memory_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
 
     def _html(self, text: str) -> str:
         return (

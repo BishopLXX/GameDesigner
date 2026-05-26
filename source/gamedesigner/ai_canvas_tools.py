@@ -43,7 +43,7 @@ AI_CANVAS_TOOL_SPECS: tuple[AiCanvasToolSpec, ...] = (
         "Create a blueprint group and optionally create nodes inside it.",
         True,
         required=("title",),
-        optional=("x", "y", "width", "height", "color", "nodes"),
+        optional=("reference_group_id", "x", "y", "width", "height", "color", "nodes"),
     ),
     AiCanvasToolSpec(
         "update_canvas_rules",

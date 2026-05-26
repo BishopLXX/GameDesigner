@@ -22,6 +22,7 @@ class AiConnectionPreset:
         return {
             "ai_provider": self.provider,
             "ai_model": self.model,
+            "ai_reasoning_effort": stored.get("ai_reasoning_effort", "xhigh"),
             "ai_auth_mode": self.auth_mode,
             "ai_api_key": api_key,
             "ai_base_url": self.base_url,
@@ -86,6 +87,7 @@ def ai_connection_snapshot(
     *,
     provider: str,
     model: str,
+    reasoning_effort: str,
     auth_mode: str,
     api_key: str,
     base_url: str,
@@ -93,6 +95,7 @@ def ai_connection_snapshot(
     return {
         "ai_provider": provider.strip() or "codex",
         "ai_model": model.strip(),
+        "ai_reasoning_effort": reasoning_effort.strip() or "xhigh",
         "ai_auth_mode": auth_mode.strip() or "official",
         "ai_api_key": api_key.strip(),
         "ai_base_url": base_url.strip(),
@@ -121,12 +124,16 @@ def clean_ai_connection_snapshot(raw: Any) -> dict[str, str]:
     provider = str(raw.get("ai_provider", "codex") or "codex")
     if provider not in {"codex", "claude"}:
         provider = "codex"
+    reasoning_effort = str(raw.get("ai_reasoning_effort", "xhigh") or "xhigh")
+    if reasoning_effort not in {"minimal", "low", "medium", "high", "xhigh"}:
+        reasoning_effort = "xhigh"
     auth_mode = str(raw.get("ai_auth_mode", "official") or "official")
     if auth_mode not in {"official", "api_key"}:
         auth_mode = "official"
     return ai_connection_snapshot(
         provider=provider,
         model=str(raw.get("ai_model", "") or ""),
+        reasoning_effort=reasoning_effort,
         auth_mode=auth_mode,
         api_key=str(raw.get("ai_api_key", "") or ""),
         base_url=str(raw.get("ai_base_url", "") or ""),

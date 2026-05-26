@@ -53,6 +53,7 @@ from .models import (
     EDGE_STYLES,
     BlueprintGroup,
     CanvasData,
+    Edge,
     Node,
     NodeField,
     NodeTemplate,
@@ -554,6 +555,7 @@ class GameDesignerApp(QMainWindow):
         self._project_histories: dict[int, ProjectHistory] = {}
         self._copied_nodes: list[dict[str, Any]] = []
         self._copied_groups: list[dict[str, Any]] = []
+        self._copied_edges: list[dict[str, Any]] = []
         self._paste_serial = 0
         self._last_edge_style = self.settings.last_edge_style if self.settings.last_edge_style in EDGE_STYLES else "curve"
         self._report_startup_progress(48, "准备字体和主题...")
@@ -2201,15 +2203,19 @@ class GameDesignerApp(QMainWindow):
         selected_ids = list(dict.fromkeys([*selected_ids, *group_node_ids]))
         nodes = [page.canvas_data.find_node(node_id) for node_id in selected_ids]
         copied = [node.to_dict() for node in nodes if node is not None]
+        copied_edges = self._copied_edges_for_selection(page, selected_ids, selected_group_ids)
         if not copied and not copied_groups:
             return
         self._copied_nodes = copied
         self._copied_groups = copied_groups
+        self._copied_edges = copied_edges
         self._paste_serial = 0
         if copied_groups and copied:
-            self.status.showMessage(f"已复制 {len(copied_groups)} 个蓝图组和 {len(copied)} 个节点", 2000)
+            edge_text = f"和 {len(copied_edges)} 条组内连线" if copied_edges else ""
+            self.status.showMessage(f"已复制 {len(copied_groups)} 个蓝图组、{len(copied)} 个节点{edge_text}", 2000)
         elif copied_groups:
-            self.status.showMessage(f"已复制 {len(copied_groups)} 个蓝图组", 2000)
+            edge_text = f"和 {len(copied_edges)} 条组内连线" if copied_edges else ""
+            self.status.showMessage(f"已复制 {len(copied_groups)} 个蓝图组{edge_text}", 2000)
         else:
             self.status.showMessage(f"已复制 {len(copied)} 个节点", 2000)
 
@@ -2220,6 +2226,7 @@ class GameDesignerApp(QMainWindow):
         offset = 40.0 * (self._paste_serial + 1)
         group_id_map: dict[str, str] = {}
         new_groups: list[BlueprintGroup] = []
+        new_group_edges: list[Edge] = []
         if not page.canvas_data.is_data_canvas():
             for raw in self._copied_groups:
                 group = self._clone_group_for_paste(raw, offset)
@@ -2248,10 +2255,15 @@ class GameDesignerApp(QMainWindow):
                 node.canvas_id = ""
                 node.link_path = ""
             new_nodes.append(node)
+        node_id_map = self._build_copied_node_id_map(self._copied_nodes, new_nodes)
+        if not page.canvas_data.is_data_canvas():
+            new_group_edges = self._clone_edges_for_paste(self._copied_edges, group_id_map, node_id_map, offset)
         for group in new_groups:
             page.canvas_data.add_group(group)
         for node in new_nodes:
             page.canvas_data.add_node(node)
+        for edge in new_group_edges:
+            page.canvas_data.edges.append(edge)
         if page.canvas_data.is_data_canvas():
             self._sync_canvas_state(page)
         self._paste_serial += 1
@@ -2279,6 +2291,64 @@ class GameDesignerApp(QMainWindow):
         group.x += offset
         group.y += offset
         return group
+
+    def _copied_edges_for_selection(
+        self,
+        page: ProjectPage,
+        selected_ids: list[str],
+        selected_group_ids: list[str],
+    ) -> list[dict[str, Any]]:
+        selected_node_ids = set(selected_ids)
+        selected_group_set = set(selected_group_ids)
+        selected_group_members = {
+            node.id
+            for node in page.canvas_data.nodes
+            if node.group_id in selected_group_set
+        }
+        selected_endpoints = selected_node_ids | selected_group_set | selected_group_members
+        return [
+            edge.to_dict()
+            for edge in page.canvas_data.valid_edges()
+            if edge.source in selected_endpoints and edge.target in selected_endpoints
+        ]
+
+    def _build_copied_node_id_map(self, copied_nodes: list[dict[str, Any]], new_nodes: list[Node]) -> dict[str, str]:
+        id_map: dict[str, str] = {}
+        for raw, node in zip(copied_nodes, new_nodes):
+            source_id = str(raw.get("id") or "")
+            if source_id:
+                id_map[source_id] = node.id
+        return id_map
+
+    def _clone_edges_for_paste(
+        self,
+        copied_edges: list[dict[str, Any]],
+        group_id_map: dict[str, str],
+        node_id_map: dict[str, str],
+        offset: float,
+    ) -> list[Edge]:
+        cloned_edges: list[Edge] = []
+        for raw in copied_edges:
+            edge = Edge.from_dict(copy.deepcopy(raw))
+            source = group_id_map.get(edge.source) or node_id_map.get(edge.source)
+            target = group_id_map.get(edge.target) or node_id_map.get(edge.target)
+            if not source or not target or source == target:
+                continue
+            edge.id = new_id("edge")
+            edge.source = source
+            edge.target = target
+            self._shift_edge_geometry(edge, offset, offset)
+            cloned_edges.append(edge)
+        return cloned_edges
+
+    def _shift_edge_geometry(self, edge: Edge, dx: float, dy: float) -> None:
+        if edge.orthogonal_bend_x is not None:
+            edge.orthogonal_bend_x += dx
+        if edge.orthogonal_bend_y is not None:
+            edge.orthogonal_bend_y += dy
+        for point in edge.orthogonal_route:
+            point["x"] = float(point.get("x", 0.0)) + dx
+            point["y"] = float(point.get("y", 0.0)) + dy
 
     def _clone_node_for_paste(self, raw: dict[str, Any], offset: float, preserve_field_ids: bool = False) -> Node:
         node = Node.from_dict(copy.deepcopy(raw))
@@ -2829,18 +2899,51 @@ class GameDesignerApp(QMainWindow):
                 updated_rules += 1
                 continue
             if action.type == "create_group":
-                group = self._group_from_ai_action(page, action, base, created_groups + 1)
-                page.canvas_data.add_group(group)
-                selected_group_ids.add(group.id)
-                created_groups += 1
-                group_base = QPointF(group.x + 32, group.y + 54)
-                for group_node_index, node_action in enumerate(action.nodes, start=1):
-                    node_action.group_id = group.id
-                    node = self._node_from_ai_action(page, node_action, group_base, group_node_index)
-                    node.group_id = group.id
-                    page.canvas_data.add_node(node)
-                    selected_ids.add(node.id)
-                    created += 1
+                reference_group = self._reference_group_for_ai_action(page, action)
+                reference_member_count = (
+                    len([node for node in page.canvas_data.nodes if node.group_id == reference_group.id])
+                    if reference_group is not None
+                    else 0
+                )
+                use_reference_group = bool(
+                    reference_group is not None
+                    and (
+                        str(getattr(action, "reference_group_id", "") or "").strip()
+                        or not action.nodes
+                        or len(action.nodes) == reference_member_count
+                    )
+                )
+                if use_reference_group:
+                    group, group_nodes, group_edges = self._create_group_from_reference(
+                        page,
+                        action,
+                        reference_group,
+                        base,
+                        created_groups + 1,
+                    )
+                    page.canvas_data.add_group(group)
+                    selected_group_ids.add(group.id)
+                    created_groups += 1
+                    for node in group_nodes:
+                        page.canvas_data.add_node(node)
+                        selected_ids.add(node.id)
+                        created += 1
+                    for edge in group_edges:
+                        page.canvas_data.edges.append(edge)
+                        created_edges += 1
+                else:
+                    group = self._group_from_ai_action(page, action, base, created_groups + 1)
+                    page.canvas_data.add_group(group)
+                    selected_group_ids.add(group.id)
+                    created_groups += 1
+                    group_base = QPointF(group.x + 32, group.y + 54)
+                    for group_node_index, node_action in enumerate(action.nodes, start=1):
+                        node_action.group_id = group.id
+                        node = self._node_from_ai_action(page, node_action, group_base, group_node_index)
+                        node.group_id = group.id
+                        page.canvas_data.add_node(node)
+                        selected_ids.add(node.id)
+                        created += 1
                 continue
             if action.type == "create_node":
                 create_index += 1
@@ -3285,6 +3388,34 @@ class GameDesignerApp(QMainWindow):
                 best = candidate
         return best[2] if best and best[0] >= 12 else None
 
+    def _reference_group_for_ai_action(self, page: ProjectPage, action: Any) -> BlueprintGroup | None:
+        reference_id = str(getattr(action, "reference_group_id", "") or "").strip()
+        if reference_id:
+            reference = page.canvas_data.find_group(reference_id)
+            if reference is not None:
+                return reference
+        selected_groups = [
+            group
+            for group in page.canvas_data.groups
+            if group.id in page.canvas.selected_group_ids
+        ]
+        if len(selected_groups) == 1:
+            return selected_groups[0]
+        target_title = str(getattr(action, "title", "") or "").strip()
+        if not target_title:
+            return None
+        best: tuple[int, BlueprintGroup] | None = None
+        for group in page.canvas_data.groups:
+            if group.title.strip() == target_title:
+                continue
+            score = self._semantic_reference_score(target_title, group.title)
+            if score <= 0:
+                continue
+            candidate = (score, group)
+            if best is None or candidate[0] > best[0]:
+                best = candidate
+        return best[1] if best and best[0] >= 12 else None
+
     def _semantic_reference_score(self, target_title: str, source_title: str) -> int:
         target_key = self._semantic_node_key(target_title)
         source_key = self._semantic_node_key(source_title)
@@ -3341,6 +3472,127 @@ class GameDesignerApp(QMainWindow):
         )
         self._apply_ai_fields_to_reference_node(node, action, reference)
         return node
+
+    def _create_group_from_reference(
+        self,
+        page: ProjectPage,
+        action: Any,
+        reference_group: BlueprintGroup,
+        base: QPointF,
+        index: int,
+    ) -> tuple[BlueprintGroup, list[Node], list[Edge]]:
+        reference_members = [node for node in page.canvas_data.nodes if node.group_id == reference_group.id]
+        member_id_map: dict[str, str] = {}
+        group = self._group_from_reference_group(page, action, reference_group, base, index)
+        node_lookup = {node.id: node for node in reference_members}
+        ordered_members = sorted(reference_members, key=lambda node: (node.order, node.y, node.x, node.title))
+        group_nodes: list[Node] = []
+        group_edges: list[Edge] = []
+        node_base = QPointF(group.x, group.y)
+        for member_index, reference_node in enumerate(ordered_members, start=1):
+            node_action = self._action_for_reference_group_member(action, reference_node, member_index)
+            node_action.group_id = group.id
+            rel_x = reference_node.x - reference_group.x
+            rel_y = reference_node.y - reference_group.y
+            node = self._node_from_reference_group_member(
+                page,
+                reference_node,
+                node_action,
+                node_base.x() + rel_x,
+                node_base.y() + rel_y,
+            )
+            node.group_id = group.id
+            member_id_map[reference_node.id] = node.id
+            group_nodes.append(node)
+        group_edges.extend(
+            self._clone_group_internal_edges(
+                reference_group,
+                member_id_map,
+                group.id,
+                page.canvas_data,
+                group.x - reference_group.x,
+                group.y - reference_group.y,
+            )
+        )
+        group.width = max(group.width, reference_group.width)
+        group.height = max(group.height, reference_group.height)
+        return group, group_nodes, group_edges
+
+    def _group_from_reference_group(
+        self,
+        page: ProjectPage,
+        action: Any,
+        reference_group: BlueprintGroup,
+        base: QPointF,
+        index: int,
+    ) -> BlueprintGroup:
+        x = action.x if action.x is not None else base.x() + ((index - 1) % 2) * (reference_group.width + 80.0)
+        y = action.y if action.y is not None else base.y() + ((index - 1) // 2) * (reference_group.height + 80.0)
+        return BlueprintGroup(
+            title=action.title or f"{reference_group.title} 迭代",
+            x=float(x),
+            y=float(y),
+            width=reference_group.width,
+            height=reference_group.height,
+            color=action.color or reference_group.color,
+        )
+
+    def _action_for_reference_group_member(self, action: Any, reference_node: Node, member_index: int) -> Any:
+        node_action = next((item for item in getattr(action, "nodes", []) if getattr(item, "title", "") == reference_node.title), None)
+        if node_action is not None:
+            return node_action
+        if member_index - 1 < len(getattr(action, "nodes", [])):
+            return action.nodes[member_index - 1]
+        from .ai_tools import AiCanvasFieldChange
+
+        return type(action)(
+            type="create_node",
+            title=reference_node.title,
+            fields=[AiCanvasFieldChange(field.name, field.data_type, field.value) for field in reference_node.fields],
+            group_id=getattr(action, "group_id", ""),
+        )
+
+    def _node_from_reference_group_member(
+        self,
+        page: ProjectPage,
+        reference_node: Node,
+        action: Any,
+        x: float,
+        y: float,
+    ) -> Node:
+        node = self._node_from_reference_for_ai_action(reference_node, action, x, y)
+        node.width = reference_node.width or node.width
+        node.height = reference_node.height or node.height
+        node.color = action.color or reference_node.color
+        return node
+
+    def _clone_group_internal_edges(
+        self,
+        reference_group: BlueprintGroup,
+        member_id_map: dict[str, str],
+        new_group_id: str,
+        canvas: CanvasData,
+        dx: float,
+        dy: float,
+    ) -> list[Edge]:
+        member_ids = set(member_id_map)
+        cloned_edges: list[Edge] = []
+        for edge in canvas.valid_edges():
+            if edge.source not in member_ids | {reference_group.id}:
+                continue
+            if edge.target not in member_ids | {reference_group.id}:
+                continue
+            source = member_id_map.get(edge.source, new_group_id)
+            target = member_id_map.get(edge.target, new_group_id)
+            if source == target:
+                continue
+            cloned = Edge.from_dict(edge.to_dict())
+            cloned.id = new_id("edge")
+            cloned.source = source
+            cloned.target = target
+            self._shift_edge_geometry(cloned, dx, dy)
+            cloned_edges.append(cloned)
+        return cloned_edges
 
     def _retarget_reference_icon(self, reference: Node, action: Any) -> str:
         if action.icon:

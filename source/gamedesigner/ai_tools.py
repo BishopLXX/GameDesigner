@@ -18,6 +18,7 @@ from .storage import AppSettings, project_bundle_dir
 
 AI_PROVIDERS = {"codex", "claude"}
 AI_AUTH_MODES = {"official", "api_key"}
+AI_REASONING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh"]
 AI_MODEL_PRESETS = [
     "gpt-5.4",
     "gpt-5.5",
@@ -40,7 +41,10 @@ AI_DESIGN_MODE_PROTOCOL = (
     "当用户说迭代、变体、类型、数值、成长、阶段、等级、倍率、掉落、解锁时，按迭代设计处理；"
     "迭代设计是在现有设计基础上生成数值、类型、阶段、成长或差异化版本。"
     "只要上下文里有参考节点、参考画布、便签、画布规则或现有内容，迭代必须基于这些文案和现有内容继续扩展，"
-    "不要脱离参考另起一套设定。\n"
+    "不要脱离参考另起一套设定。"
+    "当迭代蓝图组、模组、模块或一组节点时，迭代不仅是文案和数值变化，还必须默认保留参考对象的结构："
+    "蓝图组边界尺寸、成员节点相对位置、成员顺序、字段结构、视觉卡片布局和内部连接拓扑都要一并继承；"
+    "除非用户明确要求重排、改模板或改连接，否则只改变变体特有的标题、文案、数值和命名。\n"
 )
 
 
@@ -88,6 +92,7 @@ class AiCanvasAction:
     rules: str = ""
     template_id: str = ""
     reference_node_id: str = ""
+    reference_group_id: str = ""
     icon: str = ""
     node_type: str = "普通"
     x: float | None = None
@@ -117,11 +122,15 @@ def normalized_ai_auth_mode(value: str) -> str:
     return value if value in AI_AUTH_MODES else "official"
 
 
+def normalized_ai_reasoning_effort(value: str) -> str:
+    return value if value in AI_REASONING_EFFORTS else "xhigh"
+
+
 def project_chat_history_path(project_path: str | Path) -> Path:
     return project_bundle_dir(project_path) / AI_CHAT_DIR / AI_CHAT_HISTORY_FILE
 
 
-def load_project_chat_history(project_path: str | Path) -> list[AiChatMessage]:
+def load_project_chat_memory(project_path: str | Path) -> list[AiChatMessage]:
     path = project_chat_history_path(project_path)
     try:
         with path.open("r", encoding="utf-8") as file:
@@ -137,15 +146,23 @@ def load_project_chat_history(project_path: str | Path) -> list[AiChatMessage]:
         message = AiChatMessage.from_dict(item)
         if message is not None:
             messages.append(message)
-    return messages[-AI_CHAT_HISTORY_LIMIT:]
+    return messages
+
+
+def load_project_chat_history(project_path: str | Path, limit: int | None = AI_CHAT_HISTORY_LIMIT) -> list[AiChatMessage]:
+    messages = load_project_chat_memory(project_path)
+    if limit is None:
+        return messages
+    if limit <= 0:
+        return []
+    return messages[-limit:]
 
 
 def save_project_chat_history(project_path: str | Path, messages: list[AiChatMessage]) -> None:
     path = project_chat_history_path(project_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    trimmed = messages[-AI_CHAT_HISTORY_LIMIT:]
     with path.open("w", encoding="utf-8") as file:
-        json.dump([message.to_dict() for message in trimmed], file, ensure_ascii=False, indent=2)
+        json.dump([message.to_dict() for message in messages], file, ensure_ascii=False, indent=2)
 
 
 def build_project_chat_prompt(context: str, user_message: str, history: list[AiChatMessage] | None = None) -> str:
@@ -180,7 +197,11 @@ def build_ai_assistant_prompt(context: str, user_message: str, history: list[AiC
         "没有可继承模板的普通 create_node 默认使用 Label 节点结构：标题简洁、icon 留空、只保留一个长文本描述卡片。\n"
         "当用户要求基于当前选中节点创建子节点、下级节点、延伸节点或后续节点时，create_node 的 x/y 默认留空；"
         "GameDesigner 会把子节点放到父节点右侧并自动创建从父节点到子节点的连接。\n"
-        "如果用户要求参考某个蓝图组继续迭代，可以创建新的蓝图组，并在其中创建一批结构相近但内容迭代后的节点。\n"
+        "如果用户要求参考某个蓝图组继续迭代，必须把该蓝图组当作结构蓝图来克隆："
+        "新组的边界尺寸、成员节点数量、成员节点之间的相对位置、组内连线拓扑和字段布局都要默认沿用参考组；"
+        "只对变体内容、标题、数值、命名和必要的少量文案做差异化。"
+        "此时 create_group 必须填写 reference_group_id，组内 create_node 继续沿用参考组对应节点的字段结构和相对摆放逻辑；"
+        "如果确实要改结构，用户必须明确说“重排”“改布局”“改连接”或类似指令。\n"
         "你可以给出设计建议、文案、节点规划，也可以在用户要求改画布时输出可执行的画布动作。\n"
         "不要声称你自己直接改了工程文件；如果输出画布动作，GameDesigner 会在回复结束后自动应用到当前画布，不需要用户再点击确认。\n\n"
         "每个画布都有自己的规则记忆。当前画布规则记忆是高权重上下文，生成与迭代必须优先遵守；"
@@ -210,6 +231,7 @@ def build_ai_assistant_prompt(context: str, user_message: str, history: list[AiC
         "    {\n"
         '      "type": "create_group",\n'
         '      "title": "蓝图组标题",\n'
+        '      "reference_group_id": "可选，迭代蓝图组或模组时填写参考蓝图组id",\n'
         '      "x": null,\n'
         '      "y": null,\n'
         '      "width": 640,\n'
@@ -258,6 +280,8 @@ def build_ai_assistant_prompt(context: str, user_message: str, history: list[AiC
         "query_canvas、search_nodes、validate_actions 是只读工具；需要实际改画布时不要只输出只读工具。\n"
         "字段 data_type 优先用 文本、长文本、整数、数字、布尔、枚举、日期、资源路径；"
         "迭代已有同类节点时不要改字段结构、节点尺寸或视觉布局，除非用户明确要求改模板；"
+        "迭代蓝图组、模块或一组节点时，不要只复制标题和内容；默认必须保留参考组的边界尺寸、相对位置、成员顺序和组内连接结构；"
+        "只有用户明确要求重排、改布局或改连接时，才允许改变这些结构信息；"
         "普通默认节点不要生成图标，也不要拆出多个字段，除非用户明确要求复杂模板或当前选中节点已有模板；"
         "基于选中节点生成子节点时不要手写右上角坐标，除非用户明确要求固定位置；"
         "如果是迭代新节点或新蓝图组，请直接输出动作块；如果用户只是咨询，不要输出动作块。\n\n"
@@ -286,6 +310,7 @@ def _history_text(history: list[AiChatMessage]) -> str:
 def build_ai_cli_invocation(settings: AppSettings, prompt: str, cwd: str | Path) -> AiCliInvocation:
     provider = normalized_ai_provider(settings.ai_provider)
     model = settings.ai_model.strip() or ("opus" if provider == "claude" else "gpt-5.4")
+    reasoning_effort = normalized_ai_reasoning_effort(getattr(settings, "ai_reasoning_effort", "xhigh"))
     cwd_path = Path(cwd)
     environment: dict[str, str] = {}
     if normalized_ai_auth_mode(settings.ai_auth_mode) == "api_key":
@@ -318,6 +343,8 @@ def build_ai_cli_invocation(settings: AppSettings, prompt: str, cwd: str | Path)
             "read-only",
             "--color",
             "never",
+            "-c",
+            f'model_reasoning_effort="{reasoning_effort}"',
             "-m",
             model,
             "-",
@@ -461,6 +488,7 @@ def _ai_canvas_action_from_dict(raw: dict[str, Any]) -> AiCanvasAction | None:
         rules=str(raw.get("rules") or raw.get("content") or "").strip(),
         template_id=str(raw.get("template_id") or "").strip(),
         reference_node_id=str(raw.get("reference_node_id") or raw.get("reference_id") or "").strip(),
+        reference_group_id=str(raw.get("reference_group_id") or raw.get("reference_blueprint_group_id") or "").strip(),
         icon=str(raw.get("icon") or "").strip()[:4],
         node_type=node_type,
         x=_optional_number(raw.get("x")),
@@ -731,6 +759,12 @@ def _compact_note_text(value: str, limit: int) -> str:
 
 def _group_detail_lines(group: BlueprintGroup, canvas: CanvasData, project: ProjectData) -> list[str]:
     members = [node for node in canvas.nodes if node.group_id == group.id]
+    member_ids = {node.id for node in members}
+    internal_edges = [
+        edge
+        for edge in canvas.valid_edges()
+        if edge.source in member_ids | {group.id} and edge.target in member_ids | {group.id}
+    ]
     lines = [
         (
             f"- 蓝图组: {group.title} ({group.id}), 位置 ({group.x:.0f}, {group.y:.0f}), "
@@ -738,9 +772,20 @@ def _group_detail_lines(group: BlueprintGroup, canvas: CanvasData, project: Proj
         )
     ]
     for node in members[:12]:
-        lines.append(f"  - 组内节点: {_node_summary(node, project, detailed=True)}")
+        rel_x = node.x - group.x
+        rel_y = node.y - group.y
+        lines.append(
+            f"  - 组内节点: {_node_summary(node, project, detailed=True)}, "
+            f"相对位置 ({rel_x:.0f}, {rel_y:.0f})"
+        )
     if len(members) > 12:
         lines.append(f"  - ... 还有 {len(members) - 12} 个组内节点未列出")
+    if internal_edges:
+        lines.append("  - 组内连线:")
+        for edge in internal_edges[:16]:
+            lines.append(f"    - {_edge_summary(edge, canvas)}")
+        if len(internal_edges) > 16:
+            lines.append(f"    - ... 还有 {len(internal_edges) - 16} 条组内连线未列出")
     return lines
 
 
