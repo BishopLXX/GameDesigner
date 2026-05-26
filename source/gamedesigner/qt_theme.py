@@ -382,6 +382,29 @@ def stylesheet(name: str) -> str:
         background: {colors["control_hover"]};
         border-color: {colors["accent"]};
     }}
+    QLabel#aiImagePreview {{
+        background: {colors["panel_alt"]};
+        color: {colors["text_muted"]};
+        border: 1px solid {colors["hairline"]};
+        border-radius: 10px;
+    }}
+    QListWidget#aiImageReferenceList, QListWidget#aiImageOutputList {{
+        background: {colors["panel_alt"]};
+        color: {colors["text"]};
+        border: 1px solid {colors["hairline"]};
+        border-radius: 8px;
+        padding: 6px;
+        outline: 0;
+    }}
+    QListWidget#aiImageReferenceList::item, QListWidget#aiImageOutputList::item {{
+        border: 1px solid transparent;
+        border-radius: 7px;
+        padding: 4px;
+    }}
+    QListWidget#aiImageReferenceList::item:selected, QListWidget#aiImageOutputList::item:selected {{
+        background: {colors["control"]};
+        border-color: {colors["accent"]};
+    }}
     QWidget#nodePreviewPanel {{
         background: {colors["panel"]};
         border: 1px solid {colors["hairline"]};

@@ -1,7 +1,10 @@
+import os
 import shutil
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from gamedesigner.image_ai import AiImageError, build_ai_image_request
 from gamedesigner.ai_tools import (
     AI_ACTION_BLOCK_END,
     AI_ACTION_BLOCK_START,
@@ -35,6 +38,87 @@ from gamedesigner.storage import AppSettings
 
 
 class AiToolsTests(unittest.TestCase):
+    def test_ai_image_request_uses_official_base_url_and_model_settings(self) -> None:
+        settings = AppSettings(
+            ai_image_provider="openai",
+            ai_image_model="gpt-image-1.5",
+            ai_image_api_key="secret",
+            ai_image_base_url="https://ignored.example/v1",
+            ai_image_size="1024x1024",
+            ai_image_quality="high",
+            ai_image_background="transparent",
+            ai_image_count=2,
+            ai_image_output_format="webp",
+        )
+
+        request = build_ai_image_request(settings, "slime icon", [Path("D:/ref.png")])
+
+        self.assertEqual(request.base_url, "https://api.openai.com/v1")
+        self.assertEqual(request.model, "gpt-image-1.5")
+        self.assertEqual(request.size, "1024x1024")
+        self.assertEqual(request.quality, "high")
+        self.assertEqual(request.background, "transparent")
+        self.assertEqual(request.count, 2)
+        self.assertEqual(request.output_format, "webp")
+        self.assertEqual(request.reference_paths, [Path("D:/ref.png")])
+
+    def test_ai_image_request_uses_compatible_base_url(self) -> None:
+        settings = AppSettings(
+            ai_image_provider="compatible",
+            ai_image_model="custom-image-model",
+            ai_image_api_key="secret",
+            ai_image_base_url="https://images.example.test/v1/",
+        )
+
+        request = build_ai_image_request(settings, "asset")
+
+        self.assertEqual(request.base_url, "https://images.example.test/v1")
+        self.assertEqual(request.model, "custom-image-model")
+
+    def test_ai_image_request_adds_v1_to_compatible_root_base_url(self) -> None:
+        settings = AppSettings(
+            ai_image_provider="compatible",
+            ai_image_model="gpt-image-2",
+            ai_image_api_key="secret",
+            ai_image_base_url="https://www.packyapi.com",
+        )
+
+        request = build_ai_image_request(settings, "asset")
+
+        self.assertEqual(request.base_url, "https://www.packyapi.com/v1")
+
+    def test_ai_image_request_requires_api_key(self) -> None:
+        settings = AppSettings(ai_image_api_key="")
+
+        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": ""}):
+            with self.assertRaises(AiImageError):
+                build_ai_image_request(settings, "asset")
+
+    def test_app_settings_roundtrip_ai_image_settings(self) -> None:
+        settings = AppSettings(
+            ai_image_provider="compatible",
+            ai_image_model="gpt-image-2",
+            ai_image_api_key="image-key",
+            ai_image_base_url="https://images.example.test/v1",
+            ai_image_size="1536x1024",
+            ai_image_quality="medium",
+            ai_image_background="opaque",
+            ai_image_count=3,
+            ai_image_output_format="jpeg",
+        )
+
+        loaded = AppSettings.from_dict(settings.to_dict())
+
+        self.assertEqual(loaded.ai_image_provider, "compatible")
+        self.assertEqual(loaded.ai_image_model, "gpt-image-2")
+        self.assertEqual(loaded.ai_image_api_key, "image-key")
+        self.assertEqual(loaded.ai_image_base_url, "https://images.example.test/v1")
+        self.assertEqual(loaded.ai_image_size, "1536x1024")
+        self.assertEqual(loaded.ai_image_quality, "medium")
+        self.assertEqual(loaded.ai_image_background, "opaque")
+        self.assertEqual(loaded.ai_image_count, 3)
+        self.assertEqual(loaded.ai_image_output_format, "jpeg")
+
     def test_codex_invocation_uses_model_cwd_and_stdin_prompt(self) -> None:
         settings = AppSettings(ai_provider="codex", ai_model="gpt-5.5")
 

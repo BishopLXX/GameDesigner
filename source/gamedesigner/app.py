@@ -685,6 +685,9 @@ class GameDesignerApp(QMainWindow):
         self.ai_chat_action.setShortcut(QKeySequence("Ctrl+Shift+A"))
         self.ai_chat_action.triggered.connect(self._open_ai_chat)
 
+        self.ai_image_action = QAction("AI 生图助手...", self)
+        self.ai_image_action.triggered.connect(self._open_ai_image_assistant)
+
         self.canvas_notes_action = QAction("画布便签...", self)
         self.canvas_notes_action.triggered.connect(self._open_canvas_notes)
 
@@ -749,6 +752,7 @@ class GameDesignerApp(QMainWindow):
 
         self.ai_menu = QMenu("AI", self)
         self.ai_menu.addAction(self.ai_chat_action)
+        self.ai_menu.addAction(self.ai_image_action)
         self.ai_menu.addAction(self.canvas_notes_action)
         self.ai_menu.addAction(self.ai_settings_action)
 
@@ -770,8 +774,15 @@ class GameDesignerApp(QMainWindow):
         notes_button.setToolTip("当前画布便签")
         notes_button.setAutoRaise(True)
         notes_button.clicked.connect(self._open_canvas_notes)
+        image_button = QToolButton(holder)
+        image_button.setObjectName("aiAssistantHandleButton")
+        image_button.setText("生图")
+        image_button.setToolTip("展开 AI 生图助手")
+        image_button.setAutoRaise(True)
+        image_button.clicked.connect(self._open_ai_image_assistant)
         layout.addStretch(1)
         layout.addWidget(button)
+        layout.addWidget(image_button)
         layout.addWidget(notes_button)
         layout.addStretch(1)
         return holder
@@ -2771,6 +2782,20 @@ class GameDesignerApp(QMainWindow):
 
     def _open_ai_chat(self) -> None:
         self._open_ai_assistant_panel()
+
+    def _open_ai_image_assistant(self) -> None:
+        from .ui.ai_image_panel import AiImagePanel
+
+        if not isinstance(self.ai_assistant_panel, AiImagePanel):
+            panel = AiImagePanel(self, self.settings, self._current_ai_project_context)
+            panel.collapseRequested.connect(self._collapse_ai_assistant)
+            self.ai_assistant_panel = panel
+            self.ai_assistant_stack.addWidget(panel)
+        self.ai_assistant_expanded = True
+        self.ai_assistant_stack.setFixedWidth(820)
+        self.ai_assistant_stack.setCurrentWidget(self.ai_assistant_panel)
+        self.ai_assistant_panel.show()
+        self.ai_assistant_panel.input.setFocus(Qt.OtherFocusReason)
 
     def _open_ai_iteration_assistant(self) -> None:
         panel = self._open_ai_assistant_panel()

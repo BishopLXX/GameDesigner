@@ -28,6 +28,7 @@ from gamedesigner.storage import (
 )
 from gamedesigner.ui.link_document_dialog import LinkDocumentDialog
 from gamedesigner.ui.ai_chat_dialog import AiChatPanel, AiSettingsDialog
+from gamedesigner.ui.ai_image_panel import AiImagePanel, AiImageSettingsDialog
 from gamedesigner.ui.node_preview_panel import NodePreviewPanel
 from gamedesigner.ui.submit_text_edit import SubmitPlainTextEdit
 
@@ -197,6 +198,46 @@ class AppEditingTests(unittest.TestCase):
         self.assertEqual(window.ai_assistant_stack.width(), 42)
         self.assertIs(window.ai_assistant_stack.currentWidget(), window.ai_assistant_collapsed)
         window.deleteLater()
+
+    def test_ai_image_assistant_lives_in_right_panel_with_model_selector(self) -> None:
+        window = GameDesignerApp()
+
+        window._open_ai_image_assistant()
+
+        self.assertTrue(window.ai_assistant_expanded)
+        self.assertIsInstance(window.ai_assistant_panel, AiImagePanel)
+        self.assertEqual(window.ai_assistant_stack.width(), 820)
+        self.assertEqual(window.ai_assistant_panel.model_combo.currentText(), window.settings.ai_image_model)
+
+        window._collapse_ai_assistant()
+
+        self.assertFalse(window.ai_assistant_expanded)
+        self.assertEqual(window.ai_assistant_stack.width(), 42)
+        window.deleteLater()
+
+    def test_ai_image_settings_dialog_persists_image_model_and_api(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            settings = AppSettings(workspace_dir=folder, export_dir=str(Path(folder) / "exports"))
+            with mock.patch.dict(os.environ, {"APPDATA": folder}):
+                save_settings(settings)
+                dialog = AiImageSettingsDialog(None, settings)
+                compatible_index = dialog.provider_combo.findData("compatible")
+                dialog.provider_combo.setCurrentIndex(compatible_index)
+                dialog.model_combo.setEditText("custom-image")
+                dialog.api_key_edit.setText("image-secret")
+                dialog.base_url_edit.setText("https://images.example.test/v1")
+                dialog.output_format_combo.setCurrentText("webp")
+
+                dialog._save()
+
+                self.assertEqual(settings.ai_image_provider, "compatible")
+                self.assertEqual(settings.ai_image_model, "custom-image")
+                self.assertEqual(settings.ai_image_api_key, "image-secret")
+                self.assertEqual(settings.ai_image_base_url, "https://images.example.test/v1")
+                self.assertEqual(settings.ai_image_output_format, "webp")
+                loaded = load_settings()
+                self.assertEqual(loaded.ai_image_model, "custom-image")
+                dialog.deleteLater()
 
     def test_ai_settings_dialog_one_click_uses_ollama_free_preset(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
