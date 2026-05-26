@@ -2794,6 +2794,8 @@ class GameDesignerApp(QMainWindow):
         self.ai_assistant_expanded = True
         self.ai_assistant_stack.setFixedWidth(820)
         self.ai_assistant_stack.setCurrentWidget(self.ai_assistant_panel)
+        if hasattr(self.ai_assistant_panel, "load_project_cache"):
+            self.ai_assistant_panel.load_project_cache()
         self.ai_assistant_panel.show()
         self.ai_assistant_panel.input.setFocus(Qt.OtherFocusReason)
 

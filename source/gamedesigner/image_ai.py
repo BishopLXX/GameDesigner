@@ -21,7 +21,7 @@ from .storage import AppSettings, project_bundle_dir
 
 AI_IMAGE_DIR = "ai_images"
 AI_IMAGE_REFERENCES_DIR = "references"
-AI_IMAGE_GENERATED_DIR = "generated"
+AI_IMAGE_CACHE_DIR = "cache"
 AI_IMAGE_MODEL_PRESETS = [
     "gpt-image-1.5",
     "chatgpt-image-latest",
@@ -76,7 +76,7 @@ class AiGeneratedImage:
 
 
 @dataclass(frozen=True)
-class SavedAiImage:
+class CachedAiImage:
     path: Path
     width: int
     height: int
@@ -173,23 +173,54 @@ def save_ai_image_reference_from_qimage(project_path: str | Path, image: QImage)
     return AiImageReference(path=path, width=image.width(), height=image.height())
 
 
-def save_generated_ai_image(
+def ai_image_cache_dir(project_path: str | Path) -> Path:
+    return project_bundle_dir(project_path) / AI_IMAGE_DIR / AI_IMAGE_CACHE_DIR
+
+
+def cache_generated_ai_image(
     project_path: str | Path,
     image: AiGeneratedImage,
     *,
     index: int = 1,
-) -> SavedAiImage:
-    folder = project_bundle_dir(project_path) / AI_IMAGE_DIR / AI_IMAGE_GENERATED_DIR
+) -> CachedAiImage:
+    folder = ai_image_cache_dir(project_path)
     folder.mkdir(parents=True, exist_ok=True)
     extension = _safe_output_extension(image.output_format)
-    path = folder / f"image_{_timestamp()}_{index}_{uuid.uuid4().hex[:8]}.{extension}"
+    path = folder / f"cache_{_timestamp()}_{index}_{uuid.uuid4().hex[:8]}.{extension}"
     path.write_bytes(image.data)
-    loaded = QImage(str(path))
-    return SavedAiImage(
-        path=path,
-        width=loaded.width() if not loaded.isNull() else 0,
-        height=loaded.height() if not loaded.isNull() else 0,
-        revised_prompt=image.revised_prompt,
+    return cached_ai_image_from_path(path, revised_prompt=image.revised_prompt)
+
+
+def load_cached_ai_images(project_path: str | Path, *, limit: int = 80) -> list[CachedAiImage]:
+    folder = ai_image_cache_dir(project_path)
+    if not folder.exists():
+        return []
+    paths = [
+        path
+        for path in folder.iterdir()
+        if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+    ]
+    paths.sort(key=lambda path: path.stat().st_mtime)
+    if limit > 0:
+        paths = paths[-limit:]
+    images: list[CachedAiImage] = []
+    for path in paths:
+        image = cached_ai_image_from_path(path)
+        if image.width > 0 and image.height > 0:
+            images.append(image)
+    return images
+
+
+def cached_ai_image_from_path(path: str | Path, *, revised_prompt: str = "") -> CachedAiImage:
+    image_path = Path(path)
+    loaded = QImage(str(image_path))
+    if loaded.isNull():
+        return CachedAiImage(path=image_path, width=0, height=0, revised_prompt=revised_prompt)
+    return CachedAiImage(
+        path=image_path,
+        width=loaded.width(),
+        height=loaded.height(),
+        revised_prompt=revised_prompt,
     )
 
 

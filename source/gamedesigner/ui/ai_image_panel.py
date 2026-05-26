@@ -36,12 +36,13 @@ from ..image_ai import (
     AiImageError,
     AiImageReference,
     AiImageRequest,
-    SavedAiImage,
+    CachedAiImage,
     build_ai_image_request,
+    cache_generated_ai_image,
     generate_ai_images,
+    load_cached_ai_images,
     save_ai_image_reference,
     save_ai_image_reference_from_qimage,
-    save_generated_ai_image,
 )
 from ..storage import AppSettings, save_settings
 from ..window_layouts import restore_window_layout, save_window_layout
@@ -180,14 +181,14 @@ class ImageGenerationThread(QThread):
     def run(self) -> None:  # type: ignore[override]
         try:
             images = generate_ai_images(self.request)
-            saved = [
-                save_generated_ai_image(self.project_path, image, index=index)
+            cached = [
+                cache_generated_ai_image(self.project_path, image, index=index)
                 for index, image in enumerate(images, start=1)
             ]
         except Exception as exc:
             self.failed.emit(str(exc))
             return
-        self.succeeded.emit(saved)
+        self.succeeded.emit(cached)
 
 
 class AiImagePanel(QWidget):
@@ -204,7 +205,8 @@ class AiImagePanel(QWidget):
         self.settings = settings
         self.context_provider = context_provider
         self.references: list[AiImageReference] = []
-        self.generated_images: list[SavedAiImage] = []
+        self.cached_images: list[CachedAiImage] = []
+        self._cache_project_path: Path | None = None
         self._current_image_path: Path | None = None
         self._thread: ImageGenerationThread | None = None
 
@@ -293,9 +295,9 @@ class AiImagePanel(QWidget):
         self.save_button = QPushButton("保存为...")
         self.save_button.setEnabled(False)
         self.save_button.clicked.connect(self._save_current_image_as)
-        self.open_folder_button = QPushButton("打开目录")
+        self.open_folder_button = QPushButton("打开缓存")
         self.open_folder_button.setEnabled(False)
-        self.open_folder_button.clicked.connect(self._open_generated_folder)
+        self.open_folder_button.clicked.connect(self._open_cache_folder)
         self.clear_button = QPushButton("清屏")
         self.clear_button.clicked.connect(self._clear_screen)
         self.send_button = QPushButton("生成")
@@ -364,6 +366,7 @@ class AiImagePanel(QWidget):
         layout.addLayout(body, 1)
         self._append_system("准备就绪。")
         self._refresh_header()
+        self.load_project_cache()
 
     def _fill_combo(self, combo: QComboBox, values: list[str], current: str) -> None:
         combo.addItems(values)
@@ -421,15 +424,15 @@ class AiImagePanel(QWidget):
 
     def _generation_succeeded(self, saved_images: object) -> None:
         images = list(saved_images) if isinstance(saved_images, list) else []
-        typed_images = [image for image in images if isinstance(image, SavedAiImage)]
+        typed_images = [image for image in images if isinstance(image, CachedAiImage)]
         if not typed_images:
             self._append_system("生图服务没有返回可保存的图片。")
             return
-        self.generated_images.extend(typed_images)
+        self.cached_images.extend(typed_images)
         for image in typed_images:
             self._add_output_item(image)
         last = typed_images[-1]
-        self._append_ai(f"已生成 {len(typed_images)} 张图片，已保存到项目文件夹。")
+        self._append_ai(f"已生成 {len(typed_images)} 张图片，已放入生图缓存。")
         if last.revised_prompt:
             self._append_system(f"优化后的提示词：{last.revised_prompt}")
         self._select_generated_image(last.path)
@@ -443,14 +446,36 @@ class AiImagePanel(QWidget):
         self.send_button.setEnabled(True)
         self.send_button.setText("生成")
 
-    def _add_output_item(self, image: SavedAiImage) -> None:
+    def load_project_cache(self) -> None:
+        try:
+            _context, _cwd, project_path = self.context_provider()
+        except ValueError:
+            return
+        if self._cache_project_path == project_path:
+            return
+        self._cache_project_path = project_path
+        self.output_list.clear()
+        self._current_image_path = None
+        self._render_current_preview()
+        self.save_button.setEnabled(False)
+        self.open_folder_button.setEnabled(False)
+        self.cached_images = load_cached_ai_images(project_path)
+        for image in self.cached_images:
+            self._add_output_item(image, select=False)
+        if self.cached_images:
+            self._select_generated_image(self.cached_images[-1].path)
+            self._append_system(f"已载入 {len(self.cached_images)} 张生图缓存。")
+
+    def _add_output_item(self, image: CachedAiImage, *, select: bool = True) -> None:
         item = QListWidgetItem(image.path.name)
         item.setData(Qt.UserRole, str(image.path))
+        item.setToolTip(str(image.path))
         pixmap = QPixmap(str(image.path))
         if not pixmap.isNull():
             item.setIcon(pixmap.scaled(74, 74, Qt.KeepAspectRatio, Qt.SmoothTransformation))
         self.output_list.addItem(item)
-        self.output_list.setCurrentItem(item)
+        if select:
+            self.output_list.setCurrentItem(item)
 
     def _select_output_item(self) -> None:
         item = self.output_list.currentItem()
@@ -576,7 +601,7 @@ class AiImagePanel(QWidget):
             return
         self._append_system(f"已保存：{target}")
 
-    def _open_generated_folder(self) -> None:
+    def _open_cache_folder(self) -> None:
         if self._current_image_path is not None:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._current_image_path.parent)))
 

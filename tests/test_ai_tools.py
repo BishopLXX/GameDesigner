@@ -1,10 +1,19 @@
+import base64
 import os
 import shutil
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from gamedesigner.image_ai import AiImageError, build_ai_image_request
+from gamedesigner.image_ai import (
+    AiGeneratedImage,
+    AiImageError,
+    ai_image_cache_dir,
+    build_ai_image_request,
+    cache_generated_ai_image,
+    load_cached_ai_images,
+)
 from gamedesigner.ai_tools import (
     AI_ACTION_BLOCK_END,
     AI_ACTION_BLOCK_START,
@@ -35,6 +44,12 @@ from gamedesigner.ai_presets import (
 )
 from gamedesigner.models import BlueprintGroup, CanvasData, DesignNote, Edge, Node, NodeField, ProjectData
 from gamedesigner.storage import AppSettings
+
+
+PNG_1X1 = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACXBIWXMAAA9hAAAPYQGoP6dp"
+    "AAAADUlEQVQImWP4z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="
+)
 
 
 class AiToolsTests(unittest.TestCase):
@@ -118,6 +133,18 @@ class AiToolsTests(unittest.TestCase):
         self.assertEqual(loaded.ai_image_background, "opaque")
         self.assertEqual(loaded.ai_image_count, 3)
         self.assertEqual(loaded.ai_image_output_format, "jpeg")
+
+    def test_ai_image_results_are_written_to_project_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "CacheProject.gdc"
+
+            cached = cache_generated_ai_image(project_path, AiGeneratedImage(PNG_1X1, "png"), index=1)
+            loaded = load_cached_ai_images(project_path)
+
+            self.assertTrue(cached.path.exists())
+            self.assertEqual(cached.path.parent, ai_image_cache_dir(project_path))
+            self.assertEqual(len(loaded), 1)
+            self.assertEqual(loaded[0].path, cached.path)
 
     def test_codex_invocation_uses_model_cwd_and_stdin_prompt(self) -> None:
         settings = AppSettings(ai_provider="codex", ai_model="gpt-5.5")

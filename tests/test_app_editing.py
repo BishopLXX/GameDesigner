@@ -11,6 +11,7 @@ from PySide6.QtGui import QImage, QKeyEvent, QTextCursor
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QWidget
 
 from gamedesigner.app import EDGE_LABEL_MAX_LENGTH, GameDesignerApp
+from gamedesigner.image_ai import AiGeneratedImage, cache_generated_ai_image
 from gamedesigner.ai_tools import AiCanvasAction, AiCanvasFieldChange
 from gamedesigner.ai_tools import AiChatMessage, load_project_chat_history, save_project_chat_history
 from gamedesigner.canvas_io import import_canvas_sheet
@@ -238,6 +239,30 @@ class AppEditingTests(unittest.TestCase):
                 loaded = load_settings()
                 self.assertEqual(loaded.ai_image_model, "custom-image")
                 dialog.deleteLater()
+
+    def test_ai_image_panel_loads_cached_images_when_reopened(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "CacheProject.gdc"
+            png_1x1 = bytes.fromhex(
+                "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+                "000000097048597300000f6100000f6101a83fa7690000000d49444154089963f8cfc0f01f"
+                "00050001ffabce36890000000049454e44ae426082"
+            )
+            cached = cache_generated_ai_image(project_path, AiGeneratedImage(png_1x1, "png"))
+            settings = AppSettings(workspace_dir=folder, export_dir=str(Path(folder) / "exports"))
+            context_provider = lambda: ("ctx", Path(folder), project_path)
+
+            panel = AiImagePanel(None, settings, context_provider)
+
+            self.assertEqual(panel.output_list.count(), 1)
+            self.assertEqual(panel._current_image_path, cached.path)
+            panel.deleteLater()
+
+            reopened = AiImagePanel(None, settings, context_provider)
+
+            self.assertEqual(reopened.output_list.count(), 1)
+            self.assertEqual(reopened._current_image_path, cached.path)
+            reopened.deleteLater()
 
     def test_ai_settings_dialog_one_click_uses_ollama_free_preset(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
