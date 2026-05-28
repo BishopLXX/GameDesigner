@@ -335,9 +335,9 @@ class AiToolsTests(unittest.TestCase):
             self.assertEqual(max(y for _x, y in opaque_positions), 7)
             self.assertLess(min(x for x, _y in opaque_positions), 3)
             self.assertGreaterEqual(max(x for x, _y in opaque_positions), 4)
-            self.assertLessEqual(len(colors), 16)
+            self.assertLessEqual(len(colors), 48)
 
-    def test_pixel_ai_image_cache_uses_limited_palette_without_gradient_spill(self) -> None:
+    def test_pixel_ai_image_cache_uses_bounded_palette_without_crushing_detail(self) -> None:
         source = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
         pixels = source.load()
         for y in range(64):
@@ -365,7 +365,54 @@ class AiToolsTests(unittest.TestCase):
                 if processed.pixelColor(x, y).alpha() == 255
             }
 
-            self.assertLessEqual(len(colors), 16)
+            self.assertGreater(len(colors), 16)
+            self.assertLessEqual(len(colors), 48)
+
+    def test_pixel_ai_image_cache_preserves_rich_detail_palette(self) -> None:
+        source = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        pixels = source.load()
+        for y in range(8, 56):
+            for x in range(12, 52):
+                shade = (x * 5 + y * 7) % 96
+                pixels[x, y] = (96 + shade, 44 + (x % 9) * 6, 132 + (y % 11) * 5, 255)
+        for x in range(12, 52):
+            pixels[x, 8] = (28, 24, 36, 255)
+            pixels[x, 55] = (28, 24, 36, 255)
+        for y in range(8, 56):
+            pixels[12, y] = (28, 24, 36, 255)
+            pixels[51, y] = (28, 24, 36, 255)
+        for x, y in [(26, 24), (38, 24), (28, 34), (36, 34), (32, 42)]:
+            pixels[x, y] = (246, 226, 116, 255)
+        for x, y in [(27, 25), (39, 25), (32, 35)]:
+            pixels[x, y] = (18, 16, 24, 255)
+        buffer = BytesIO()
+        source.save(buffer, format="PNG")
+
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "PixelDetailProject.gdc"
+
+            cached = cache_generated_ai_image(
+                project_path,
+                AiGeneratedImage(buffer.getvalue(), "png"),
+                index=1,
+                cache_key="canvas-a",
+                pixel_mode=True,
+                pixel_output_size="64x64",
+            )
+            processed = QImage(str(cached.path))
+            colors = {
+                processed.pixelColor(x, y).rgba()
+                for y in range(processed.height())
+                for x in range(processed.width())
+                if processed.pixelColor(x, y).alpha() == 255
+            }
+            eye = processed.pixelColor(27, 25)
+            highlight = processed.pixelColor(32, 42)
+
+            self.assertGreater(len(colors), 32)
+            self.assertLessEqual(len(colors), 96)
+            self.assertLess(eye.red(), 50)
+            self.assertGreater(highlight.red(), 180)
 
     def test_ai_image_request_with_reference_omits_input_fidelity_for_gpt_image_2(self) -> None:
         settings = AppSettings(

@@ -23,9 +23,9 @@ from PIL.PngImagePlugin import PngInfo
 from .ai_presets import normalize_ai_credentials
 from .pixel_art import (
     PIXEL_ART_ALPHA_THRESHOLD,
-    PIXEL_ART_MAX_COLORS,
     PIXEL_ART_SAMPLE_BLOCK,
     normalized_pixel_output_size,
+    pixel_art_palette_limit,
     pixel_output_size_dimensions,
 )
 from .storage import AppSettings, project_bundle_dir
@@ -587,7 +587,7 @@ def _pixel_grid_sample(image: Image.Image, *, pixel_output_size: str = "auto") -
             right = min(image.width, left + block)
             cell = image.crop((left, top, right, bottom))
             pixels[x + x_pad, y + y_pad] = _dominant_cell_color(cell)
-    _apply_palette_quantization(result)
+    _apply_palette_quantization(result, pixel_art_palette_limit(target_width, target_height))
     return result
 
 
@@ -604,7 +604,8 @@ def _dominant_cell_color(cell: Image.Image) -> tuple[int, int, int, int]:
     return tuple(int(sorted(channel)[len(channel) // 2]) for channel in channels)  # type: ignore[return-value]
 
 
-def _apply_palette_quantization(image: Image.Image) -> None:
+def _apply_palette_quantization(image: Image.Image, limit: int) -> None:
+    limit = max(1, int(limit))
     if hasattr(image, "get_flattened_data"):
         raw_pixels = list(image.get_flattened_data())
     else:  # pragma: no cover - Pillow compatibility fallback.
@@ -614,9 +615,9 @@ def _apply_palette_quantization(image: Image.Image) -> None:
         for pixel in raw_pixels
         if len(pixel) >= 4 and pixel[3] >= PIXEL_ART_ALPHA_THRESHOLD
     ]
-    if len({pixel for pixel in opaque_pixels}) <= PIXEL_ART_MAX_COLORS:
+    if len({pixel for pixel in opaque_pixels}) <= limit:
         return
-    quantized_rgb = _quantized_palette_image(opaque_pixels, PIXEL_ART_MAX_COLORS)
+    quantized_rgb = _quantized_palette_image(opaque_pixels, limit)
     if not quantized_rgb:
         return
     replacements = iter(quantized_rgb)
