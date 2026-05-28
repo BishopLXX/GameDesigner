@@ -13,13 +13,22 @@ from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QWidget
 from gamedesigner.app import EDGE_LABEL_MAX_LENGTH, GameDesignerApp
 from gamedesigner.image_ai import AiGeneratedImage, AiImageReference, CachedAiImage, cache_generated_ai_image
 from gamedesigner.ai_tools import AiCanvasAction, AiCanvasFieldChange
-from gamedesigner.ai_tools import AiChatMessage, load_project_chat_history, save_project_chat_history
+from gamedesigner.ai_tools import AiChatMessage, build_project_chat_context, load_project_chat_history, save_project_chat_history
 from gamedesigner.canvas_io import import_canvas_sheet
 from gamedesigner.image_canvas import build_image_canvas_request, find_image_output_node
 from gamedesigner.project_files.linked_documents import create_link_document, write_link_document
 from gamedesigner.qt_canvas import NodeGraphView
 from gamedesigner.qt_dialogs import HEADER_HEIGHT, InlineFieldEditor, NodeEditorDialog, TemplateSaveDialog
-from gamedesigner.models import BlueprintGroup, DesignNote, Node, NodeField, NodeTemplate, ProjectData, default_image_canvas_nodes
+from gamedesigner.models import (
+    BlueprintGroup,
+    DesignNote,
+    Node,
+    NodeField,
+    NodeTemplate,
+    ProjectData,
+    default_image_canvas_nodes,
+    default_pixel_canvas_nodes,
+)
 from gamedesigner.storage import (
     AppSettings,
     load_settings,
@@ -225,6 +234,25 @@ class AppEditingTests(unittest.TestCase):
 
         self.assertFalse(window.ai_assistant_expanded)
         self.assertEqual(window.ai_assistant_stack.width(), 42)
+        window.deleteLater()
+
+    def test_sidebar_can_open_or_create_image_and_pixel_canvas_entries(self) -> None:
+        window = GameDesignerApp()
+        project = ProjectData(name="右侧入口测试")
+        project.ensure_canvas_structure()
+        page = window._add_page(project, None, dirty=False, canvas_data=project.root_canvas())
+        window.tabs.setCurrentWidget(page)
+
+        window._open_or_create_image_canvas_from_sidebar()
+        image_canvas = next(canvas for canvas in project.canvases if canvas.canvas_type == "image")
+        self.assertEqual(image_canvas.canvas_type, "image")
+        self.assertTrue(any(node.title == "入口" for node in image_canvas.nodes))
+
+        window._open_or_create_pixel_canvas_from_sidebar()
+        pixel_canvas = next(canvas for canvas in project.canvases if canvas.canvas_type == "pixel")
+        self.assertEqual(pixel_canvas.canvas_type, "pixel")
+        self.assertTrue(pixel_canvas.is_pixel_canvas())
+        self.assertIn("像素作画画布规则", pixel_canvas.ai_rules)
         window.deleteLater()
 
     def test_ai_image_generate_button_uses_click_wrapper_without_signal_args(self) -> None:
@@ -773,6 +801,45 @@ class AppEditingTests(unittest.TestCase):
         self.assertIn("拒绝访问", panel.transcript.toPlainText())
         warning.assert_called_once()
         cleanup.assert_called_once()
+        panel.deleteLater()
+
+    def test_ai_panel_steers_running_reply_with_follow_up_message(self) -> None:
+        class RunningProcess:
+            def __init__(self) -> None:
+                self.killed = False
+
+            def kill(self) -> None:
+                self.killed = True
+
+        project_path = Path("D:/GameDesigner/QueuedFollowUp.gdc")
+        panel = AiChatPanel(
+            None,
+            AppSettings(ai_provider="codex", ai_model="gpt-5.4"),
+            lambda: ("项目上下文", project_path.parent, project_path),
+        )
+        process = RunningProcess()
+        panel._process = process  # type: ignore[assignment]
+        panel._pending_user_message = "先分析当前画布"
+        panel.input.setPlainText("继续补充这个规则")
+
+        panel._send()
+
+        self.assertTrue(process.killed)
+        self.assertEqual(panel._steering_messages, [("继续补充这个规则", [])])
+        self.assertEqual(panel.input.toPlainText(), "")
+        self.assertEqual(panel.send_button.text(), "追加")
+        self.assertIn("继续补充这个规则", panel.transcript.toPlainText())
+        self.assertIn("已追加到当前回复", panel.transcript.toPlainText())
+
+        panel._process = None
+        with mock.patch.object(panel, "_send_message_now") as send_now:
+            self.assertTrue(panel._restart_with_steering_messages())
+
+        restarted_message = send_now.call_args.args[0]
+        self.assertIn("先分析当前画布", restarted_message)
+        self.assertIn("继续补充这个规则", restarted_message)
+        send_now.assert_called_once_with(restarted_message, [], already_displayed=True, apply_iteration=False)
+        self.assertEqual(panel._steering_messages, [])
         panel.deleteLater()
 
     def test_submit_plain_text_edit_enter_submits_shift_enter_inserts_newline(self) -> None:
@@ -1455,6 +1522,32 @@ class AppEditingTests(unittest.TestCase):
         self.assertTrue(window.ai_assistant_expanded)
         window.deleteLater()
 
+    def test_add_pixel_canvas_creates_pixel_art_generation_flow(self) -> None:
+        window = GameDesignerApp()
+        project = ProjectData(name="像素作画画布测试")
+        project.ensure_canvas_structure()
+        page = window._add_page(project, None, dirty=False, canvas_data=project.root_canvas())
+        window.tabs.setCurrentWidget(page)
+
+        parent_node_id = window._add_pixel_canvas_node_at(260, 180)
+
+        parent_node = project.root_canvas().find_node(parent_node_id)
+        self.assertIsNotNone(parent_node)
+        canvas = project.find_canvas(parent_node.canvas_id)
+        self.assertIsNotNone(canvas)
+        self.assertEqual(parent_node.icon, "像")
+        self.assertEqual(canvas.canvas_type, "pixel")
+        self.assertTrue(canvas.is_image_canvas())
+        self.assertTrue(canvas.is_pixel_canvas())
+        self.assertIn("像素作画画布规则", canvas.ai_rules)
+        self.assertEqual(
+            [node.title for node in canvas.nodes],
+            ["像素目标", "制作规格", "完美像素线条", "高品质动作游戏像素方向", "输出"],
+        )
+        self.assertEqual(len(canvas.valid_edges()), 4)
+        self.assertTrue(window.ai_assistant_expanded)
+        window.deleteLater()
+
     def test_connection_drop_image_canvas_keeps_parent_edge_and_selection(self) -> None:
         window = GameDesignerApp()
         project = ProjectData(name="拖线生图画布测试")
@@ -1553,6 +1646,40 @@ class AppEditingTests(unittest.TestCase):
             self.assertIn("按钮圆角小", request.prompt)
             self.assertIn("输入给生图", request.prompt)
             self.assertEqual([str(path) for path in request.reference_paths], [reference_image])
+
+    def test_normal_image_canvas_request_does_not_include_pixel_rules(self) -> None:
+        project = ProjectData(name="普通作画提示测试")
+        project.ensure_canvas_structure()
+        image_canvas = project.add_canvas("普通作画", canvas_type="image", parent_canvas_id=project.root_canvas_id)
+        entry, output, edge = default_image_canvas_nodes()
+        image_canvas.nodes.extend([entry, output])
+        image_canvas.edges.append(edge)
+
+        request = build_image_canvas_request(image_canvas, output.id, project=project)
+        context = build_project_chat_context(project, image_canvas)
+
+        self.assertNotIn("像素作画硬约束", request.prompt)
+        self.assertNotIn("pixel-perfect", request.prompt)
+        self.assertNotIn("像素完美", context)
+        self.assertIn("生图画布协议", context)
+
+    def test_pixel_canvas_request_includes_pixel_perfect_rules(self) -> None:
+        project = ProjectData(name="像素提示测试")
+        project.ensure_canvas_structure()
+        pixel_canvas = project.add_canvas("像素作画", canvas_type="pixel", parent_canvas_id=project.root_canvas_id)
+        nodes, edges = default_pixel_canvas_nodes()
+        pixel_canvas.nodes.extend(nodes)
+        pixel_canvas.edges.extend(edges)
+        output = find_image_output_node(pixel_canvas)
+        self.assertIsNotNone(output)
+
+        request = build_image_canvas_request(pixel_canvas, output.id, project=project)
+
+        self.assertIn("像素作画硬约束", request.prompt)
+        self.assertIn("nearest-neighbor", request.prompt)
+        self.assertIn("pixel-perfect", request.prompt)
+        self.assertIn("禁止抗锯齿", request.prompt)
+        self.assertIn("完美像素线条", request.prompt)
 
     def test_add_node_in_data_canvas_uses_canvas_template_and_forces_lock(self) -> None:
         window = GameDesignerApp()

@@ -466,6 +466,7 @@ class AiChatPanel(QWidget):
         self._activity_step = 0
         self._activity_log_lines: list[str] = []
         self._pending_image_attachments: list[AiImageAttachment] = []
+        self._steering_messages: list[tuple[str, list[AiImageAttachment]]] = []
 
         title_label = QLabel("AI 助手")
         title_label.setObjectName("aiAssistantTitle")
@@ -603,8 +604,61 @@ class AiChatPanel(QWidget):
     def _send(self) -> None:
         message = self.input.toPlainText().strip()
         attachments = list(self._pending_image_attachments)
-        if (not message and not attachments) or self._process is not None:
+        if not message and not attachments:
             return
+        if self._process is not None:
+            self._steer_message(message, attachments)
+            return
+        self._send_message_now(message, attachments)
+
+    def _steer_message(self, message: str, attachments: list[AiImageAttachment]) -> None:
+        if not message and attachments:
+            message = "请分析这张图片。"
+        self._steering_messages.append((message, attachments))
+        self._append_user(self._display_user_message(message, attachments))
+        self.input.clear()
+        self._pending_image_attachments = []
+        self._refresh_attachments_label()
+        self._append_system("已追加到当前回复，正在中断并按新信息重新发送。")
+        self.send_button.setEnabled(True)
+        self.send_button.setText("追加")
+        self._start_activity("正在应用追加信息")
+        self._process.kill()
+
+    def _restart_with_steering_messages(self) -> bool:
+        if self._process is not None or not self._steering_messages:
+            return False
+        message = self._combined_steering_message()
+        self._steering_messages = []
+        self._append_system("正在按追加后的完整意图重新调用 AI。")
+        self._send_message_now(message, [], already_displayed=True, apply_iteration=False)
+        return True
+
+    def _combined_steering_message(self) -> str:
+        original = self._pending_user_message.strip()
+        additions = [
+            self._message_with_image_attachments(message, attachments).strip()
+            for message, attachments in self._steering_messages
+        ]
+        additions = [text for text in additions if text]
+        if not original:
+            return "\n\n".join(additions)
+        return (
+            "【用户在上一轮回复生成过程中追加了指令，请按下面的完整意图重新回答。】\n\n"
+            "原请求：\n"
+            f"{original}\n\n"
+            "追加指令：\n"
+            + "\n\n".join(f"{index}. {text}" for index, text in enumerate(additions, start=1))
+        )
+
+    def _send_message_now(
+        self,
+        message: str,
+        attachments: list[AiImageAttachment],
+        *,
+        already_displayed: bool = False,
+        apply_iteration: bool = True,
+    ) -> None:
         try:
             context, cwd, project_path = self.context_provider()
         except ValueError as exc:
@@ -614,7 +668,11 @@ class AiChatPanel(QWidget):
         if not message and attachments:
             message = "请分析这张图片。"
         message_with_attachments = self._message_with_image_attachments(message, attachments)
-        prompt_message = self._iteration_prompt(message_with_attachments) if self._iteration_mode else message_with_attachments
+        prompt_message = (
+            self._iteration_prompt(message_with_attachments)
+            if self._iteration_mode and apply_iteration
+            else message_with_attachments
+        )
         prompt = build_ai_assistant_prompt(context, prompt_message, self._history)
         invocation = build_ai_cli_invocation(self.settings, prompt, cwd)
         output_file = self._new_output_file() if invocation.program == "codex" else None
@@ -637,11 +695,13 @@ class AiChatPanel(QWidget):
         self._pending_output_file = output_file
         self._pending_actions = []
         self._clear_activity_log()
-        self._append_user(self._display_user_message(message, attachments))
+        if not already_displayed:
+            self._append_user(self._display_user_message(message, attachments))
         self.input.clear()
         self._pending_image_attachments = []
         self._refresh_attachments_label()
-        self.send_button.setEnabled(False)
+        self.send_button.setEnabled(True)
+        self.send_button.setText("追加")
         self.cancel_button.setEnabled(True)
         self._start_activity(f"{invocation.program} 正在思考")
         self._append_system(f"正在调用 {invocation.program}...")
@@ -661,6 +721,7 @@ class AiChatPanel(QWidget):
             error_text = process.errorString().strip() or "未知错误"
             self._process = None
             self.send_button.setEnabled(True)
+            self.send_button.setText("发送")
             self.cancel_button.setEnabled(False)
             self._stop_activity("启动失败")
             self._append_system(f"无法启动 {invocation.program}。\n程序：{program}\n错误：{error_text}")
@@ -671,6 +732,10 @@ class AiChatPanel(QWidget):
                 "请确认 CLI 已安装，并且可执行文件在 PATH 中。",
             )
             self._cleanup_pending_output_file()
+            self._pending_user_message = ""
+            self._pending_output_chunks = []
+            self._pending_error_chunks = []
+            self._restart_with_steering_messages()
             return
         process.write(invocation.stdin.encode("utf-8"))
         process.closeWriteChannel()
@@ -746,6 +811,15 @@ class AiChatPanel(QWidget):
             self._append_activity_from_chunk(text, "运行日志")
 
     def _process_finished(self, exit_code: int, _status: QProcess.ExitStatus) -> None:
+        if self._steering_messages:
+            self._pending_output_chunks = []
+            self._pending_error_chunks = []
+            self._cleanup_pending_output_file()
+            self._process = None
+            self.cancel_button.setEnabled(False)
+            self._stop_activity("就绪")
+            if self._restart_with_steering_messages():
+                return
         ai_text = self._read_pending_output_file()
         if not ai_text:
             ai_text = self._clean_cli_output("".join(self._pending_output_chunks))
@@ -781,6 +855,7 @@ class AiChatPanel(QWidget):
         self.cancel_button.setEnabled(False)
         self._stop_activity("就绪")
         self._append_system("回复结束。")
+        self.send_button.setText("发送")
 
     def _append_activity_from_chunk(self, text: str, title: str) -> None:
         lines = self._activity_lines_from_chunk(text)

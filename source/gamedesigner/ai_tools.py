@@ -414,26 +414,41 @@ def split_ai_canvas_action_response(text: str) -> tuple[str, list[AiCanvasAction
         text,
         flags=re.DOTALL,
     ).strip()
+    if not actions:
+        visible, fallback_actions = _extract_fallback_canvas_action_blocks(visible)
+        actions.extend(fallback_actions)
     return visible, actions, "\n".join(errors)
 
 
 def parse_ai_canvas_actions(text: str) -> list[AiCanvasAction]:
     raw = _extract_json_text(text)
     try:
-        data = json.loads(raw)
+        values = _json_values(raw)
     except json.JSONDecodeError as exc:
         raise ValueError(f"无法解析 AI 画布动作 JSON：{exc}") from exc
-    items = None
+    actions: list[AiCanvasAction] = []
+    for data in values:
+        data_actions = _ai_canvas_actions_from_data(data)
+        if data_actions is None:
+            raise ValueError("AI 画布动作必须是动作对象、动作列表，或包含 actions 列表的对象。")
+        actions.extend(data_actions)
+    return actions
+
+
+def _ai_canvas_actions_from_data(data: Any) -> list[AiCanvasAction] | None:
     if isinstance(data, dict):
-        items = data.get("actions")
-        if items is None:
-            items = data.get("tool_calls")
-        if items is None:
-            items = data.get("tools")
+        if _is_action_like_dict(data):
+            items: Any = [data]
+        else:
+            items = data.get("actions")
+            if items is None:
+                items = data.get("tool_calls")
+            if items is None:
+                items = data.get("tools")
     else:
         items = data
     if not isinstance(items, list):
-        raise ValueError("AI 画布动作必须是列表，或包含 actions 列表的对象。")
+        return None
     actions: list[AiCanvasAction] = []
     for item in items:
         if not isinstance(item, dict):
@@ -442,6 +457,112 @@ def parse_ai_canvas_actions(text: str) -> list[AiCanvasAction]:
         if action is not None:
             actions.append(action)
     return actions
+
+
+def _is_action_like_dict(data: dict[str, Any]) -> bool:
+    action_type = data.get("type") or data.get("name") or data.get("tool")
+    if str(action_type or "").strip() in AI_CANVAS_ACTION_TYPES:
+        return True
+    function = data.get("function")
+    if isinstance(function, dict):
+        return str(function.get("name") or "").strip() in AI_CANVAS_ACTION_TYPES
+    return False
+
+
+def _json_values(raw: str) -> list[Any]:
+    decoder = json.JSONDecoder()
+    values: list[Any] = []
+    index = 0
+    length = len(raw)
+    while index < length:
+        while index < length and raw[index].isspace():
+            index += 1
+        if index >= length:
+            break
+        value, index = decoder.raw_decode(raw, index)
+        values.append(value)
+        while index < length and raw[index].isspace():
+            index += 1
+    if not values:
+        raise json.JSONDecodeError("Expecting value", raw, 0)
+    return values
+
+
+def _extract_fallback_canvas_action_blocks(text: str) -> tuple[str, list[AiCanvasAction]]:
+    actions: list[AiCanvasAction] = []
+
+    def parse_fence(match: re.Match[str]) -> str:
+        language = (match.group(1) or "").strip().lower()
+        if language and language not in {"json", "gd_actions"}:
+            return match.group(0)
+        candidate_actions = _try_parse_canvas_action_candidate(match.group(2))
+        if not candidate_actions:
+            return match.group(0)
+        actions.extend(candidate_actions)
+        return ""
+
+    visible = re.sub(r"```([A-Za-z0-9_-]*)\s*(.*?)```", parse_fence, text, flags=re.DOTALL).strip()
+    if actions:
+        return visible, actions
+    stripped = visible.strip()
+    if stripped.startswith(("{", "[")) and stripped.endswith(("}", "]")):
+        candidate_actions = _try_parse_canvas_action_candidate(stripped)
+        if candidate_actions:
+            return "", candidate_actions
+    visible, inline_actions = _extract_inline_canvas_action_blocks(visible)
+    if inline_actions:
+        return visible, inline_actions
+    return visible, []
+
+
+def _try_parse_canvas_action_candidate(text: str) -> list[AiCanvasAction]:
+    candidate = text.strip()
+    if not candidate or not candidate.startswith(("{", "[")):
+        return []
+    try:
+        actions = parse_ai_canvas_actions(candidate)
+    except ValueError:
+        return []
+    return actions
+
+
+def _extract_inline_canvas_action_blocks(text: str) -> tuple[str, list[AiCanvasAction]]:
+    decoder = json.JSONDecoder()
+    spans: list[tuple[int, int, list[AiCanvasAction]]] = []
+    index = 0
+    while index < len(text):
+        start = _next_json_start(text, index)
+        if start < 0:
+            break
+        try:
+            _value, end = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            index = start + 1
+            continue
+        candidate_actions = _try_parse_canvas_action_candidate(text[start:end])
+        if candidate_actions:
+            spans.append((start, end, candidate_actions))
+            index = end
+        else:
+            index = start + 1
+    if not spans:
+        return text.strip(), []
+    actions: list[AiCanvasAction] = []
+    visible_parts: list[str] = []
+    cursor = 0
+    for start, end, candidate_actions in spans:
+        visible_parts.append(text[cursor:start])
+        actions.extend(candidate_actions)
+        cursor = end
+    visible_parts.append(text[cursor:])
+    return "".join(visible_parts).strip(), actions
+
+
+def _next_json_start(text: str, start: int) -> int:
+    object_index = text.find("{", start)
+    array_index = text.find("[", start)
+    candidates = [index for index in (object_index, array_index) if index >= 0]
+    return min(candidates) if candidates else -1
 
 
 def describe_ai_canvas_actions(actions: list[AiCanvasAction]) -> list[str]:

@@ -441,7 +441,14 @@ class ExportCanvasCsvDialog(QDialog):
 
     def _canvas_label(self, canvas: CanvasData) -> str:
         name = canvas.name.strip() or "未命名画布"
-        suffix = "数据画布" if canvas.is_data_canvas() else "自由画布"
+        if canvas.is_data_canvas():
+            suffix = "数据画布"
+        elif canvas.is_pixel_canvas():
+            suffix = "像素作画画布"
+        elif canvas.is_image_canvas():
+            suffix = "生图画布"
+        else:
+            suffix = "自由画布"
         return f"{name}（{suffix}）"
 
     def _pick_folder(self) -> None:
@@ -725,6 +732,7 @@ class EditorFieldItem(QGraphicsObject):
                         max(1, int(rect.width())),
                         max(1, int(rect.height())),
                         fit,
+                        smooth=None,
                     )
                 painter.save()
                 painter.setClipPath(path)
@@ -964,8 +972,16 @@ class FieldCanvas(QGraphicsView):
     def source_image_pixmap(self, path: str) -> QPixmap:
         return self._pixmap_cache.source(path) or QPixmap()
 
-    def scaled_image_pixmap(self, path: str, width: int, height: int, mode: str) -> QPixmap | None:
-        return self._pixmap_cache.scaled(path, width, height, mode)
+    def scaled_image_pixmap(
+        self,
+        path: str,
+        width: int,
+        height: int,
+        mode: str,
+        *,
+        smooth: bool | None = None,
+    ) -> QPixmap | None:
+        return self._pixmap_cache.scaled(path, width, height, mode, smooth=smooth)
 
     def _on_frame_resized(self, width: float, height: float) -> None:
         self.node_width = max(VISUAL_NODE_MIN_WIDTH, float(width))

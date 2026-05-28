@@ -71,6 +71,7 @@ from .models import (
     DesignNote,
     default_label_node,
     default_image_canvas_nodes,
+    default_pixel_canvas_nodes,
     default_project,
     new_id,
 )
@@ -790,14 +791,26 @@ class GameDesignerApp(QMainWindow):
         holder = QWidget(self)
         holder.setObjectName("aiAssistantCollapsed")
         layout = QVBoxLayout(holder)
-        layout.setContentsMargins(4, 8, 4, 8)
-        layout.setSpacing(8)
+        layout.setContentsMargins(3, 8, 3, 8)
+        layout.setSpacing(6)
         button = QToolButton(holder)
         button.setObjectName("aiAssistantHandleButton")
         button.setText("AI\n助手")
         button.setToolTip("展开 AI 助手")
         button.setAutoRaise(True)
         button.clicked.connect(self._open_ai_chat)
+        paint_canvas_button = QToolButton(holder)
+        paint_canvas_button.setObjectName("aiAssistantHandleButton")
+        paint_canvas_button.setText("AI\n作画")
+        paint_canvas_button.setToolTip("创建或打开普通 AI 作画画布")
+        paint_canvas_button.setAutoRaise(True)
+        paint_canvas_button.clicked.connect(self._open_or_create_image_canvas_from_sidebar)
+        pixel_button = QToolButton(holder)
+        pixel_button.setObjectName("aiAssistantHandleButton")
+        pixel_button.setText("像素\n生图")
+        pixel_button.setToolTip("创建或打开像素作画画布")
+        pixel_button.setAutoRaise(True)
+        pixel_button.clicked.connect(self._open_or_create_pixel_canvas_from_sidebar)
         notes_button = QToolButton(holder)
         notes_button.setObjectName("aiAssistantHandleButton")
         notes_button.setText("便签")
@@ -813,6 +826,8 @@ class GameDesignerApp(QMainWindow):
         layout.addStretch(1)
         layout.addWidget(button)
         layout.addWidget(image_button)
+        layout.addWidget(paint_canvas_button)
+        layout.addWidget(pixel_button)
         layout.addWidget(notes_button)
         layout.addStretch(1)
         return holder
@@ -934,6 +949,7 @@ class GameDesignerApp(QMainWindow):
         canvas.createNodeRequested.connect(self._add_node_at)
         canvas.createCanvasNodeRequested.connect(self._add_canvas_node_at)
         canvas.createImageCanvasRequested.connect(self._add_image_canvas_node_at)
+        canvas.createPixelCanvasRequested.connect(self._add_pixel_canvas_node_at)
         canvas.createDataCanvasRequested.connect(self._add_data_canvas_node_at)
         canvas.createLinkNodeRequested.connect(self._add_link_node_at)
         canvas.createGroupRequested.connect(self._add_blueprint_group_at)
@@ -1635,6 +1651,7 @@ class GameDesignerApp(QMainWindow):
             "node": menu.addAction("节点"),
             "canvas": menu.addAction("画布节点"),
             "image_canvas": menu.addAction("生图画布"),
+            "pixel_canvas": menu.addAction("像素作画画布"),
             "data_canvas": menu.addAction("数据画布"),
             "note": menu.addAction("便签"),
             "group": menu.addAction("蓝图组"),
@@ -1651,6 +1668,8 @@ class GameDesignerApp(QMainWindow):
             created_node_id = self._add_canvas_node_at(scene_pos.x(), scene_pos.y()) or ""
         elif action == actions["image_canvas"]:
             created_node_id = self._add_image_canvas_node_at(scene_pos.x(), scene_pos.y()) or ""
+        elif action == actions["pixel_canvas"]:
+            created_node_id = self._add_pixel_canvas_node_at(scene_pos.x(), scene_pos.y()) or ""
         elif action == actions["data_canvas"]:
             created_node_id = self._add_data_canvas_node_at(scene_pos.x(), scene_pos.y()) or ""
         elif action == actions["note"]:
@@ -2072,6 +2091,15 @@ class GameDesignerApp(QMainWindow):
             return ""
         return self._add_canvas_node(page, x, y, canvas_type="image")
 
+    def _add_pixel_canvas_node_at(self, x: float, y: float) -> str:
+        page = self._current_page()
+        if not page:
+            return ""
+        if page.is_welcome:
+            self._new_project()
+            return ""
+        return self._add_canvas_node(page, x, y, canvas_type="pixel")
+
     def _add_canvas_node(
         self,
         page: ProjectPage,
@@ -2083,7 +2111,7 @@ class GameDesignerApp(QMainWindow):
     ) -> str:
         if page.canvas_data.is_data_canvas():
             return ""
-        canvas_type = canvas_type if canvas_type in {"normal", "data", "image"} else "normal"
+        canvas_type = canvas_type if canvas_type in {"normal", "data", "image", "pixel"} else "normal"
         if canvas_type == "data":
             title = "数据画布"
             icon = "数"
@@ -2092,6 +2120,10 @@ class GameDesignerApp(QMainWindow):
             title = "生图画布"
             icon = "图"
             fields = [NodeField("入口", "画布", "双击打开生图画布")]
+        elif canvas_type == "pixel":
+            title = "像素作画画布"
+            icon = "像"
+            fields = [NodeField("入口", "画布", "双击打开像素作画画布")]
         else:
             title = "新画布"
             icon = "画"
@@ -2116,9 +2148,19 @@ class GameDesignerApp(QMainWindow):
         node.group_id = page.canvas.group_id_at_scene_pos(QPointF(x, y))
         page.canvas_data.add_node(node)
         if canvas.is_image_canvas():
-            entry, output, edge = default_image_canvas_nodes()
-            canvas.nodes.extend([entry, output])
-            canvas.edges.append(edge)
+            if canvas.is_pixel_canvas():
+                nodes, edges = default_pixel_canvas_nodes()
+                canvas.nodes.extend(nodes)
+                canvas.edges.extend(edges)
+                canvas.ai_rules = (
+                    "像素作画画布规则：所有生成必须是专业像素美术资产。"
+                    "优先原生小分辨率、统一正方形像素格、有限调色板、完美像素线条、硬边无抗锯齿、nearest-neighbor 整数倍预览。"
+                    "严禁高分辨率插画伪装像素、模糊边缘、半透明脏边、照片级渐变和随机噪点。"
+                )
+            else:
+                entry, output, edge = default_image_canvas_nodes()
+                canvas.nodes.extend([entry, output])
+                canvas.edges.append(edge)
         if canvas.is_data_canvas():
             self._sync_project_templates(page.project)
             self._refresh_project_views(page.project)
@@ -2933,7 +2975,12 @@ class GameDesignerApp(QMainWindow):
         self._mark_dirty(page)
         self._open_ai_image_assistant()
         if hasattr(self.ai_assistant_panel, "bind_canvas"):
-            self.ai_assistant_panel.bind_canvas(page.canvas_data.name, output.id, page.canvas_data.id)
+            self.ai_assistant_panel.bind_canvas(
+                page.canvas_data.name,
+                output.id,
+                page.canvas_data.id,
+                page.canvas_data.is_pixel_canvas(),
+            )
         if hasattr(self.ai_assistant_panel, "generate_with_prompt"):
             self.ai_assistant_panel.generate_with_prompt(
                 set_prompt,
@@ -3006,7 +3053,12 @@ class GameDesignerApp(QMainWindow):
         self._mark_dirty(page)
         self._open_ai_image_assistant()
         if hasattr(self.ai_assistant_panel, "bind_canvas"):
-            self.ai_assistant_panel.bind_canvas(page.canvas_data.name, new_output.id, page.canvas_data.id)
+            self.ai_assistant_panel.bind_canvas(
+                page.canvas_data.name,
+                new_output.id,
+                page.canvas_data.id,
+                page.canvas_data.is_pixel_canvas(),
+            )
 
     def _remember_last_edge_style(self, style: str) -> None:
         if style not in EDGE_STYLES or self._last_edge_style == style:
@@ -3035,6 +3087,35 @@ class GameDesignerApp(QMainWindow):
     def _open_ai_chat(self) -> None:
         self._open_ai_assistant_panel()
 
+    def _open_or_create_image_canvas_from_sidebar(self) -> None:
+        self._open_or_create_canvas_type_from_sidebar("image")
+
+    def _open_or_create_pixel_canvas_from_sidebar(self) -> None:
+        self._open_or_create_canvas_type_from_sidebar("pixel")
+
+    def _open_or_create_canvas_type_from_sidebar(self, canvas_type: str) -> None:
+        target_type = canvas_type if canvas_type in {"image", "pixel"} else "image"
+        page = self._current_page()
+        if not page:
+            return
+        if page.is_welcome:
+            self._new_project()
+            return
+        if page.canvas_data.canvas_type == target_type:
+            self._open_ai_image_assistant()
+            return
+        if page.canvas_data.is_data_canvas():
+            return
+        existing = next((canvas for canvas in page.project.canvases if canvas.canvas_type == target_type), None)
+        if existing is not None:
+            self._open_canvas_page(page.project, page.path, existing.id, source_canvas_id=page.canvas_id)
+            return
+        pos = page.canvas.center_world()
+        if target_type == "pixel":
+            self._add_pixel_canvas_node_at(pos.x(), pos.y())
+        else:
+            self._add_image_canvas_node_at(pos.x(), pos.y())
+
     def _open_ai_image_assistant(self) -> None:
         from .ui.ai_image_panel import AiImagePanel
 
@@ -3056,6 +3137,7 @@ class GameDesignerApp(QMainWindow):
                     page.canvas_data.name,
                     self._image_canvas_output_node_id(page.canvas_data),
                     page.canvas_data.id,
+                    page.canvas_data.is_pixel_canvas(),
                 )
             else:
                 self.ai_assistant_panel.bind_canvas("", "")

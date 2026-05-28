@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from io import BytesIO
 import json
 import mimetypes
 import os
@@ -15,6 +16,8 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtGui import QImage
+from PIL import Image, ImageOps, ImageStat
+from PIL.PngImagePlugin import PngInfo
 
 from .ai_presets import normalize_ai_credentials
 from .storage import AppSettings, project_bundle_dir
@@ -41,6 +44,7 @@ AI_IMAGE_QUALITY_PRESETS = ["auto", "low", "medium", "high"]
 AI_IMAGE_BACKGROUND_PRESETS = ["auto", "transparent", "opaque"]
 AI_IMAGE_OUTPUT_FORMAT_PRESETS = ["png", "webp", "jpeg"]
 AI_IMAGE_PROVIDERS = {"openai", "compatible"}
+PIXEL_ART_ALPHA_THRESHOLD = 128
 
 
 class AiImageError(RuntimeError):
@@ -192,12 +196,16 @@ def cache_generated_ai_image(
     *,
     index: int = 1,
     cache_key: str = "",
+    pixel_mode: bool = False,
 ) -> CachedAiImage:
     folder = ai_image_cache_dir(project_path, cache_key)
+    if pixel_mode:
+        folder = folder / "pixel"
     folder.mkdir(parents=True, exist_ok=True)
-    extension = _safe_output_extension(image.output_format)
+    extension = "png" if pixel_mode else _safe_output_extension(image.output_format)
     path = folder / f"cache_{_timestamp()}_{index}_{uuid.uuid4().hex[:8]}.{extension}"
-    path.write_bytes(image.data)
+    data = _pixel_art_image_bytes(image.data) if pixel_mode else image.data
+    path.write_bytes(data)
     return cached_ai_image_from_path(path, revised_prompt=image.revised_prompt)
 
 
@@ -206,8 +214,11 @@ def load_cached_ai_images(
     *,
     limit: int = 80,
     cache_key: str = "",
+    pixel_mode: bool = False,
 ) -> list[CachedAiImage]:
     folder = ai_image_cache_dir(project_path, cache_key)
+    if pixel_mode:
+        folder = folder / "pixel"
     if not folder.exists():
         return []
     paths = [
@@ -513,6 +524,29 @@ def _safe_output_extension(value: str) -> str:
     if value == "jpeg":
         return "jpg"
     return value if value in {"png", "webp", "jpg"} else "png"
+
+
+def _pixel_art_image_bytes(raw: bytes) -> bytes:
+    with Image.open(BytesIO(raw)) as source:
+        source = ImageOps.exif_transpose(source).convert("RGBA")
+        alpha = source.getchannel("A")
+        if _has_semitransparent_pixels(alpha):
+            alpha = alpha.point(lambda value: 255 if value >= PIXEL_ART_ALPHA_THRESHOLD else 0, mode="L")
+            source.putalpha(alpha)
+        return _image_to_png_bytes(source)
+
+
+def _has_semitransparent_pixels(alpha: Image.Image) -> bool:
+    extrema = alpha.getextrema()
+    return bool(extrema and 0 < extrema[0] and extrema[1] < 255)
+
+
+def _image_to_png_bytes(image: Image.Image) -> bytes:
+    buffer = BytesIO()
+    info = PngInfo()
+    info.add_text("GameDesignerPixelArt", "1")
+    image.save(buffer, format="PNG", optimize=True, pnginfo=info)
+    return buffer.getvalue()
 
 
 def _safe_cache_key(cache_key: str) -> str:

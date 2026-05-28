@@ -1,10 +1,14 @@
 import base64
+from io import BytesIO
 import os
 import shutil
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+
+from PIL import Image
+from PySide6.QtGui import QImage
 
 from gamedesigner.image_ai import (
     AiGeneratedImage,
@@ -16,6 +20,7 @@ from gamedesigner.image_ai import (
     _encode_multipart,
     _multipart_body,
 )
+from gamedesigner.image_rendering import is_pixel_art_image_path
 from gamedesigner.ai_tools import (
     AI_ACTION_BLOCK_END,
     AI_ACTION_BLOCK_START,
@@ -218,6 +223,46 @@ class AiToolsTests(unittest.TestCase):
             self.assertEqual(cached.path.parent, ai_image_cache_dir(project_path))
             self.assertEqual(len(loaded), 1)
             self.assertEqual(loaded[0].path, cached.path)
+
+    def test_pixel_ai_image_cache_enforces_fixed_grid_png(self) -> None:
+        source = Image.new("RGBA", (2, 2))
+        source.putdata(
+            [
+                (240, 96, 48, 255),
+                (240, 96, 48, 96),
+                (32, 96, 200, 32),
+                (32, 200, 96, 255),
+            ]
+        )
+        buffer = BytesIO()
+        source.save(buffer, format="PNG")
+
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "PixelCacheProject.gdc"
+
+            cached = cache_generated_ai_image(
+                project_path,
+                AiGeneratedImage(buffer.getvalue(), "webp"),
+                index=1,
+                cache_key="canvas-a",
+                pixel_mode=True,
+            )
+            loaded = load_cached_ai_images(project_path, cache_key="canvas-a", pixel_mode=True)
+            normal_loaded = load_cached_ai_images(project_path, cache_key="canvas-a")
+            processed = QImage(str(cached.path))
+            alpha_values = {
+                processed.pixelColor(x, y).alpha()
+                for y in range(processed.height())
+                for x in range(processed.width())
+            }
+
+            self.assertEqual(cached.path.suffix.lower(), ".png")
+            self.assertIn("pixel", {part.lower() for part in cached.path.parts})
+            self.assertTrue(is_pixel_art_image_path(str(cached.path)))
+            self.assertEqual((processed.width(), processed.height()), (32, 32))
+            self.assertTrue(alpha_values.issubset({0, 255}))
+            self.assertEqual([image.path for image in loaded], [cached.path])
+            self.assertEqual(normal_loaded, [])
 
     def test_ai_image_request_with_reference_omits_input_fidelity_for_gpt_image_2(self) -> None:
         settings = AppSettings(
@@ -641,6 +686,54 @@ class AiToolsTests(unittest.TestCase):
         self.assertEqual(visible, "我建议先补一个节点。")
         self.assertEqual(len(actions), 1)
         self.assertEqual(actions[0].title, "Boss一阶段")
+
+    def test_split_ai_canvas_action_response_recovers_fenced_json_actions(self) -> None:
+        visible, actions, error = split_ai_canvas_action_response(
+            "可以，下面是新蓝图。\n"
+            "```json\n"
+            '[{"type":"create_group","title":"酒馆经营蓝图","nodes":[{"type":"create_node","title":"接单"}]}]\n'
+            "```"
+        )
+
+        self.assertEqual(error, "")
+        self.assertEqual(visible, "可以，下面是新蓝图。")
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].type, "create_group")
+        self.assertEqual(actions[0].title, "酒馆经营蓝图")
+        self.assertEqual(actions[0].nodes[0].title, "接单")
+
+    def test_parse_ai_canvas_actions_supports_single_action_object_and_adjacent_objects(self) -> None:
+        actions = parse_ai_canvas_actions(
+            '{"type":"create_group","title":"模块A"}\n'
+            '{"type":"create_node","title":"模块节点"}'
+        )
+
+        self.assertEqual([action.type for action in actions], ["create_group", "create_node"])
+        self.assertEqual(actions[0].title, "模块A")
+        self.assertEqual(actions[1].title, "模块节点")
+
+    def test_split_ai_canvas_action_response_keeps_non_action_json_visible(self) -> None:
+        visible, actions, error = split_ai_canvas_action_response(
+            "这里是数据示例。\n"
+            "```json\n"
+            '{"title":"不是画布动作","items":[1,2,3]}\n'
+            "```"
+        )
+
+        self.assertEqual(error, "")
+        self.assertEqual(actions, [])
+        self.assertIn("不是画布动作", visible)
+
+    def test_split_ai_canvas_action_response_recovers_inline_json_actions(self) -> None:
+        visible, actions, error = split_ai_canvas_action_response(
+            '可以创建。 [{"type":"create_group","title":"战斗系统蓝图"}]'
+        )
+
+        self.assertEqual(error, "")
+        self.assertEqual(visible, "可以创建。")
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].type, "create_group")
+        self.assertEqual(actions[0].title, "战斗系统蓝图")
 
     def test_project_chat_history_roundtrip_uses_project_bundle(self) -> None:
         project_path = Path(self._testMethodName) / "MemoryProject.gdc"

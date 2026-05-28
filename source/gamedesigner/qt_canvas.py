@@ -568,6 +568,7 @@ class NodeItem(QGraphicsObject):
                             max(1, int(w)),
                             max(1, int(h)),
                             fit,
+                            smooth=None,
                         )
                     painter.save()
                     painter.setClipPath(path)
@@ -2135,6 +2136,7 @@ class NodeGraphView(QGraphicsView):
     createNodeRequested = Signal(float, float)
     createCanvasNodeRequested = Signal(float, float)
     createImageCanvasRequested = Signal(float, float)
+    createPixelCanvasRequested = Signal(float, float)
     createDataCanvasRequested = Signal(float, float)
     createLinkNodeRequested = Signal(float, float, str)
     createGroupRequested = Signal(float, float)
@@ -2755,9 +2757,17 @@ class NodeGraphView(QGraphicsView):
         self._pixmap_cache._load_source = self._load_source_pixmap  # type: ignore[method-assign]
         return self._pixmap_cache.source(path)
 
-    def _scaled_image_pixmap(self, path: str, width: int, height: int, mode: str = "contain") -> QPixmap | None:
+    def _scaled_image_pixmap(
+        self,
+        path: str,
+        width: int,
+        height: int,
+        mode: str = "contain",
+        *,
+        smooth: bool | None = None,
+    ) -> QPixmap | None:
         self._pixmap_cache._load_source = self._load_source_pixmap  # type: ignore[method-assign]
-        return self._pixmap_cache.scaled(path, width, height, mode)
+        return self._pixmap_cache.scaled(path, width, height, mode, smooth=smooth)
 
     def start_connection(self, source_id: str | None) -> None:
         if not self.can_create_edges():
@@ -3985,6 +3995,7 @@ class NodeGraphView(QGraphicsView):
 
         create_canvas = create_menu.addAction("画布节点")
         create_image_canvas = create_menu.addAction("生图画布")
+        create_pixel_canvas = create_menu.addAction("像素作画画布")
         create_data_canvas = create_menu.addAction("数据画布")
         create_note = create_menu.addAction("便签")
         create_group = create_menu.addAction("蓝图组")
@@ -4004,6 +4015,7 @@ class NodeGraphView(QGraphicsView):
             {
                 "create_canvas": create_canvas,
                 "create_image_canvas": create_image_canvas,
+                "create_pixel_canvas": create_pixel_canvas,
                 "create_data_canvas": create_data_canvas,
                 "create_note": create_note,
                 "create_group": create_group,
@@ -4023,6 +4035,9 @@ class NodeGraphView(QGraphicsView):
             return True
         if action == create_actions.get("create_image_canvas"):
             self.createImageCanvasRequested.emit(scene_pos.x(), scene_pos.y())
+            return True
+        if action == create_actions.get("create_pixel_canvas"):
+            self.createPixelCanvasRequested.emit(scene_pos.x(), scene_pos.y())
             return True
         if action == create_actions.get("create_data_canvas"):
             self.createDataCanvasRequested.emit(scene_pos.x(), scene_pos.y())

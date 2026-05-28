@@ -178,18 +178,26 @@ class ImageGenerationThread(QThread):
         request: AiImageRequest,
         project_path: Path,
         cache_key: str = "",
+        pixel_mode: bool = False,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.request = request
         self.project_path = project_path
         self.cache_key = cache_key
+        self.pixel_mode = pixel_mode
 
     def run(self) -> None:  # type: ignore[override]
         try:
             images = generate_ai_images(self.request)
             cached = [
-                cache_generated_ai_image(self.project_path, image, index=index, cache_key=self.cache_key)
+                cache_generated_ai_image(
+                    self.project_path,
+                    image,
+                    index=index,
+                    cache_key=self.cache_key,
+                    pixel_mode=self.pixel_mode,
+                )
                 for index, image in enumerate(images, start=1)
             ]
         except Exception as exc:
@@ -229,11 +237,13 @@ class AiImagePanel(QWidget):
         self._pixmap_cache = PixmapCache(source_limit=64, scaled_limit=128)
         self._cache_project_path: Path | None = None
         self._cache_binding_key = ""
+        self._cache_pixel_mode = False
         self._current_image_path: Path | None = None
         self._thread: ImageGenerationThread | None = None
         self._active_prompt = ""
         self._bound_canvas_name = ""
         self._bound_canvas_key = ""
+        self._bound_pixel_mode = False
         self._bound_output_node_id = ""
         self._active_output_node_id = ""
         self._references_by_canvas: dict[str, list[AiImageReference]] = {}
@@ -422,10 +432,17 @@ class AiImagePanel(QWidget):
         binding = f"    绑定: {self._bound_canvas_name}" if self._bound_canvas_name else ""
         self.header_label.setText(f"服务: {provider}    地址: {base_url}{binding}")
 
-    def bind_canvas(self, canvas_name: str, output_node_id: str = "", canvas_key: str = "") -> None:
+    def bind_canvas(
+        self,
+        canvas_name: str,
+        output_node_id: str = "",
+        canvas_key: str = "",
+        pixel_mode: bool = False,
+    ) -> None:
         self._store_current_references()
         self._bound_canvas_name = canvas_name.strip()
         self._bound_canvas_key = canvas_key.strip()
+        self._bound_pixel_mode = bool(pixel_mode)
         self._bound_output_node_id = output_node_id.strip()
         self._load_bound_references()
         self._refresh_header()
@@ -494,7 +511,7 @@ class AiImagePanel(QWidget):
         self.send_button.setText("等待")
         self._start_activity()
         self._append_system(f"正在调用 {request.model} 生成图片...")
-        thread = ImageGenerationThread(request, project_path, self._cache_key(), self)
+        thread = ImageGenerationThread(request, project_path, self._cache_key(), self._bound_pixel_mode, self)
         thread.succeeded.connect(self._generation_succeeded)
         thread.failed.connect(self._generation_failed)
         thread.finished.connect(self._thread_finished)
@@ -552,17 +569,22 @@ class AiImagePanel(QWidget):
         except ValueError:
             return
         cache_key = self._cache_key()
-        if self._cache_project_path == project_path and self._cache_binding_key == cache_key:
+        if (
+            self._cache_project_path == project_path
+            and self._cache_binding_key == cache_key
+            and self._cache_pixel_mode == self._bound_pixel_mode
+        ):
             return
         self._cache_project_path = project_path
         self._cache_binding_key = cache_key
+        self._cache_pixel_mode = self._bound_pixel_mode
         self._pixmap_cache.clear()
         self.output_list.clear()
         self._current_image_path = None
         self._render_current_preview()
         self.save_button.setEnabled(False)
         self.open_folder_button.setEnabled(False)
-        self.cached_images = load_cached_ai_images(project_path, cache_key=cache_key)
+        self.cached_images = load_cached_ai_images(project_path, cache_key=cache_key, pixel_mode=self._bound_pixel_mode)
         for image in self.cached_images:
             self._add_output_item(image, select=False)
         if self.cached_images:

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from pathlib import Path
 
 from PySide6.QtCore import QRectF, Qt
-from PySide6.QtGui import QPainter, QPixmap
+from PySide6.QtGui import QImageReader, QPainter, QPixmap
 
 from .models import NodeField
 
@@ -24,7 +25,7 @@ class PixmapCache:
         self.source_limit = max(1, int(source_limit))
         self.scaled_limit = max(1, int(scaled_limit))
         self._source_pixmap_cache: OrderedDict[str, QPixmap | None] = OrderedDict()
-        self._scaled_pixmap_cache: OrderedDict[tuple[str, int, int, str], QPixmap | None] = OrderedDict()
+        self._scaled_pixmap_cache: OrderedDict[tuple[str, int, int, str, bool], QPixmap | None] = OrderedDict()
 
     def clear(self) -> None:
         self._source_pixmap_cache.clear()
@@ -42,12 +43,22 @@ class PixmapCache:
         self._remember(self._source_pixmap_cache, cache_key, pixmap, self.source_limit)
         return pixmap
 
-    def scaled(self, path: str, width: int, height: int, mode: str = "contain") -> QPixmap | None:
+    def scaled(
+        self,
+        path: str,
+        width: int,
+        height: int,
+        mode: str = "contain",
+        *,
+        smooth: bool | None = None,
+    ) -> QPixmap | None:
         source = self.source(path)
         if source is None:
             return None
+        if smooth is None:
+            smooth = not is_pixel_art_image_path(path)
         normalized_mode = mode if mode in {"stretch", "contain", "cover"} else "contain"
-        cache_key = (path.strip(), max(1, width), max(1, height), normalized_mode)
+        cache_key = (path.strip(), max(1, width), max(1, height), normalized_mode, bool(smooth))
         cached = self._scaled_pixmap_cache.get(cache_key, _MISSING_PIXMAP)
         if cached is not _MISSING_PIXMAP:
             self._scaled_pixmap_cache.move_to_end(cache_key)
@@ -59,7 +70,8 @@ class PixmapCache:
             if normalized_mode == "cover"
             else Qt.KeepAspectRatio
         )
-        pixmap = source.scaled(cache_key[1], cache_key[2], aspect_mode, Qt.SmoothTransformation)
+        transform_mode = Qt.SmoothTransformation if smooth else Qt.FastTransformation
+        pixmap = source.scaled(cache_key[1], cache_key[2], aspect_mode, transform_mode)
         self._remember(self._scaled_pixmap_cache, cache_key, pixmap, self.scaled_limit)
         return pixmap
 
@@ -88,12 +100,13 @@ def draw_field_pixmap(
     if pixmap.isNull() or target.width() <= 0 or target.height() <= 0:
         return
     painter.save()
-    painter.setRenderHint(QPainter.SmoothPixmapTransform, smooth)
+    pixel_art = is_pixel_art_image_path(field.image_path)
+    painter.setRenderHint(QPainter.SmoothPixmapTransform, smooth and not pixel_art)
     fit = field.image_fit if field.image_fit in IMAGE_FIT_MODES else "stretch"
     if fit == "contain":
-        _draw_contain(painter, pixmap, target, scaled_pixmap)
+        _draw_contain(painter, pixmap, target, scaled_pixmap, pixel_art=pixel_art)
     elif fit == "cover":
-        _draw_cover(painter, pixmap, target, scaled_pixmap)
+        _draw_cover(painter, pixmap, target, scaled_pixmap, pixel_art=pixel_art)
     elif fit == "nine_slice":
         _draw_nine_slice(painter, pixmap, target, field)
     else:
@@ -104,24 +117,51 @@ def draw_field_pixmap(
     painter.restore()
 
 
-def _draw_contain(painter: QPainter, pixmap: QPixmap, target: QRectF, scaled_pixmap: QPixmap | None = None) -> None:
+def is_pixel_art_image_path(path: str) -> bool:
+    text = str(path or "").strip()
+    if not text:
+        return False
+    reader = QImageReader(text)
+    if reader.text("GameDesignerPixelArt").strip() == "1":
+        return True
+    parts = {part.lower() for part in Path(text).parts}
+    if "pixel" in parts:
+        return True
+    return False
+
+
+def _draw_contain(
+    painter: QPainter,
+    pixmap: QPixmap,
+    target: QRectF,
+    scaled_pixmap: QPixmap | None = None,
+    *,
+    pixel_art: bool = False,
+) -> None:
     scaled = scaled_pixmap or pixmap.scaled(
         max(1, int(target.width())),
         max(1, int(target.height())),
         Qt.KeepAspectRatio,
-        Qt.SmoothTransformation,
+        Qt.FastTransformation if pixel_art else Qt.SmoothTransformation,
     )
     x = target.x() + (target.width() - scaled.width()) / 2
     y = target.y() + (target.height() - scaled.height()) / 2
     painter.drawPixmap(int(x), int(y), scaled)
 
 
-def _draw_cover(painter: QPainter, pixmap: QPixmap, target: QRectF, scaled_pixmap: QPixmap | None = None) -> None:
+def _draw_cover(
+    painter: QPainter,
+    pixmap: QPixmap,
+    target: QRectF,
+    scaled_pixmap: QPixmap | None = None,
+    *,
+    pixel_art: bool = False,
+) -> None:
     scaled = scaled_pixmap or pixmap.scaled(
         max(1, int(target.width())),
         max(1, int(target.height())),
         Qt.KeepAspectRatioByExpanding,
-        Qt.SmoothTransformation,
+        Qt.FastTransformation if pixel_art else Qt.SmoothTransformation,
     )
     source_x = max(0, int((scaled.width() - target.width()) / 2))
     source_y = max(0, int((scaled.height() - target.height()) / 2))

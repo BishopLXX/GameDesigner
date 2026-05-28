@@ -31,7 +31,7 @@ FIELD_TYPES = [
 ]
 
 NODE_TYPES = ["普通", "画布", "超文本"]
-CANVAS_TYPES = ["normal", "data", "image"]
+CANVAS_TYPES = ["normal", "data", "image", "pixel"]
 DATA_LAYOUT_MODES = ["horizontal", "grid", "table"]
 DATA_ROW_STYLE_MODES = ["independent", "thumbnail"]
 IMAGE_FIT_MODES = ["stretch", "contain", "cover", "nine_slice"]
@@ -441,7 +441,10 @@ class CanvasData:
         return self.canvas_type == "data"
 
     def is_image_canvas(self) -> bool:
-        return self.canvas_type == "image"
+        return self.canvas_type in {"image", "pixel"}
+
+    def is_pixel_canvas(self) -> bool:
+        return self.canvas_type == "pixel"
 
     def find_node(self, node_id: str) -> Node | None:
         return next((node for node in self.nodes if node.id == node_id), None)
@@ -837,6 +840,151 @@ def default_image_canvas_nodes() -> tuple[Node, Node, Edge]:
     )
     edge = Edge(source=entry.id, target=output.id, label="生成目标")
     return entry, output, edge
+
+
+def default_pixel_canvas_nodes() -> tuple[list[Node], list[Edge]]:
+    entry = Node(
+        title="像素目标",
+        x=-860,
+        y=-180,
+        width=520,
+        height=260,
+        color=DEFAULT_NODE_COLOR,
+        icon="像",
+        fields=[
+            _visual_field(
+                "提示词",
+                "长文本",
+                "写清素材用途、主体、动作、朝向和尺寸，例如：32x32 酒馆地砖 tile，俯视 3/4，暖木色，可无缝平铺。",
+                16,
+                16,
+                472,
+                170,
+                13,
+            ),
+        ],
+    )
+    production = Node(
+        title="制作规格",
+        x=-230,
+        y=-310,
+        width=560,
+        height=330,
+        color=DEFAULT_NODE_COLOR,
+        icon="规",
+        fields=[
+            _visual_field(
+                "原生分辨率",
+                "长文本",
+                "必须先按 16/24/32/48/64/96 px 等小画布原生像素网格完成，再用 nearest-neighbor 整数倍预览。禁止高分辨率插画缩小、马赛克滤镜、半透明边缘和模糊采样。",
+                16,
+                16,
+                512,
+                118,
+                13,
+            ),
+            _visual_field(
+                "调色板",
+                "长文本",
+                "限制 12-24 个主色；每条色阶 3-5 档；暗部允许轻微冷暖偏移；避免照片级渐变、过多相近色和自动抗锯齿产生的新颜色。",
+                16,
+                148,
+                512,
+                118,
+                13,
+            ),
+        ],
+    )
+    pixel_perfect = Node(
+        title="完美像素线条",
+        x=-230,
+        y=80,
+        width=560,
+        height=360,
+        color=DEFAULT_NODE_COLOR,
+        icon="线",
+        fields=[
+            _visual_field(
+                "线条规则",
+                "长文本",
+                "使用 1px 硬边铅笔感线条；斜线和曲线要有规律的阶梯长度；清除 L 形拐角中多余的夹心像素；避免双宽斜线、毛刺、孤立噪点、随机单点高光和不受控抖动。",
+                16,
+                16,
+                512,
+                130,
+                13,
+            ),
+            _visual_field(
+                "像素簇",
+                "长文本",
+                "用清晰 pixel clusters 组织形体。每个亮面、暗面、轮廓块都应可读；小图标优先轮廓剪影和大块面，不靠细碎纹理堆信息。",
+                16,
+                160,
+                512,
+                118,
+                13,
+            ),
+        ],
+    )
+    style = Node(
+        title="高品质动作游戏像素方向",
+        x=430,
+        y=-250,
+        width=580,
+        height=360,
+        color=DEFAULT_NODE_COLOR,
+        icon="风",
+        fields=[
+            _visual_field(
+                "艺术原则",
+                "长文本",
+                "提炼优秀地牢/动作手游像素美术的通用原则：小体积高读性、夸张剪影、明确明暗块、饱和但克制的局部点色、道具和地表材质一眼可辨。不要复刻任何现有游戏角色、图标或具体资产。",
+                16,
+                16,
+                532,
+                130,
+                13,
+            ),
+            _visual_field(
+                "质检",
+                "长文本",
+                "缩到 1x 仍能读出主体；放大 400% 只有整齐方块像素；边缘无羽化；透明背景边缘无半透明脏边；tile 需四边可无缝衔接。",
+                16,
+                160,
+                532,
+                118,
+                13,
+            ),
+        ],
+    )
+    output_prompt = _visual_field(
+        "生成提示词",
+        "长文本",
+        "输出节点会汇总像素作画画布上下文生成最终提示词。",
+        16,
+        16,
+        456,
+        120,
+        13,
+    )
+    output_image = _visual_field("生成图片", "图片", "", 16, 150, 456, 256, 12)
+    output = Node(
+        title="输出",
+        x=1120,
+        y=-120,
+        width=506,
+        height=480,
+        color=DEFAULT_NODE_COLOR,
+        icon="图",
+        fields=[output_prompt, output_image],
+    )
+    edges = [
+        Edge(source=entry.id, target=production.id, label="素材目标"),
+        Edge(source=production.id, target=output.id, label="硬规格"),
+        Edge(source=pixel_perfect.id, target=output.id, label="完美像素"),
+        Edge(source=style.id, target=output.id, label="品质方向"),
+    ]
+    return [entry, production, pixel_perfect, style, output], edges
 
 
 def default_tech_tree_node(x: float = 0.0, y: float = 0.0) -> Node:

@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 from ..models import CanvasData, Node, NodeField, ProjectData
 from ..project_files.linked_documents import read_link_document
 from ..qt_canvas import NodeGraphView
+from ..image_rendering import is_pixel_art_image_path
 
 
 class NodePreviewPanel(QWidget):
@@ -274,7 +275,7 @@ class NodePreviewPanel(QWidget):
                         max(1, int(220 * scale)),
                         max(1, int(150 * scale)),
                         Qt.KeepAspectRatio,
-                        Qt.SmoothTransformation,
+                        Qt.FastTransformation if is_pixel_art_image_path(field.image_path) else Qt.SmoothTransformation,
                     )
                 )
                 image.setAlignment(Qt.AlignCenter)
@@ -324,7 +325,14 @@ class NodePreviewPanel(QWidget):
         image.setAlignment(Qt.AlignCenter)
         pixmap = QPixmap(str(self._resolved_image_path(field.image_path)))
         if not pixmap.isNull():
-            image.setPixmap(pixmap.scaled(420, 220, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            image.setPixmap(
+                pixmap.scaled(
+                    420,
+                    220,
+                    Qt.KeepAspectRatio,
+                    Qt.FastTransformation if is_pixel_art_image_path(field.image_path) else Qt.SmoothTransformation,
+                )
+            )
             layout.addWidget(image)
         else:
             layout.addWidget(self._small_text("图片路径无效或为空"))

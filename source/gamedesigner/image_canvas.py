@@ -28,6 +28,8 @@ class ImageCanvasRequestData:
 def canvas_type_label(canvas: CanvasData) -> str:
     if canvas.is_data_canvas():
         return "排序画布"
+    if canvas.is_pixel_canvas():
+        return "像素作画画布"
     if canvas.is_image_canvas():
         return "生图画布"
     return "自由画布"
@@ -98,6 +100,8 @@ def build_image_canvas_request(
     rules = canvas.ai_rules.strip()
     if rules:
         prompt_lines.append(rules)
+    if canvas.is_pixel_canvas():
+        prompt_lines.append(pixel_canvas_prompt_rules())
     if output_prompt:
         prompt_lines.append(output_prompt)
     if external_lines:
@@ -112,6 +116,20 @@ def build_image_canvas_request(
         reference_paths=_unique_paths(reference_paths),
         output_node_id=output.id,
         prompt_lines=prompt_lines,
+    )
+
+
+def pixel_canvas_prompt_rules() -> str:
+    return (
+        "【像素作画硬约束】\n"
+        "- 目标是专业像素美术素材，不是普通插画加马赛克滤镜；必须表现为原生像素网格上的手工像素画。\n"
+        "- 先以 ASE/Aseprite 式小尺寸工作画布思考：16x16、24x24、32x32、48x48、64x64、96x96 或用户指定尺寸；所有像素格必须是同一尺寸的正方形单元，预览只能 nearest-neighbor 整数倍放大。\n"
+        "- 禁止抗锯齿、模糊采样、柔焦、高光晕、半透明羽化边、照片级渐变、过量细碎噪点和 AI 伪纹理。\n"
+        "- 线条必须 pixel-perfect：1px 硬边，斜线阶梯规律，曲线由干净像素簇构成，清除 L 形拐角夹心像素、双宽斜线和孤立脏点。\n"
+        "- 使用有限调色板：默认 12-24 个主色，每条色阶 3-5 档；允许有控制的 hue shift；同材质颜色要成组稳定。\n"
+        "- 形体优先读性：强剪影、大块明暗、少量关键点色；小尺寸下仍能读出主体和用途。\n"
+        "- 如果是 tile 或地面，必须考虑无缝平铺、边缘连续、角落衔接和重复图案节奏。\n"
+        "- 可以提炼优秀动作/地牢手游像素美术的通用质量原则，但不得复刻任何现有游戏的角色、图标、场景或具体资产。"
     )
 
 
