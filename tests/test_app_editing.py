@@ -294,6 +294,23 @@ class AppEditingTests(unittest.TestCase):
                 self.assertEqual(loaded.ai_image_model, "custom-image")
                 dialog.deleteLater()
 
+    def test_ai_image_panel_shows_chinese_background_labels(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "PanelBackground.gdc"
+            settings = AppSettings(workspace_dir=folder, export_dir=str(Path(folder) / "exports"), ai_image_background="transparent")
+            with mock.patch.dict(os.environ, {"APPDATA": folder}):
+                panel = AiImagePanel(None, settings, lambda: ("ctx", Path(folder), project_path))
+
+                labels = [panel.background_combo.itemText(index) for index in range(panel.background_combo.count())]
+
+                self.assertIn("透明", labels)
+                self.assertIn("不透明", labels)
+                self.assertEqual(panel.background_combo.currentData(), "transparent")
+                panel.background_combo.setCurrentIndex(panel.background_combo.findData("opaque"))
+                panel._save_inline_settings()
+                self.assertEqual(settings.ai_image_background, "opaque")
+                panel.deleteLater()
+
     def test_ai_image_panel_loads_cached_images_when_reopened(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             project_path = Path(folder) / "CacheProject.gdc"

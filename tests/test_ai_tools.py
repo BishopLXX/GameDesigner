@@ -90,11 +90,9 @@ class AiToolsTests(unittest.TestCase):
         self.assertEqual(request.model, "gpt-image-1.5")
         self.assertEqual(request.size, "1024x1024")
         self.assertEqual(request.quality, "high")
-        self.assertEqual(request.background, "opaque")
+        self.assertEqual(request.background, "transparent")
         self.assertEqual(request.count, 2)
-        self.assertEqual(request.output_format, "png")
-        self.assertTrue(request.transparent_background_cleanup)
-        self.assertIn("#FFFFFF", request.prompt)
+        self.assertEqual(request.output_format, "webp")
         self.assertEqual(request.reference_paths, [Path("D:/ref.png")])
 
     def test_ai_image_request_uses_compatible_base_url(self) -> None:
@@ -230,58 +228,36 @@ class AiToolsTests(unittest.TestCase):
             self.assertEqual(len(loaded), 1)
             self.assertEqual(loaded[0].path, cached.path)
 
-    def test_transparent_ai_image_cache_removes_edge_connected_white_background(self) -> None:
-        source = Image.new("RGBA", (7, 7), (255, 255, 255, 255))
+    def test_pixel_ai_image_cache_auto_preserves_source_detail(self) -> None:
+        source = Image.new("RGBA", (12, 20), (0, 0, 0, 0))
         pixels = source.load()
-        for y in range(2, 5):
-            for x in range(2, 5):
-                pixels[x, y] = (220, 40, 32, 255)
-        pixels[3, 3] = (255, 255, 255, 255)
+        for y in range(20):
+            for x in range(12):
+                pixels[x, y] = ((x * 21 + y * 5) % 256, (x * 13 + y * 9) % 256, (x * 3 + y * 17) % 256, 255)
         buffer = BytesIO()
         source.save(buffer, format="PNG")
 
         with tempfile.TemporaryDirectory() as folder:
-            project_path = Path(folder) / "TransparentCacheProject.gdc"
+            project_path = Path(folder) / "PixelAutoProject.gdc"
 
             cached = cache_generated_ai_image(
                 project_path,
-                AiGeneratedImage(buffer.getvalue(), "jpeg"),
+                AiGeneratedImage(buffer.getvalue(), "webp"),
                 index=1,
-                transparent_background=True,
-            )
-            processed = QImage(str(cached.path))
-
-            self.assertEqual(cached.path.suffix.lower(), ".png")
-            self.assertFalse(is_pixel_art_image_path(str(cached.path)))
-            self.assertEqual(processed.pixelColor(0, 0).alpha(), 0)
-            self.assertEqual(processed.pixelColor(2, 2).alpha(), 255)
-            self.assertEqual(processed.pixelColor(3, 3).alpha(), 255)
-            self.assertGreater(processed.pixelColor(3, 3).red(), 240)
-
-    def test_transparent_pixel_ai_cache_cleans_white_before_sampling(self) -> None:
-        source = Image.new("RGBA", (4, 4), (255, 255, 255, 255))
-        pixels = source.load()
-        for y in range(1, 3):
-            for x in range(1, 3):
-                pixels[x, y] = (32, 180, 80, 255)
-        buffer = BytesIO()
-        source.save(buffer, format="PNG")
-
-        with tempfile.TemporaryDirectory() as folder:
-            project_path = Path(folder) / "TransparentPixelCacheProject.gdc"
-
-            cached = cache_generated_ai_image(
-                project_path,
-                AiGeneratedImage(buffer.getvalue(), "png"),
-                index=1,
+                cache_key="canvas-a",
                 pixel_mode=True,
-                pixel_output_size="4x4",
-                transparent_background=True,
+                pixel_output_size="auto",
             )
             processed = QImage(str(cached.path))
+            colors = {
+                processed.pixelColor(x, y).rgba()
+                for y in range(processed.height())
+                for x in range(processed.width())
+            }
 
-            self.assertEqual(processed.pixelColor(0, 0).alpha(), 0)
-            self.assertEqual(processed.pixelColor(1, 1).alpha(), 255)
+            self.assertEqual((processed.width(), processed.height()), (12, 20))
+            self.assertTrue(is_pixel_art_image_path(str(cached.path)))
+            self.assertGreater(len(colors), 128)
 
     def test_pixel_ai_image_cache_enforces_fixed_grid_png(self) -> None:
         source = Image.new("RGBA", (8, 8))
@@ -332,6 +308,33 @@ class AiToolsTests(unittest.TestCase):
             self.assertEqual(processed.pixelColor(0, 0).rgba(), QImage.fromData(buffer.getvalue()).pixelColor(0, 0).rgba())
             self.assertEqual([image.path for image in loaded], [cached.path])
             self.assertEqual(normal_loaded, [])
+
+    def test_pixel_ai_image_cache_drops_sparse_edge_fragments(self) -> None:
+        source = Image.new("RGBA", (8, 8), (0, 0, 0, 0))
+        pixels = source.load()
+        for y in range(4):
+            for x in range(4):
+                pixels[x, y] = (238, 136, 72, 255)
+        pixels[4, 0] = (238, 136, 72, 255)
+        pixels[5, 0] = (238, 136, 72, 255)
+        buffer = BytesIO()
+        source.save(buffer, format="PNG")
+
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "PixelSparseEdgeProject.gdc"
+
+            cached = cache_generated_ai_image(
+                project_path,
+                AiGeneratedImage(buffer.getvalue(), "png"),
+                index=1,
+                cache_key="canvas-a",
+                pixel_mode=True,
+                pixel_output_size="2x2",
+            )
+            processed = QImage(str(cached.path))
+
+            self.assertEqual(processed.pixelColor(0, 0).alpha(), 255)
+            self.assertEqual(processed.pixelColor(1, 0).alpha(), 0)
 
     def test_pixel_ai_image_cache_clamps_output_size_to_source(self) -> None:
         source = Image.new("RGBA", (8, 8), (10, 20, 30, 255))

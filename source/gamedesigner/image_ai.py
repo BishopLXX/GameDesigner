@@ -17,12 +17,13 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtGui import QImage
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageOps
 from PIL.PngImagePlugin import PngInfo
 
 from .ai_presets import normalize_ai_credentials
 from .pixel_art import (
     PIXEL_ART_ALPHA_THRESHOLD,
+    PIXEL_ART_CELL_ALPHA_COVERAGE_THRESHOLD,
     PIXEL_ART_SAMPLE_BLOCK,
     normalized_pixel_output_size,
     pixel_art_palette_limit,
@@ -52,7 +53,6 @@ AI_IMAGE_QUALITY_PRESETS = ["auto", "low", "medium", "high"]
 AI_IMAGE_BACKGROUND_PRESETS = ["auto", "transparent", "opaque"]
 AI_IMAGE_OUTPUT_FORMAT_PRESETS = ["png", "webp", "jpeg"]
 AI_IMAGE_PROVIDERS = {"openai", "compatible"}
-WHITE_BACKGROUND_RGB_THRESHOLD = 250
 
 
 class AiImageError(RuntimeError):
@@ -79,7 +79,6 @@ class AiImageRequest:
     background: str = "auto"
     count: int = 1
     output_format: str = "png"
-    transparent_background_cleanup: bool = False
 
 
 @dataclass(frozen=True)
@@ -124,26 +123,22 @@ def build_ai_image_request(
         str(getattr(settings, "ai_image_background", "auto") or "auto"),
         AI_IMAGE_BACKGROUND_PRESETS,
     )
-    transparent_background_cleanup = requested_background == "transparent"
     output_format = _coerce_choice(
         str(getattr(settings, "ai_image_output_format", "png") or "png"),
         AI_IMAGE_OUTPUT_FORMAT_PRESETS,
     )
-    if transparent_background_cleanup:
-        output_format = "png"
     return AiImageRequest(
         api_key=api_key,
         base_url=base_url.rstrip("/"),
         provider=provider,
         model=model,
-        prompt=_prompt_for_transparent_background_cleanup(prompt) if transparent_background_cleanup else prompt.strip(),
+        prompt=prompt.strip(),
         reference_paths=[Path(path) for path in (reference_paths or [])],
         size=_coerce_choice(str(getattr(settings, "ai_image_size", "auto") or "auto"), AI_IMAGE_SIZE_PRESETS),
         quality=_coerce_choice(str(getattr(settings, "ai_image_quality", "auto") or "auto"), AI_IMAGE_QUALITY_PRESETS),
-        background="opaque" if transparent_background_cleanup else requested_background,
+        background=requested_background,
         count=_coerce_count(getattr(settings, "ai_image_count", 1)),
         output_format=output_format,
-        transparent_background_cleanup=transparent_background_cleanup,
     )
 
 
@@ -167,17 +162,6 @@ def generate_ai_images(request: AiImageRequest) -> list[AiGeneratedImage]:
             "application/json",
         )
     return _parse_images_response(raw, request.output_format)
-
-
-def _prompt_for_transparent_background_cleanup(prompt: str) -> str:
-    cleaned = prompt.strip()
-    white_background_rule = (
-        "透明背景后处理要求：请把主体画在纯白色 #FFFFFF 背景上，背景必须干净、平整、无阴影、无渐变、无纹理、无棋盘格。"
-        "不要把白色背景画成主体的一部分；生成后本地会把边缘连通的纯白背景像素转为真正透明。"
-    )
-    if not cleaned:
-        return white_background_rule
-    return f"{cleaned}\n{white_background_rule}"
 
 
 def save_ai_image_reference(project_path: str | Path, source_path: str | Path) -> AiImageReference:
@@ -224,17 +208,12 @@ def cache_generated_ai_image(
     cache_key: str = "",
     pixel_mode: bool = False,
     pixel_output_size: str = "auto",
-    transparent_background: bool = False,
 ) -> CachedAiImage:
     folder = _ai_image_cache_folder(project_path, cache_key, pixel_mode=pixel_mode, pixel_output_size=pixel_output_size)
     folder.mkdir(parents=True, exist_ok=True)
-    extension = "png" if pixel_mode or transparent_background else _safe_output_extension(image.output_format)
+    extension = "png" if pixel_mode else _safe_output_extension(image.output_format)
     path = folder / f"cache_{_timestamp()}_{index}_{uuid.uuid4().hex[:8]}.{extension}"
-    data = image.data
-    if transparent_background:
-        data = _white_background_to_transparent_bytes(data)
-    if pixel_mode:
-        data = _pixel_art_image_bytes(data, pixel_output_size=pixel_output_size)
+    data = _pixel_art_image_bytes(image.data, pixel_output_size=pixel_output_size) if pixel_mode else image.data
     path.write_bytes(data)
     return cached_ai_image_from_path(path, revised_prompt=image.revised_prompt)
 
@@ -572,55 +551,13 @@ def _ai_image_cache_folder(
     return folder
 
 
-def _white_background_to_transparent_bytes(raw: bytes) -> bytes:
-    with Image.open(BytesIO(raw)) as source:
-        image = ImageOps.exif_transpose(source).convert("RGBA")
-        cleaned = _white_background_to_transparent_image(image)
-        return _image_to_png_bytes(cleaned)
-
-
-def _white_background_to_transparent_image(image: Image.Image) -> Image.Image:
-    width, height = image.size
-    if width <= 0 or height <= 0:
-        return image.copy()
-    rgba = image.convert("RGBA")
-    white_mask = Image.new("L", (width, height), 0)
-    source_pixels = rgba.load()
-    mask_pixels = white_mask.load()
-    for y in range(height):
-        for x in range(width):
-            red, green, blue, alpha = source_pixels[x, y]
-            if (
-                alpha >= PIXEL_ART_ALPHA_THRESHOLD
-                and red >= WHITE_BACKGROUND_RGB_THRESHOLD
-                and green >= WHITE_BACKGROUND_RGB_THRESHOLD
-                and blue >= WHITE_BACKGROUND_RGB_THRESHOLD
-            ):
-                mask_pixels[x, y] = 255
-    for x in range(width):
-        if mask_pixels[x, 0] == 255:
-            ImageDraw.floodfill(white_mask, (x, 0), 128)
-        if mask_pixels[x, height - 1] == 255:
-            ImageDraw.floodfill(white_mask, (x, height - 1), 128)
-    for y in range(height):
-        if mask_pixels[0, y] == 255:
-            ImageDraw.floodfill(white_mask, (0, y), 128)
-        if mask_pixels[width - 1, y] == 255:
-            ImageDraw.floodfill(white_mask, (width - 1, y), 128)
-    alpha = rgba.getchannel("A")
-    alpha_pixels = alpha.load()
-    for y in range(height):
-        for x in range(width):
-            if mask_pixels[x, y] == 128:
-                alpha_pixels[x, y] = 0
-    rgba.putalpha(alpha)
-    return rgba
-
-
 def _pixel_art_image_bytes(raw: bytes, *, pixel_output_size: str = "auto") -> bytes:
     with Image.open(BytesIO(raw)) as source:
         source = ImageOps.exif_transpose(source).convert("RGBA")
-        sampled = _pixel_grid_sample(source, pixel_output_size=pixel_output_size)
+        if pixel_output_size_dimensions(pixel_output_size) is None:
+            sampled = source.copy()
+        else:
+            sampled = _pixel_grid_sample(source, pixel_output_size=pixel_output_size)
         alpha = sampled.getchannel("A").point(
             lambda value: 255 if value >= PIXEL_ART_ALPHA_THRESHOLD else 0,
             mode="L",
@@ -655,12 +592,19 @@ def _pixel_grid_sample(image: Image.Image, *, pixel_output_size: str = "auto") -
             left = min(image.width - 1, x * block)
             right = min(image.width, left + block)
             cell = image.crop((left, top, right, bottom))
-            pixels[x + x_pad, y + y_pad] = _dominant_cell_color(cell)
+            pixels[x + x_pad, y + y_pad] = _dominant_cell_color(
+                cell,
+                min_alpha_coverage=PIXEL_ART_CELL_ALPHA_COVERAGE_THRESHOLD,
+            )
     _apply_palette_quantization(result, pixel_art_palette_limit(target_width, target_height))
     return result
 
 
-def _dominant_cell_color(cell: Image.Image) -> tuple[int, int, int, int]:
+def _dominant_cell_color(
+    cell: Image.Image,
+    *,
+    min_alpha_coverage: float = 0.0,
+) -> tuple[int, int, int, int]:
     rgba = cell.convert("RGBA")
     if hasattr(rgba, "get_flattened_data"):
         pixels = list(rgba.get_flattened_data())
@@ -668,6 +612,8 @@ def _dominant_cell_color(cell: Image.Image) -> tuple[int, int, int, int]:
         pixels = list(rgba.getdata())
     opaque = [pixel for pixel in pixels if pixel[3] >= PIXEL_ART_ALPHA_THRESHOLD]
     if not opaque:
+        return 0, 0, 0, 0
+    if len(opaque) / max(1, len(pixels)) < max(0.0, min(1.0, min_alpha_coverage)):
         return 0, 0, 0, 0
     channels = list(zip(*opaque, strict=False))
     return tuple(int(sorted(channel)[len(channel) // 2]) for channel in channels)  # type: ignore[return-value]

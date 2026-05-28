@@ -52,6 +52,33 @@ from ..window_layouts import restore_window_layout, save_window_layout
 from .submit_text_edit import SubmitPlainTextEdit
 
 
+AI_IMAGE_BACKGROUND_LABELS = {
+    "auto": "自动",
+    "transparent": "透明",
+    "opaque": "不透明",
+}
+
+
+def _fill_value_combo(combo: QComboBox, values: list[str], current: str, labels: dict[str, str] | None = None) -> None:
+    labels = labels or {}
+    for value in values:
+        combo.addItem(labels.get(value, value), value)
+    index = combo.findData(current or values[0])
+    if index >= 0:
+        combo.setCurrentIndex(index)
+    elif combo.isEditable():
+        combo.setEditText(current.strip() or values[0])
+    else:
+        combo.setCurrentIndex(0)
+
+
+def _combo_value(combo: QComboBox, fallback: str = "") -> str:
+    value = combo.currentData()
+    if isinstance(value, str) and value:
+        return value
+    return combo.currentText().strip() or fallback
+
+
 class AiImageSettingsDialog(QDialog):
     def __init__(self, parent: QWidget | None, settings: AppSettings) -> None:
         super().__init__(parent)
@@ -208,7 +235,6 @@ class ImageGenerationThread(QThread):
                     cache_key=self.cache_key,
                     pixel_mode=self.pixel_mode,
                     pixel_output_size=self.pixel_output_size,
-                    transparent_background=self.request.transparent_background_cleanup,
                 )
                 for index, image in enumerate(images, start=1)
             ]
@@ -293,7 +319,12 @@ class AiImagePanel(QWidget):
         self.quality_combo.currentTextChanged.connect(self._save_inline_settings)
 
         self.background_combo = QComboBox()
-        self._fill_combo(self.background_combo, AI_IMAGE_BACKGROUND_PRESETS, settings.ai_image_background)
+        _fill_value_combo(
+            self.background_combo,
+            AI_IMAGE_BACKGROUND_PRESETS,
+            settings.ai_image_background,
+            AI_IMAGE_BACKGROUND_LABELS,
+        )
         self.background_combo.currentTextChanged.connect(self._save_inline_settings)
 
         self.count_spin = QSpinBox()
@@ -448,14 +479,7 @@ class AiImagePanel(QWidget):
         self.load_project_cache()
 
     def _fill_combo(self, combo: QComboBox, values: list[str], current: str) -> None:
-        combo.addItems(values)
-        index = combo.findText(current or values[0])
-        if index >= 0:
-            combo.setCurrentIndex(index)
-        elif combo.isEditable():
-            combo.setEditText(current.strip() or values[0])
-        else:
-            combo.setCurrentIndex(0)
+        _fill_value_combo(combo, values, current)
 
     def _refresh_header(self) -> None:
         provider = "OpenAI 官方" if self.settings.ai_image_provider == "openai" else "兼容 API"
@@ -502,7 +526,7 @@ class AiImagePanel(QWidget):
         self.settings.ai_image_model = self.model_combo.currentText().strip() or AI_IMAGE_MODEL_PRESETS[0]
         self.settings.ai_image_size = self.size_combo.currentText().strip() or "auto"
         self.settings.ai_image_quality = self.quality_combo.currentText().strip() or "auto"
-        self.settings.ai_image_background = self.background_combo.currentText().strip() or "auto"
+        self.settings.ai_image_background = _combo_value(self.background_combo, "auto")
         self.settings.ai_image_count = self.count_spin.value()
         self.settings.ai_pixel_output_size = normalized_pixel_output_size(self.pixel_output_combo.currentText())
         save_settings(self.settings)
