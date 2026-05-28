@@ -336,6 +336,66 @@ class AiToolsTests(unittest.TestCase):
             self.assertEqual(processed.pixelColor(0, 0).alpha(), 255)
             self.assertEqual(processed.pixelColor(1, 0).alpha(), 0)
 
+    def test_pixel_ai_image_cache_preserves_thin_dark_outline(self) -> None:
+        source = Image.new("RGBA", (12, 12), (236, 238, 244, 255))
+        pixels = source.load()
+        for y in range(12):
+            for x in range(5, 7):
+                pixels[x, y] = (18, 20, 28, 255)
+        for y in range(12):
+            pixels[8, y] = (248, 248, 252, 255)
+        buffer = BytesIO()
+        source.save(buffer, format="PNG")
+
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "PixelOutlineProject.gdc"
+
+            cached = cache_generated_ai_image(
+                project_path,
+                AiGeneratedImage(buffer.getvalue(), "png"),
+                index=1,
+                cache_key="canvas-a",
+                pixel_mode=True,
+                pixel_output_size="3x3",
+            )
+            processed = QImage(str(cached.path))
+
+            self.assertEqual((processed.width(), processed.height()), (3, 3))
+            self.assertLess(processed.pixelColor(1, 0).red(), 64)
+            self.assertLess(processed.pixelColor(1, 1).red(), 64)
+            self.assertLess(processed.pixelColor(1, 2).red(), 64)
+
+    def test_pixel_ai_image_cache_preserves_clustered_blue_accent(self) -> None:
+        source = Image.new("RGBA", (12, 12), (52, 64, 84, 255))
+        pixels = source.load()
+        for y in range(4, 8):
+            for x in range(4, 8):
+                pixels[x, y] = (24, 224, 246, 255)
+        for y in range(12):
+            for x in range(12):
+                if (x + y) % 5 == 0:
+                    pixels[x, y] = (70, 78, 96, 255)
+        buffer = BytesIO()
+        source.save(buffer, format="PNG")
+
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "PixelAccentProject.gdc"
+
+            cached = cache_generated_ai_image(
+                project_path,
+                AiGeneratedImage(buffer.getvalue(), "png"),
+                index=1,
+                cache_key="canvas-a",
+                pixel_mode=True,
+                pixel_output_size="3x3",
+            )
+            processed = QImage(str(cached.path))
+            accent = processed.pixelColor(1, 1)
+
+            self.assertGreater(accent.blue(), 180)
+            self.assertGreater(accent.green(), 160)
+            self.assertLess(accent.red(), 80)
+
     def test_pixel_ai_image_cache_clamps_output_size_to_source(self) -> None:
         source = Image.new("RGBA", (8, 8), (10, 20, 30, 255))
         buffer = BytesIO()

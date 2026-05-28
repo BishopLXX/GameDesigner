@@ -14,7 +14,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from PySide6.QtGui import QImage
 from PIL import Image, ImageOps
@@ -53,6 +53,12 @@ AI_IMAGE_QUALITY_PRESETS = ["auto", "low", "medium", "high"]
 AI_IMAGE_BACKGROUND_PRESETS = ["auto", "transparent", "opaque"]
 AI_IMAGE_OUTPUT_FORMAT_PRESETS = ["png", "webp", "jpeg"]
 AI_IMAGE_PROVIDERS = {"openai", "compatible"}
+PIXEL_ART_OUTLINE_LUMA_MAX = 72
+PIXEL_ART_OUTLINE_CELL_COVERAGE_THRESHOLD = 0.18
+PIXEL_ART_ACCENT_CELL_COVERAGE_THRESHOLD = 0.18
+PIXEL_ART_ACCENT_SATURATION_THRESHOLD = 58
+PIXEL_ART_ACCENT_CHANNEL_THRESHOLD = 172
+PIXEL_ART_SINGLE_PIXEL_FEATURE_COVERAGE_THRESHOLD = 0.10
 
 
 class AiImageError(RuntimeError):
@@ -613,10 +619,109 @@ def _dominant_cell_color(
     opaque = [pixel for pixel in pixels if pixel[3] >= PIXEL_ART_ALPHA_THRESHOLD]
     if not opaque:
         return 0, 0, 0, 0
-    if len(opaque) / max(1, len(pixels)) < max(0.0, min(1.0, min_alpha_coverage)):
+    cell_area = max(1, len(pixels))
+    opaque_coverage = len(opaque) / cell_area
+    dark_pixels = _clustered_cell_feature_pixels(
+        rgba,
+        lambda pixel: _pixel_luminance(pixel) <= PIXEL_ART_OUTLINE_LUMA_MAX,
+        min_coverage=PIXEL_ART_OUTLINE_CELL_COVERAGE_THRESHOLD,
+    )
+    if dark_pixels:
+        return _median_cell_color(dark_pixels)
+    if opaque_coverage < max(0.0, min(1.0, min_alpha_coverage)):
         return 0, 0, 0, 0
-    channels = list(zip(*opaque, strict=False))
+    accent_pixels = _clustered_cell_feature_pixels(
+        rgba,
+        _is_pixel_art_accent_pixel,
+        min_coverage=PIXEL_ART_ACCENT_CELL_COVERAGE_THRESHOLD,
+    )
+    if accent_pixels:
+        return _median_cell_color(accent_pixels)
+    return _trimmed_average_cell_color(opaque)
+
+
+def _pixel_luminance(pixel: tuple[int, int, int, int]) -> float:
+    return 0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2]
+
+
+def _is_pixel_art_accent_pixel(pixel: tuple[int, int, int, int]) -> bool:
+    red, green, blue, alpha = pixel
+    if alpha < PIXEL_ART_ALPHA_THRESHOLD:
+        return False
+    highest = max(red, green, blue)
+    lowest = min(red, green, blue)
+    if highest >= 224 and _pixel_luminance(pixel) >= 168:
+        return True
+    return (
+        highest >= PIXEL_ART_ACCENT_CHANNEL_THRESHOLD
+        and highest - lowest >= PIXEL_ART_ACCENT_SATURATION_THRESHOLD
+        and _pixel_luminance(pixel) >= 80
+    )
+
+
+def _clustered_cell_feature_pixels(
+    cell: Image.Image,
+    predicate: Callable[[tuple[int, int, int, int]], bool],
+    *,
+    min_coverage: float,
+) -> list[tuple[int, int, int, int]]:
+    rgba = cell.convert("RGBA")
+    if hasattr(rgba, "get_flattened_data"):
+        raw_pixels = [tuple(pixel[:4]) for pixel in rgba.get_flattened_data()]
+    else:  # pragma: no cover - Pillow compatibility fallback.
+        raw_pixels = [tuple(pixel[:4]) for pixel in rgba.getdata()]
+    width, height = rgba.size
+    feature_indices = [
+        index
+        for index, pixel in enumerate(raw_pixels)
+        if pixel[3] >= PIXEL_ART_ALPHA_THRESHOLD and predicate(pixel)
+    ]
+    if not feature_indices:
+        return []
+    cell_area = max(1, width * height)
+    feature_coverage = len(feature_indices) / cell_area
+    feature_set = set(feature_indices)
+    clustered_indices = [
+        index
+        for index in feature_indices
+        if _has_neighboring_feature(index, width, height, feature_set)
+    ]
+    if clustered_indices and len(clustered_indices) / cell_area >= max(0.0, min_coverage):
+        return [raw_pixels[index] for index in clustered_indices]
+    if len(feature_indices) == 1 and feature_coverage >= PIXEL_ART_SINGLE_PIXEL_FEATURE_COVERAGE_THRESHOLD:
+        return [raw_pixels[feature_indices[0]]]
+    return []
+
+
+def _has_neighboring_feature(index: int, width: int, height: int, feature_indices: set[int]) -> bool:
+    x = index % width
+    y = index // width
+    for neighbor_y in range(max(0, y - 1), min(height, y + 2)):
+        for neighbor_x in range(max(0, x - 1), min(width, x + 2)):
+            neighbor_index = neighbor_y * width + neighbor_x
+            if neighbor_index != index and neighbor_index in feature_indices:
+                return True
+    return False
+
+
+def _median_cell_color(pixels: list[tuple[int, int, int, int]]) -> tuple[int, int, int, int]:
+    channels = list(zip(*pixels, strict=False))
     return tuple(int(sorted(channel)[len(channel) // 2]) for channel in channels)  # type: ignore[return-value]
+
+
+def _trimmed_average_cell_color(pixels: list[tuple[int, int, int, int]]) -> tuple[int, int, int, int]:
+    ordered = sorted(pixels, key=_pixel_luminance)
+    trim = len(ordered) // 8
+    if trim > 0 and len(ordered) - trim * 2 >= 3:
+        ordered = ordered[trim:-trim]
+    alpha_sum = sum(max(1, pixel[3]) for pixel in ordered)
+    if alpha_sum <= 0:
+        return 0, 0, 0, 0
+    red = sum(pixel[0] * max(1, pixel[3]) for pixel in ordered) / alpha_sum
+    green = sum(pixel[1] * max(1, pixel[3]) for pixel in ordered) / alpha_sum
+    blue = sum(pixel[2] * max(1, pixel[3]) for pixel in ordered) / alpha_sum
+    alpha = sum(pixel[3] for pixel in ordered) / max(1, len(ordered))
+    return int(round(red)), int(round(green)), int(round(blue)), int(round(alpha))
 
 
 def _apply_palette_quantization(image: Image.Image, limit: int) -> None:
