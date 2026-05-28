@@ -95,6 +95,55 @@ class AiToolsTests(unittest.TestCase):
         self.assertEqual(request.output_format, "webp")
         self.assertEqual(request.reference_paths, [Path("D:/ref.png")])
 
+    def test_ai_image_request_allows_small_gpt_image_2_size(self) -> None:
+        settings = AppSettings(
+            ai_image_provider="openai",
+            ai_image_model="gpt-image-2",
+            ai_image_api_key="secret",
+            ai_image_size="816x816",
+        )
+
+        request = build_ai_image_request(settings, "pixel character")
+
+        self.assertEqual(request.size, "816x816")
+
+    def test_ai_image_request_keeps_custom_size_for_compatible_provider(self) -> None:
+        settings = AppSettings(
+            ai_image_provider="compatible",
+            ai_image_model="custom-image-model",
+            ai_image_api_key="secret",
+            ai_image_base_url="https://images.example.test/v1",
+            ai_image_size="816x816",
+        )
+
+        request = build_ai_image_request(settings, "pixel character")
+
+        self.assertEqual(request.size, "816x816")
+
+    def test_ai_image_request_drops_unsupported_small_legacy_size(self) -> None:
+        settings = AppSettings(
+            ai_image_provider="openai",
+            ai_image_model="gpt-image-1.5",
+            ai_image_api_key="secret",
+            ai_image_size="816x816",
+        )
+
+        request = build_ai_image_request(settings, "pixel character")
+
+        self.assertEqual(request.size, "auto")
+
+    def test_ai_image_request_drops_tiny_gpt_image_2_size(self) -> None:
+        settings = AppSettings(
+            ai_image_provider="openai",
+            ai_image_model="gpt-image-2",
+            ai_image_api_key="secret",
+            ai_image_size="256x256",
+        )
+
+        request = build_ai_image_request(settings, "pixel character")
+
+        self.assertEqual(request.size, "auto")
+
     def test_ai_image_request_uses_compatible_base_url(self) -> None:
         settings = AppSettings(
             ai_image_provider="compatible",
@@ -133,7 +182,7 @@ class AiToolsTests(unittest.TestCase):
             ai_image_model="gpt-image-2",
             ai_image_api_key="image-key",
             ai_image_base_url="https://images.example.test/v1",
-            ai_image_size="1536x1024",
+            ai_image_size="816x816",
             ai_image_quality="medium",
             ai_image_background="opaque",
             ai_image_count=3,
@@ -147,7 +196,7 @@ class AiToolsTests(unittest.TestCase):
         self.assertEqual(loaded.ai_image_model, "gpt-image-2")
         self.assertEqual(loaded.ai_image_api_key, "image-key")
         self.assertEqual(loaded.ai_image_base_url, "https://images.example.test/v1")
-        self.assertEqual(loaded.ai_image_size, "1536x1024")
+        self.assertEqual(loaded.ai_image_size, "816x816")
         self.assertEqual(loaded.ai_image_quality, "medium")
         self.assertEqual(loaded.ai_image_background, "opaque")
         self.assertEqual(loaded.ai_image_count, 3)

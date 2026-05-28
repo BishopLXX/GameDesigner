@@ -46,7 +46,7 @@ from ..image_ai import (
     save_ai_image_reference_from_qimage,
 )
 from ..image_rendering import PixmapCache
-from ..pixel_art import AI_IMAGE_PIXEL_OUTPUT_SIZE_PRESETS, normalized_pixel_output_size
+from ..pixel_art import AI_IMAGE_PIXEL_OUTPUT_SIZE_PRESETS, normalized_ai_image_size, normalized_pixel_output_size
 from ..storage import AppSettings, save_settings
 from ..window_layouts import restore_window_layout, save_window_layout
 from .submit_text_edit import SubmitPlainTextEdit
@@ -311,8 +311,11 @@ class AiImagePanel(QWidget):
         self.model_combo.currentTextChanged.connect(self._save_inline_settings)
 
         self.size_combo = QComboBox()
+        self.size_combo.setEditable(True)
         self._fill_combo(self.size_combo, AI_IMAGE_SIZE_PRESETS, settings.ai_image_size)
         self.size_combo.currentTextChanged.connect(self._save_inline_settings)
+        if self.size_combo.lineEdit() is not None:
+            self.size_combo.lineEdit().editingFinished.connect(self._save_inline_settings)
 
         self.quality_combo = QComboBox()
         self._fill_combo(self.quality_combo, AI_IMAGE_QUALITY_PRESETS, settings.ai_image_quality)
@@ -524,7 +527,7 @@ class AiImagePanel(QWidget):
 
     def _save_inline_settings(self, *_args) -> None:
         self.settings.ai_image_model = self.model_combo.currentText().strip() or AI_IMAGE_MODEL_PRESETS[0]
-        self.settings.ai_image_size = self.size_combo.currentText().strip() or "auto"
+        self.settings.ai_image_size = normalized_ai_image_size(self.size_combo.currentText())
         self.settings.ai_image_quality = self.quality_combo.currentText().strip() or "auto"
         self.settings.ai_image_background = _combo_value(self.background_combo, "auto")
         self.settings.ai_image_count = self.count_spin.value()

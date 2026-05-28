@@ -548,6 +548,23 @@ class AppEditingTests(unittest.TestCase):
             self.assertEqual(panel.cached_images, [])
             panel.deleteLater()
 
+    def test_ai_image_panel_keeps_custom_image_size(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "CustomSize.gdc"
+            settings = AppSettings(
+                workspace_dir=folder,
+                export_dir=str(Path(folder) / "exports"),
+                ai_image_size="816x816",
+            )
+            context_provider = lambda: ("ctx", Path(folder), project_path)
+            panel = AiImagePanel(None, settings, context_provider)
+
+            panel.size_combo.setEditText("768x864")
+            panel._save_inline_settings()
+
+            self.assertEqual(settings.ai_image_size, "768x864")
+            panel.deleteLater()
+
     def test_ai_settings_dialog_one_click_uses_ollama_free_preset(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             settings = AppSettings(workspace_dir=folder, export_dir=str(Path(folder) / "exports"))

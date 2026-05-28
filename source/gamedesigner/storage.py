@@ -9,7 +9,7 @@ from typing import Any
 
 from .ai_presets import clean_ai_saved_connections, normalize_ai_credentials
 from .models import EDGE_STYLES, ProjectData, default_project
-from .pixel_art import normalized_pixel_output_size
+from .pixel_art import normalized_ai_image_size, normalized_pixel_output_size
 
 
 APP_NAME = "GameDesigner"
@@ -78,7 +78,7 @@ class AppSettings:
             "ai_image_model": self.ai_image_model,
             "ai_image_api_key": ai_image_api_key,
             "ai_image_base_url": ai_image_base_url,
-            "ai_image_size": self.ai_image_size,
+            "ai_image_size": normalized_ai_image_size(self.ai_image_size),
             "ai_image_quality": self.ai_image_quality,
             "ai_image_background": self.ai_image_background,
             "ai_image_count": self.ai_image_count,
@@ -134,7 +134,7 @@ class AppSettings:
             ai_image_model=str(raw.get("ai_image_model", "gpt-image-1.5") or "gpt-image-1.5"),
             ai_image_api_key=ai_image_api_key,
             ai_image_base_url=ai_image_base_url,
-            ai_image_size=_coerce_string_choice(raw.get("ai_image_size"), {"auto", "1024x1024", "1536x1024", "1024x1536"}, "auto"),
+            ai_image_size=normalized_ai_image_size(raw.get("ai_image_size")),
             ai_image_quality=_coerce_string_choice(raw.get("ai_image_quality"), {"auto", "low", "medium", "high"}, "auto"),
             ai_image_background=_coerce_string_choice(raw.get("ai_image_background"), {"auto", "transparent", "opaque"}, "auto"),
             ai_image_count=_coerce_int(raw.get("ai_image_count"), 1, 10, 1),

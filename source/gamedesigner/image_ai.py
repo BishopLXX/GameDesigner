@@ -22,9 +22,12 @@ from PIL.PngImagePlugin import PngInfo
 
 from .ai_presets import normalize_ai_credentials
 from .pixel_art import (
+    AI_IMAGE_SIZE_PRESETS,
     PIXEL_ART_ALPHA_THRESHOLD,
     PIXEL_ART_CELL_ALPHA_COVERAGE_THRESHOLD,
     PIXEL_ART_SAMPLE_BLOCK,
+    api_ai_image_size,
+    normalized_ai_image_size,
     normalized_pixel_output_size,
     pixel_art_palette_limit,
     pixel_output_size_dimensions,
@@ -42,12 +45,6 @@ AI_IMAGE_MODEL_PRESETS = [
     "gpt-image-1-mini",
     "gpt-image-2",
     "dall-e-3",
-]
-AI_IMAGE_SIZE_PRESETS = [
-    "auto",
-    "1024x1024",
-    "1536x1024",
-    "1024x1536",
 ]
 AI_IMAGE_QUALITY_PRESETS = ["auto", "low", "medium", "high"]
 AI_IMAGE_BACKGROUND_PRESETS = ["auto", "transparent", "opaque"]
@@ -124,7 +121,6 @@ def build_ai_image_request(
     api_key = configured_key or os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise AiImageError("请先在生图设置里填写 OpenAI 或兼容服务的 API Key。")
-    model = str(getattr(settings, "ai_image_model", "") or "").strip() or AI_IMAGE_MODEL_PRESETS[0]
     requested_background = _coerce_choice(
         str(getattr(settings, "ai_image_background", "auto") or "auto"),
         AI_IMAGE_BACKGROUND_PRESETS,
@@ -133,6 +129,9 @@ def build_ai_image_request(
         str(getattr(settings, "ai_image_output_format", "png") or "png"),
         AI_IMAGE_OUTPUT_FORMAT_PRESETS,
     )
+    model = str(getattr(settings, "ai_image_model", "") or "").strip() or AI_IMAGE_MODEL_PRESETS[0]
+    requested_size = normalized_ai_image_size(getattr(settings, "ai_image_size", "auto"))
+    request_size = api_ai_image_size(requested_size, model=model, provider=provider)
     return AiImageRequest(
         api_key=api_key,
         base_url=base_url.rstrip("/"),
@@ -140,7 +139,7 @@ def build_ai_image_request(
         model=model,
         prompt=prompt.strip(),
         reference_paths=[Path(path) for path in (reference_paths or [])],
-        size=_coerce_choice(str(getattr(settings, "ai_image_size", "auto") or "auto"), AI_IMAGE_SIZE_PRESETS),
+        size=request_size,
         quality=_coerce_choice(str(getattr(settings, "ai_image_quality", "auto") or "auto"), AI_IMAGE_QUALITY_PRESETS),
         background=requested_background,
         count=_coerce_count(getattr(settings, "ai_image_count", 1)),
