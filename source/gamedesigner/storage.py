@@ -52,6 +52,7 @@ class AppSettings:
     ai_image_count: int = 1
     ai_image_output_format: str = "png"
     ai_pixel_output_size: str = "auto"
+    aseprite_cli_path: str = ""
     recent_projects: list[str] = field(default_factory=list)
     welcome_layout: dict[str, dict[str, float]] = field(default_factory=dict)
     welcome_recent_layouts: dict[str, dict[str, float]] = field(default_factory=dict)
@@ -84,6 +85,7 @@ class AppSettings:
             "ai_image_count": self.ai_image_count,
             "ai_image_output_format": self.ai_image_output_format,
             "ai_pixel_output_size": normalized_pixel_output_size(self.ai_pixel_output_size),
+            "aseprite_cli_path": str(self.aseprite_cli_path or "").strip(),
             "recent_projects": self.recent_projects,
             "welcome_layout": self.welcome_layout,
             "welcome_recent_layouts": self.welcome_recent_layouts,
@@ -140,6 +142,7 @@ class AppSettings:
             ai_image_count=_coerce_int(raw.get("ai_image_count"), 1, 10, 1),
             ai_image_output_format=_coerce_string_choice(raw.get("ai_image_output_format"), {"png", "webp", "jpeg"}, "png"),
             ai_pixel_output_size=normalized_pixel_output_size(raw.get("ai_pixel_output_size")),
+            aseprite_cli_path=str(raw.get("aseprite_cli_path", "") or "").strip(),
             recent_projects=[str(item) for item in recent if item],
             welcome_layout=_coerce_layout_map(raw.get("welcome_layout")),
             welcome_recent_layouts=_coerce_layout_map(raw.get("welcome_recent_layouts")),

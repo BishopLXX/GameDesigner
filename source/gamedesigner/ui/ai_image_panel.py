@@ -41,12 +41,21 @@ from ..image_ai import (
     build_ai_image_request,
     cache_generated_ai_image,
     generate_ai_images,
+    generate_pixel_downscale_candidates,
     load_cached_ai_images,
+    normalize_aseprite_cli_path,
+    pixel_source_path_for_candidate,
     save_ai_image_reference,
     save_ai_image_reference_from_qimage,
 )
 from ..image_rendering import PixmapCache
-from ..pixel_art import AI_IMAGE_PIXEL_OUTPUT_SIZE_PRESETS, normalized_ai_image_size, normalized_pixel_output_size
+from ..pixel_art import (
+    AI_IMAGE_PIXEL_OUTPUT_SIZE_PRESETS,
+    api_ai_image_size,
+    normalized_ai_image_size,
+    normalized_pixel_output_size,
+    pixel_output_size_dimensions,
+)
 from ..storage import AppSettings, save_settings
 from ..window_layouts import restore_window_layout, save_window_layout
 from .submit_text_edit import SubmitPlainTextEdit
@@ -105,6 +114,9 @@ class AiImageSettingsDialog(QDialog):
         self.base_url_edit = QLineEdit(settings.ai_image_base_url)
         self.base_url_edit.setPlaceholderText("例如 https://api.openai.com/v1")
 
+        self.aseprite_cli_edit = QLineEdit(getattr(settings, "aseprite_cli_path", ""))
+        self.aseprite_cli_edit.setPlaceholderText(r"例如 C:\Program Files\Aseprite\Aseprite.exe")
+
         self.output_format_combo = QComboBox()
         self.output_format_combo.addItems(AI_IMAGE_OUTPUT_FORMAT_PRESETS)
         output_index = self.output_format_combo.findText(settings.ai_image_output_format or "png")
@@ -121,6 +133,7 @@ class AiImageSettingsDialog(QDialog):
         form.addRow("模型", self.model_combo)
         form.addRow("API Key", self.api_key_edit)
         form.addRow("Base URL", self.base_url_edit)
+        form.addRow("Aseprite CLI", self.aseprite_cli_edit)
         form.addRow("输出格式", self.output_format_combo)
         form.addRow("像素输出尺寸", self.pixel_output_combo)
 
@@ -148,6 +161,7 @@ class AiImageSettingsDialog(QDialog):
         self.settings.ai_image_model = self.model_combo.currentText().strip() or AI_IMAGE_MODEL_PRESETS[0]
         self.settings.ai_image_api_key = self.api_key_edit.text().strip()
         self.settings.ai_image_base_url = self.base_url_edit.text().strip()
+        self.settings.aseprite_cli_path = normalize_aseprite_cli_path(self.aseprite_cli_edit.text())
         self.settings.ai_image_output_format = self.output_format_combo.currentText().strip() or "png"
         self.settings.ai_pixel_output_size = normalized_pixel_output_size(self.pixel_output_combo.currentText())
         save_settings(self.settings)
@@ -527,14 +541,37 @@ class AiImagePanel(QWidget):
 
     def _save_inline_settings(self, *_args) -> None:
         self.settings.ai_image_model = self.model_combo.currentText().strip() or AI_IMAGE_MODEL_PRESETS[0]
-        self.settings.ai_image_size = normalized_ai_image_size(self.size_combo.currentText())
         self.settings.ai_image_quality = self.quality_combo.currentText().strip() or "auto"
         self.settings.ai_image_background = _combo_value(self.background_combo, "auto")
         self.settings.ai_image_count = self.count_spin.value()
         self.settings.ai_pixel_output_size = normalized_pixel_output_size(self.pixel_output_combo.currentText())
+        self.settings.ai_image_size = self._effective_ai_source_size()
         save_settings(self.settings)
         if self._bound_pixel_mode and self._cache_pixel_output_size != self.settings.ai_pixel_output_size:
             self._cache_pixel_output_size = ""
+
+    def _effective_ai_source_size(self) -> str:
+        requested = normalized_ai_image_size(self.size_combo.currentText())
+        if not self._bound_pixel_mode or requested != "auto":
+            return requested
+        target = pixel_output_size_dimensions(self.settings.ai_pixel_output_size)
+        if target is None:
+            return requested
+        width, height = target
+        for scale in (4, 3):
+            candidate = f"{width * scale}x{height * scale}"
+            if api_ai_image_size(
+                candidate,
+                model=self.settings.ai_image_model,
+                provider=self.settings.ai_image_provider,
+            ) != "auto":
+                self.size_combo.blockSignals(True)
+                try:
+                    self.size_combo.setEditText(candidate)
+                finally:
+                    self.size_combo.blockSignals(False)
+                return candidate
+        return requested
 
     def _send_from_button(self, _checked: bool = False) -> None:
         self._send()
@@ -798,12 +835,89 @@ class AiImagePanel(QWidget):
             self.output_list.setCurrentItem(item)
             item.setSelected(True)
         menu = QMenu(self)
+        open_folder_action = menu.addAction("打开所在文件夹")
+        candidate_action = menu.addAction("生成粗像素候选")
+        redraw_action = menu.addAction("作为参考重绘像素稿")
+        menu.addSeparator()
         delete_action = menu.addAction("删除缓存图")
+        pixel_ready = self._bound_pixel_mode and item is not None
+        open_folder_action.setEnabled(item is not None)
+        candidate_action.setEnabled(pixel_ready and self._thread is None)
+        redraw_action.setEnabled(pixel_ready and self._thread is None)
         if item is None:
             delete_action.setEnabled(False)
         action = menu.exec(self.output_list.mapToGlobal(position))
-        if action == delete_action and item is not None:
+        if action == open_folder_action and item is not None:
+            self._open_output_item_folder(item)
+        elif action == candidate_action and item is not None:
+            self._generate_pixel_candidates_from_output(item)
+        elif action == redraw_action and item is not None:
+            self._redraw_pixel_draft_from_output(item)
+        elif action == delete_action and item is not None:
             self._delete_cached_output_items(self.output_list.selectedItems() or [item])
+
+    def _generate_pixel_candidates_from_output(self, item: QListWidgetItem) -> None:
+        path = Path(str(item.data(Qt.UserRole) or ""))
+        if not path.exists():
+            QMessageBox.information(self, "粗像素候选", "当前缓存图不存在。")
+            return
+        self._save_inline_settings()
+        try:
+            _context, _cwd, project_path = self.context_provider()
+        except ValueError as exc:
+            QMessageBox.information(self, "没有可用工程", str(exc))
+            return
+        try:
+            candidates = generate_pixel_downscale_candidates(
+                project_path,
+                path,
+                cache_key=self._cache_key(),
+                pixel_output_size=self.settings.ai_pixel_output_size,
+                aseprite_cli_path=self.settings.aseprite_cli_path,
+            )
+        except AiImageError as exc:
+            QMessageBox.information(self, "粗像素候选", str(exc))
+            return
+        if not candidates:
+            self._append_system("没有生成粗像素候选。")
+            return
+        added_images = [candidate.image for candidate in candidates if candidate.image.width > 0 and candidate.image.height > 0]
+        self.cached_images.extend(added_images)
+        for image in added_images:
+            self._add_output_item(image, select=False)
+        if added_images:
+            self._select_generated_image(added_images[-1].path)
+            item = self._find_output_item(added_images[-1].path)
+            if item is not None:
+                self.output_list.setCurrentItem(item)
+        labels = "、".join(f"{candidate.label}" for candidate in candidates)
+        aseprite_note = "，包含 Aseprite 候选" if any(candidate.used_aseprite for candidate in candidates) else "，未找到可用的 Aseprite CLI 或未生成 Aseprite 候选"
+        self._append_system(f"已生成 {len(candidates)} 张粗像素候选：{labels}{aseprite_note}。这些只是 AI 重绘参考，不作为最终资产。")
+
+    def _redraw_pixel_draft_from_output(self, item: QListWidgetItem) -> None:
+        path = Path(str(item.data(Qt.UserRole) or ""))
+        if not path.exists():
+            QMessageBox.information(self, "像素重绘", "当前参考图不存在。")
+            return
+        prompt = self._native_pixel_redraw_prompt(path)
+        self.generate_with_prompt(prompt, [path], output_node_id=self._bound_output_node_id)
+
+    def _native_pixel_redraw_prompt(self, reference_path: Path) -> str:
+        output_size = normalized_pixel_output_size(self.pixel_output_combo.currentText())
+        size_text = output_size if output_size != "auto" else "与参考图一致"
+        return (
+            "基于参考图重绘为原生像素游戏资产。\n"
+            f"目标最终尺寸：{size_text}。\n"
+            f"参考图文件名：{reference_path.name}。\n"
+            "保持主体、剪影、装备结构、颜色关系、关键点色和可读性，但重新设计像素线条，不要照搬压缩噪点。\n"
+            "画法必须是 native pixel art，不是高分辨率插画缩小、不是马赛克滤镜、不是柔边插画。\n"
+            "外轮廓使用选择性 1px 描边；避免连续粗黑边，尺寸小时不要出现硬、粗、糊成一圈的描边。\n"
+            "内部结构线要少、细、带色相，优先深蓝灰或局部深色，不要整片纯黑线。\n"
+            "删除小尺寸下会变脏的碎线、毛刺、随机噪点、半透明脏边和高分辨率插画线。\n"
+            "用清晰像素簇组织形体：大色块明确，亮暗面稳定，关键小细节只保留能在 1x 看清的部分。\n"
+            "调色板受控但不要过度压色；保留角色/道具/材质读性。\n"
+            "透明背景，无文字，无水印。"
+        )
 
     def _delete_cached_output_items(self, items: list[QListWidgetItem]) -> None:
         paths = []
@@ -827,6 +941,12 @@ class AiImagePanel(QWidget):
                 except OSError as exc:
                     failed.append(f"{path.name}: {exc}")
                     continue
+            source_path = pixel_source_path_for_candidate(path)
+            if source_path != path and source_path.exists():
+                try:
+                    source_path.unlink()
+                except OSError as exc:
+                    failed.append(f"{source_path.name}: {exc}")
             deleted_paths.append(path)
 
         self.output_list.blockSignals(True)
@@ -908,11 +1028,17 @@ class AiImagePanel(QWidget):
         if self._current_image_path is not None:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._current_image_path.parent)))
 
+    def _open_output_item_folder(self, item: QListWidgetItem) -> None:
+        path = Path(str(item.data(Qt.UserRole) or ""))
+        if path.exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))
+
     def _open_settings(self) -> None:
         dialog = AiImageSettingsDialog(self, self.settings)
         if dialog.exec() == QDialog.Accepted:
             self.model_combo.setEditText(self.settings.ai_image_model or AI_IMAGE_MODEL_PRESETS[0])
             self.pixel_output_combo.setEditText(normalized_pixel_output_size(self.settings.ai_pixel_output_size))
+            self.aseprite_cli_edit.setText(getattr(self.settings, "aseprite_cli_path", ""))
             self._refresh_header()
 
     def _clear_screen(self) -> None:

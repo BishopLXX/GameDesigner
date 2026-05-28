@@ -427,6 +427,92 @@ class AppEditingTests(unittest.TestCase):
             panel._thread = None
             panel.deleteLater()
 
+    def test_ai_image_panel_derives_4x_source_size_for_pixel_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "PixelSourceSize.gdc"
+            settings = AppSettings(
+                workspace_dir=folder,
+                export_dir=str(Path(folder) / "exports"),
+                ai_image_provider="compatible",
+                ai_image_model="custom-image",
+                ai_image_api_key="secret",
+                ai_image_size="auto",
+                ai_pixel_output_size="256x384",
+            )
+            context_provider = lambda: ("ctx", Path(folder), project_path)
+            panel = AiImagePanel(None, settings, context_provider)
+            panel.bind_canvas("像素生图", "out", "pixel-canvas", True)
+
+            with mock.patch("gamedesigner.ui.ai_image_panel.ImageGenerationThread") as thread_cls:
+                thread = thread_cls.return_value
+                panel.generate_with_prompt("生成像素角色", output_node_id="out")
+
+            request = thread_cls.call_args.args[0]
+            self.assertEqual(settings.ai_image_size, "1024x1536")
+            self.assertEqual(request.size, "1024x1536")
+            self.assertEqual(panel.size_combo.currentText(), "1024x1536")
+            self.assertEqual(thread.start.call_count, 1)
+            panel._thread = None
+            panel.deleteLater()
+
+    def test_ai_image_panel_generates_pixel_candidate_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "PixelCandidatePanel.gdc"
+            settings = AppSettings(
+                workspace_dir=folder,
+                export_dir=str(Path(folder) / "exports"),
+                ai_pixel_output_size="8x8",
+            )
+            source_path = Path(folder) / "source.png"
+            image = QImage(16, 16, QImage.Format_ARGB32)
+            image.fill(0xFF7848CC)
+            image.save(str(source_path), "PNG")
+            context_provider = lambda: ("ctx", Path(folder), project_path)
+            panel = AiImagePanel(None, settings, context_provider)
+            panel.bind_canvas("像素生图", "out", "pixel-canvas", True)
+            panel.cached_images = [CachedAiImage(source_path, 16, 16)]
+            panel._add_output_item(panel.cached_images[0])
+            item = panel.output_list.currentItem()
+
+            panel._generate_pixel_candidates_from_output(item)
+
+            self.assertEqual(panel.output_list.count(), 6)
+            self.assertEqual(len(panel.cached_images), 6)
+            self.assertEqual(panel._current_image_path.parent.name, "8x8")
+            panel.deleteLater()
+
+    def test_ai_image_panel_redraws_selected_pixel_candidate_as_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "PixelRedrawPanel.gdc"
+            settings = AppSettings(
+                workspace_dir=folder,
+                export_dir=str(Path(folder) / "exports"),
+                ai_image_api_key="secret",
+                ai_pixel_output_size="128x128",
+            )
+            candidate_path = Path(folder) / "candidate.png"
+            image = QImage(8, 8, QImage.Format_ARGB32)
+            image.fill(0xFF00AADD)
+            image.save(str(candidate_path), "PNG")
+            context_provider = lambda: ("ctx", Path(folder), project_path)
+            panel = AiImagePanel(None, settings, context_provider)
+            panel.bind_canvas("像素生图", "out", "pixel-canvas", True)
+            panel.cached_images = [CachedAiImage(candidate_path, 8, 8)]
+            panel._add_output_item(panel.cached_images[0])
+            item = panel.output_list.currentItem()
+
+            with mock.patch("gamedesigner.ui.ai_image_panel.ImageGenerationThread") as thread_cls:
+                thread = thread_cls.return_value
+                panel._redraw_pixel_draft_from_output(item)
+
+            request = thread_cls.call_args.args[0]
+            self.assertEqual(request.reference_paths, [candidate_path])
+            self.assertIn("原生像素游戏资产", request.prompt)
+            self.assertIn("目标最终尺寸：128x128", request.prompt)
+            self.assertEqual(thread.start.call_count, 1)
+            panel._thread = None
+            panel.deleteLater()
+
     def test_ai_image_panel_uses_cached_outputs_as_references(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             project_path = Path(folder) / "CachedRefs.gdc"

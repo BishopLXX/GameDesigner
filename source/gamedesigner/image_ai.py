@@ -7,6 +7,8 @@ import math
 import mimetypes
 import os
 import shutil
+import subprocess
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -17,7 +19,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from PySide6.QtGui import QImage
-from PIL import Image, ImageOps
+from PIL import Image, ImageFilter, ImageOps
 from PIL.PngImagePlugin import PngInfo
 
 from .ai_presets import normalize_ai_credentials
@@ -44,6 +46,7 @@ AI_IMAGE_MODEL_PRESETS = [
     "gpt-image-1",
     "gpt-image-1-mini",
     "gpt-image-2",
+    "dall-e-2",
     "dall-e-3",
 ]
 AI_IMAGE_QUALITY_PRESETS = ["auto", "low", "medium", "high"]
@@ -56,6 +59,22 @@ PIXEL_ART_ACCENT_CELL_COVERAGE_THRESHOLD = 0.18
 PIXEL_ART_ACCENT_SATURATION_THRESHOLD = 58
 PIXEL_ART_ACCENT_CHANNEL_THRESHOLD = 172
 PIXEL_ART_SINGLE_PIXEL_FEATURE_COVERAGE_THRESHOLD = 0.10
+PIXEL_DOWNSCALE_CANDIDATE_LIMIT = 5
+PIXEL_DOWNSCALE_CANDIDATE_METHODS = (
+    "grid",
+    "box",
+    "lanczos",
+    "nearest",
+    "palette_box",
+)
+ASEPRITE_WINDOWS_CANDIDATE_PATHS = (
+    r"C:\Program Files\Aseprite\Aseprite.exe",
+    r"C:\Program Files (x86)\Aseprite\Aseprite.exe",
+    r"C:\Program Files (x86)\Steam\steamapps\common\Aseprite\Aseprite.exe",
+)
+PIXEL_ART_METADATA_KEY = "GameDesignerPixelArt"
+PIXEL_SOURCE_METADATA_KEY = "GameDesignerPixelSource"
+PIXEL_SOURCE_DIR = "sources"
 
 
 class AiImageError(RuntimeError):
@@ -97,6 +116,14 @@ class CachedAiImage:
     width: int
     height: int
     revised_prompt: str = ""
+
+
+@dataclass(frozen=True)
+class PixelDownscaleCandidate:
+    image: CachedAiImage
+    method: str
+    label: str
+    used_aseprite: bool = False
 
 
 def normalized_ai_image_provider(value: str) -> str:
@@ -220,7 +247,53 @@ def cache_generated_ai_image(
     path = folder / f"cache_{_timestamp()}_{index}_{uuid.uuid4().hex[:8]}.{extension}"
     data = _pixel_art_image_bytes(image.data, pixel_output_size=pixel_output_size) if pixel_mode else image.data
     path.write_bytes(data)
+    if pixel_mode:
+        _save_pixel_source_image(image.data, path, folder)
     return cached_ai_image_from_path(path, revised_prompt=image.revised_prompt)
+
+
+def generate_pixel_downscale_candidates(
+    project_path: str | Path,
+    source_path: str | Path,
+    *,
+    cache_key: str = "",
+    pixel_output_size: str = "auto",
+    include_aseprite: bool = True,
+    aseprite_cli_path: str | Path | None = None,
+) -> list[PixelDownscaleCandidate]:
+    target_size = pixel_output_size_dimensions(pixel_output_size)
+    if target_size is None:
+        raise AiImageError("请先设置明确的像素输出尺寸，例如 128x128、256x256 或 256x384。")
+    source = pixel_source_path_for_candidate(source_path)
+    if not source.exists():
+        raise AiImageError(f"源图不存在：{source}")
+    folder = _ai_image_cache_folder(project_path, cache_key, pixel_mode=True, pixel_output_size=pixel_output_size)
+    folder.mkdir(parents=True, exist_ok=True)
+    candidates: list[PixelDownscaleCandidate] = []
+    with Image.open(source) as loaded:
+        image = ImageOps.exif_transpose(loaded).convert("RGBA")
+        for method in PIXEL_DOWNSCALE_CANDIDATE_METHODS:
+            candidate = _pixel_downscale_candidate_image(image, method, target_size)
+            if candidate is None:
+                continue
+            candidates.append(
+                _save_pixel_downscale_candidate(
+                    folder,
+                    candidate,
+                    method=method,
+                    label=_pixel_downscale_candidate_label(method),
+                )
+            )
+    if include_aseprite:
+        aseprite_candidate = _generate_aseprite_downscale_candidate(
+            source,
+            folder,
+            target_size,
+            aseprite_cli_path=aseprite_cli_path,
+        )
+        if aseprite_candidate is not None:
+            candidates.append(aseprite_candidate)
+    return candidates[:PIXEL_DOWNSCALE_CANDIDATE_LIMIT + 1]
 
 
 def load_cached_ai_images(
@@ -571,6 +644,225 @@ def _pixel_art_image_bytes(raw: bytes, *, pixel_output_size: str = "auto") -> by
         return _image_to_png_bytes(sampled, pixel_art=True)
 
 
+def _pixel_downscale_candidate_image(
+    image: Image.Image,
+    method: str,
+    target_size: tuple[int, int],
+) -> Image.Image | None:
+    target_width, target_height = target_size
+    if target_width <= 0 or target_height <= 0:
+        return None
+    if method == "grid":
+        return _pixel_grid_sample(image, pixel_output_size=f"{target_width}x{target_height}")
+    if method == "box":
+        result = _resize_contain_to_canvas(image, target_size, Image.Resampling.BOX)
+    elif method == "lanczos":
+        result = _resize_contain_to_canvas(image, target_size, Image.Resampling.LANCZOS)
+    elif method == "nearest":
+        result = _resize_contain_to_canvas(image, target_size, Image.Resampling.NEAREST)
+    elif method == "palette_box":
+        softened = image.filter(ImageFilter.MedianFilter(size=3)) if min(image.size) >= 3 else image
+        result = _resize_contain_to_canvas(softened, target_size, Image.Resampling.BOX)
+        _apply_palette_quantization(result, max(16, pixel_art_palette_limit(target_width, target_height) // 2))
+    else:
+        return None
+    _finalize_pixel_candidate(result)
+    return result
+
+
+def _resize_contain_to_canvas(
+    image: Image.Image,
+    target_size: tuple[int, int],
+    resample: Image.Resampling,
+) -> Image.Image:
+    target_width, target_height = target_size
+    source_width, source_height = image.size
+    if source_width <= 0 or source_height <= 0:
+        return Image.new("RGBA", target_size, (0, 0, 0, 0))
+    scale = min(target_width / source_width, target_height / source_height)
+    resized_width = max(1, min(target_width, int(round(source_width * scale))))
+    resized_height = max(1, min(target_height, int(round(source_height * scale))))
+    resized = image.resize((resized_width, resized_height), resample=resample)
+    result = Image.new("RGBA", target_size, (0, 0, 0, 0))
+    result.alpha_composite(resized, ((target_width - resized_width) // 2, (target_height - resized_height) // 2))
+    return result
+
+
+def _finalize_pixel_candidate(image: Image.Image) -> None:
+    alpha = image.getchannel("A").point(
+        lambda value: 255 if value >= PIXEL_ART_ALPHA_THRESHOLD else 0,
+        mode="L",
+    )
+    image.putalpha(alpha)
+
+
+def _save_pixel_downscale_candidate(
+    folder: Path,
+    image: Image.Image,
+    *,
+    method: str,
+    label: str,
+    used_aseprite: bool = False,
+) -> PixelDownscaleCandidate:
+    safe_method = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in method.strip()) or "candidate"
+    safe_label = _sanitize_filename_piece(label) if label else ""
+    name_parts = ["candidate", _timestamp(), safe_method]
+    if safe_label and safe_label != safe_method:
+        name_parts.append(safe_label)
+    name_parts.append(uuid.uuid4().hex[:8])
+    path = folder / ("_".join(name_parts) + ".png")
+    path.write_bytes(_image_to_png_bytes(image, pixel_art=True))
+    return PixelDownscaleCandidate(
+        image=cached_ai_image_from_path(path),
+        method=safe_method,
+        label=label,
+        used_aseprite=used_aseprite,
+    )
+
+
+def _save_pixel_source_image(raw: bytes, cached_path: Path, cache_folder: Path) -> None:
+    try:
+        with Image.open(BytesIO(raw)) as source:
+            source = ImageOps.exif_transpose(source).convert("RGBA")
+    except OSError:
+        return
+    source_folder = cache_folder / PIXEL_SOURCE_DIR
+    source_folder.mkdir(parents=True, exist_ok=True)
+    source_path = source_folder / f"{cached_path.stem}_source.png"
+    try:
+        buffer = BytesIO()
+        info = PngInfo()
+        info.add_text(PIXEL_SOURCE_METADATA_KEY, "1")
+        source.save(buffer, format="PNG", optimize=True, pnginfo=info)
+        source_path.write_bytes(buffer.getvalue())
+    except OSError:
+        return
+
+
+def pixel_source_path_for_candidate(cached_path: str | Path) -> Path:
+    path = Path(cached_path)
+    source_path = path.parent / PIXEL_SOURCE_DIR / f"{path.stem}_source.png"
+    if source_path.exists():
+        return source_path
+    return path
+
+
+def _pixel_downscale_candidate_label(method: str) -> str:
+    return {
+        "grid": "卷积采样",
+        "box": "BOX 缩小",
+        "lanczos": "Lanczos 缩小",
+        "nearest": "Nearest 缩小",
+        "palette_box": "中值+调色板",
+        "aseprite": "Aseprite 缩小",
+    }.get(method, method)
+
+
+def _generate_aseprite_downscale_candidate(
+    source_path: Path,
+    folder: Path,
+    target_size: tuple[int, int],
+    *,
+    aseprite_cli_path: str | Path | None = None,
+) -> PixelDownscaleCandidate | None:
+    aseprite = find_aseprite_executable(aseprite_cli_path)
+    if aseprite is None:
+        return None
+    target_width, target_height = target_size
+    try:
+        with Image.open(source_path) as source:
+            source_width, source_height = source.size
+    except OSError:
+        return None
+    if source_width <= 0 or source_height <= 0 or target_width <= 0 or target_height <= 0:
+        return None
+    scale = min(target_width / source_width, target_height / source_height)
+    if scale <= 0:
+        return None
+    with tempfile.TemporaryDirectory(prefix="gamedesigner_aseprite_") as temp_folder:
+        temp_output = Path(temp_folder) / "aseprite_candidate.png"
+        command = [
+            str(aseprite),
+            "-b",
+            str(source_path),
+            "--scale",
+            f"{scale:.8f}",
+            "--save-as",
+            str(temp_output),
+        ]
+        try:
+            subprocess.run(
+                command,
+                check=True,
+                capture_output=True,
+                timeout=45,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            return None
+        if not temp_output.exists():
+            return None
+        try:
+            with Image.open(temp_output) as loaded:
+                generated = ImageOps.exif_transpose(loaded).convert("RGBA")
+        except OSError:
+            return None
+        if generated.size != target_size:
+            generated = _center_fit_pixel_image(generated, target_size)
+        _finalize_pixel_candidate(generated)
+        return _save_pixel_downscale_candidate(
+            folder,
+            generated,
+            method="aseprite",
+            label=_pixel_downscale_candidate_label("aseprite"),
+            used_aseprite=True,
+        )
+
+
+def find_aseprite_executable(override_path: str | Path | None = None) -> Path | None:
+    configured = normalize_aseprite_cli_path(override_path)
+    if configured:
+        return Path(configured)
+    found = shutil.which("aseprite") or shutil.which("aseprite.exe")
+    if found:
+        return Path(found)
+    for raw_path in ASEPRITE_WINDOWS_CANDIDATE_PATHS:
+        path = Path(raw_path)
+        if path.exists():
+            return path
+    return None
+
+
+def normalize_aseprite_cli_path(value: str | Path | None) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    path = Path(text)
+    if not path.exists():
+        return ""
+    suffix = path.suffix.lower()
+    if suffix not in {".exe", ".app", ""} and path.name.lower() not in {"aseprite", "aseprite.exe"}:
+        return ""
+    return str(path)
+
+
+def _sanitize_filename_piece(value: str) -> str:
+    cleaned = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in str(value or "").strip())
+    return cleaned.strip("_")[:40]
+
+
+def _center_fit_pixel_image(image: Image.Image, target_size: tuple[int, int]) -> Image.Image:
+    target_width, target_height = target_size
+    fitted = image
+    if fitted.width > target_width or fitted.height > target_height:
+        left = max(0, (fitted.width - target_width) // 2)
+        top = max(0, (fitted.height - target_height) // 2)
+        fitted = fitted.crop((left, top, left + min(target_width, fitted.width), top + min(target_height, fitted.height)))
+    result = Image.new("RGBA", target_size, (0, 0, 0, 0))
+    result.alpha_composite(fitted, ((target_width - fitted.width) // 2, (target_height - fitted.height) // 2))
+    return result
+
+
 def _pixel_grid_sample(image: Image.Image, *, pixel_output_size: str = "auto") -> Image.Image:
     target_size = pixel_output_size_dimensions(pixel_output_size)
     if target_size is None:
@@ -772,7 +1064,7 @@ def _image_to_png_bytes(image: Image.Image, *, pixel_art: bool = False) -> bytes
     info = PngInfo()
     save_kwargs: dict[str, Any] = {"format": "PNG", "optimize": True}
     if pixel_art:
-        info.add_text("GameDesignerPixelArt", "1")
+        info.add_text(PIXEL_ART_METADATA_KEY, "1")
         save_kwargs["pnginfo"] = info
     image.save(buffer, **save_kwargs)
     return buffer.getvalue()

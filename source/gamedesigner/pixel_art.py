@@ -38,6 +38,7 @@ AI_IMAGE_SIZE_PRESETS = [
     "1024x1792",
     "512x512",
     "256x256",
+    "128x128",
 ]
 
 GPT_IMAGE_LEGACY_SIZES = {"1024x1024", "1536x1024", "1024x1536", "auto"}

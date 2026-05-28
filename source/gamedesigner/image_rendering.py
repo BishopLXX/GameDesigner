@@ -124,6 +124,8 @@ def is_pixel_art_image_path(path: str) -> bool:
     reader = QImageReader(text)
     if reader.text("GameDesignerPixelArt").strip() == "1":
         return True
+    if reader.text("GameDesignerPixelSource").strip() == "1":
+        return True
     parts = {part.lower() for part in Path(text).parts}
     if "pixel" in parts:
         return True

@@ -16,7 +16,9 @@ from gamedesigner.image_ai import (
     ai_image_cache_dir,
     build_ai_image_request,
     cache_generated_ai_image,
+    generate_pixel_downscale_candidates,
     load_cached_ai_images,
+    pixel_source_path_for_candidate,
     _encode_multipart,
     _multipart_body,
 )
@@ -188,6 +190,7 @@ class AiToolsTests(unittest.TestCase):
             ai_image_count=3,
             ai_image_output_format="jpeg",
             ai_pixel_output_size="256x384",
+            aseprite_cli_path="D:/Tools/Aseprite/Aseprite.exe",
         )
 
         loaded = AppSettings.from_dict(settings.to_dict())
@@ -202,6 +205,7 @@ class AiToolsTests(unittest.TestCase):
         self.assertEqual(loaded.ai_image_count, 3)
         self.assertEqual(loaded.ai_image_output_format, "jpeg")
         self.assertEqual(loaded.ai_pixel_output_size, "256x384")
+        self.assertEqual(loaded.aseprite_cli_path, "D:/Tools/Aseprite/Aseprite.exe")
 
     def test_app_settings_normalizes_url_leaked_into_api_key_fields(self) -> None:
         settings = AppSettings.from_dict(
@@ -276,6 +280,23 @@ class AiToolsTests(unittest.TestCase):
             self.assertEqual(cached.path.parent, ai_image_cache_dir(project_path))
             self.assertEqual(len(loaded), 1)
             self.assertEqual(loaded[0].path, cached.path)
+
+    def test_pixel_ai_image_cache_preserves_hidden_source_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "PixelSourceCache.gdc"
+
+            cached = cache_generated_ai_image(
+                project_path,
+                AiGeneratedImage(PNG_1X1, "png"),
+                index=1,
+                cache_key="canvas-a",
+                pixel_mode=True,
+                pixel_output_size="8x8",
+            )
+
+            source_path = pixel_source_path_for_candidate(cached.path)
+            self.assertTrue(source_path.exists())
+            self.assertIn("sources", {part.lower() for part in source_path.parts})
 
     def test_pixel_ai_image_cache_auto_preserves_source_detail(self) -> None:
         source = Image.new("RGBA", (12, 20), (0, 0, 0, 0))
@@ -580,6 +601,58 @@ class AiToolsTests(unittest.TestCase):
             self.assertLessEqual(len(colors), 96)
             self.assertLess(eye.red(), 50)
             self.assertGreater(highlight.red(), 180)
+
+    def test_pixel_downscale_candidates_create_reference_pngs(self) -> None:
+        source = Image.new("RGBA", (16, 24), (0, 0, 0, 0))
+        pixels = source.load()
+        for y in range(3, 21):
+            for x in range(4, 12):
+                pixels[x, y] = (80 + x * 8, 40 + y * 4, 180, 255)
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "PixelCandidates.gdc"
+            source_path = Path(folder) / "source.png"
+            source.save(source_path)
+
+            candidates = generate_pixel_downscale_candidates(
+                project_path,
+                source_path,
+                cache_key="canvas-a",
+                pixel_output_size="8x8",
+                include_aseprite=False,
+            )
+
+            self.assertEqual(len(candidates), 5)
+            self.assertEqual({candidate.method for candidate in candidates}, {"grid", "box", "lanczos", "nearest", "palette_box"})
+            for candidate in candidates:
+                self.assertTrue(candidate.image.path.exists())
+                self.assertTrue(candidate.image.path.name.startswith("candidate_"))
+                expected_label = "".join(
+                    char if char.isalnum() or char in {"-", "_"} else "_"
+                    for char in candidate.label.strip()
+                ).strip("_")[:40]
+                self.assertIn(expected_label, candidate.image.path.name)
+                self.assertTrue(is_pixel_art_image_path(str(candidate.image.path)))
+                processed = QImage(str(candidate.image.path))
+                self.assertEqual((processed.width(), processed.height()), (8, 8))
+
+    def test_pixel_downscale_candidates_ignore_missing_aseprite(self) -> None:
+        source = Image.new("RGBA", (16, 16), (120, 90, 200, 255))
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "PixelNoAseprite.gdc"
+            source_path = Path(folder) / "source.png"
+            source.save(source_path)
+
+            with mock.patch("gamedesigner.image_ai.find_aseprite_executable", return_value=None):
+                candidates = generate_pixel_downscale_candidates(
+                    project_path,
+                    source_path,
+                    cache_key="canvas-a",
+                    pixel_output_size="8x8",
+                    include_aseprite=True,
+                )
+
+            self.assertEqual(len(candidates), 5)
+            self.assertFalse(any(candidate.used_aseprite for candidate in candidates))
 
     def test_ai_image_request_with_reference_omits_input_fidelity_for_gpt_image_2(self) -> None:
         settings = AppSettings(
