@@ -208,6 +208,7 @@ class ImageGenerationThread(QThread):
                     cache_key=self.cache_key,
                     pixel_mode=self.pixel_mode,
                     pixel_output_size=self.pixel_output_size,
+                    transparent_background=self.request.transparent_background_cleanup,
                 )
                 for index, image in enumerate(images, start=1)
             ]
