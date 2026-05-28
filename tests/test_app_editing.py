@@ -7,17 +7,19 @@ from unittest import mock
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QEvent, QMimeData, QPointF, Qt
-from PySide6.QtGui import QImage, QKeyEvent, QTextCursor
+from PySide6.QtGui import QImage, QKeyEvent, QPixmap, QTextCursor
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QWidget
 
 from gamedesigner.app import EDGE_LABEL_MAX_LENGTH, GameDesignerApp
-from gamedesigner.image_ai import AiGeneratedImage, cache_generated_ai_image
+from gamedesigner.image_ai import AiGeneratedImage, AiImageReference, CachedAiImage, cache_generated_ai_image
 from gamedesigner.ai_tools import AiCanvasAction, AiCanvasFieldChange
 from gamedesigner.ai_tools import AiChatMessage, load_project_chat_history, save_project_chat_history
 from gamedesigner.canvas_io import import_canvas_sheet
+from gamedesigner.image_canvas import build_image_canvas_request, find_image_output_node
+from gamedesigner.project_files.linked_documents import create_link_document, write_link_document
 from gamedesigner.qt_canvas import NodeGraphView
 from gamedesigner.qt_dialogs import HEADER_HEIGHT, InlineFieldEditor, NodeEditorDialog, TemplateSaveDialog
-from gamedesigner.models import BlueprintGroup, DesignNote, Node, NodeField, NodeTemplate, ProjectData
+from gamedesigner.models import BlueprintGroup, DesignNote, Node, NodeField, NodeTemplate, ProjectData, default_image_canvas_nodes
 from gamedesigner.storage import (
     AppSettings,
     load_settings,
@@ -38,6 +40,15 @@ class AppEditingTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self._appdata_temp = tempfile.TemporaryDirectory()
+        self._appdata_patch = mock.patch.dict(os.environ, {"APPDATA": self._appdata_temp.name})
+        self._appdata_patch.start()
+
+    def tearDown(self) -> None:
+        self._appdata_patch.stop()
+        self._appdata_temp.cleanup()
 
     def test_copy_paste_and_undo_redo_selected_node(self) -> None:
         window = GameDesignerApp()
@@ -216,6 +227,21 @@ class AppEditingTests(unittest.TestCase):
         self.assertEqual(window.ai_assistant_stack.width(), 42)
         window.deleteLater()
 
+    def test_ai_image_generate_button_uses_click_wrapper_without_signal_args(self) -> None:
+        settings = AppSettings(ai_image_api_key="secret", ai_image_base_url="https://api.openai.com/v1")
+
+        panel = AiImagePanel(
+            None,
+            settings,
+            lambda: ("工程上下文", Path("D:/GameDesigner"), Path("D:/GameDesigner/Test.gdc")),
+        )
+        panel._send = mock.Mock()  # type: ignore[assignment]
+
+        panel.send_button.click()
+
+        panel._send.assert_called_once_with()
+        panel.deleteLater()
+
     def test_ai_image_settings_dialog_persists_image_model_and_api(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             settings = AppSettings(workspace_dir=folder, export_dir=str(Path(folder) / "exports"))
@@ -263,6 +289,197 @@ class AppEditingTests(unittest.TestCase):
             self.assertEqual(reopened.output_list.count(), 1)
             self.assertEqual(reopened._current_image_path, cached.path)
             reopened.deleteLater()
+
+    def test_ai_image_panel_shows_activity_indicator_while_generating(self) -> None:
+        window = GameDesignerApp()
+        window._open_ai_image_assistant()
+        panel = window.ai_assistant_panel
+        assert isinstance(panel, AiImagePanel)
+
+        panel._start_activity()
+        self.assertTrue(panel.activity_timer.isActive())
+        self.assertNotEqual(panel.activity_label.text(), "Ready")
+
+        panel._stop_activity()
+        self.assertFalse(panel.activity_timer.isActive())
+        self.assertEqual(panel.activity_label.text(), "Ready")
+        window.deleteLater()
+
+    def test_ai_image_panel_keeps_references_per_bound_canvas(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "CanvasRefs.gdc"
+            settings = AppSettings(workspace_dir=folder, export_dir=str(Path(folder) / "exports"))
+            context_provider = lambda: ("ctx", Path(folder), project_path)
+            panel = AiImagePanel(None, settings, context_provider)
+            first = AiImageReference(Path(folder) / "first.png", 1, 1)
+            second = AiImageReference(Path(folder) / "second.png", 1, 1)
+
+            panel.bind_canvas("第一生图", "out-a", "canvas-a")
+            panel.references.append(first)
+            panel._add_reference_item(first)
+            panel._store_current_references()
+
+            panel.bind_canvas("第二生图", "out-b", "canvas-b")
+            self.assertEqual(panel.references, [])
+            panel.references.append(second)
+            panel._add_reference_item(second)
+            panel._store_current_references()
+
+            panel.bind_canvas("第一生图", "out-a2", "canvas-a")
+            self.assertEqual([reference.path for reference in panel.references], [first.path])
+            self.assertEqual(panel.reference_list.count(), 1)
+
+            panel.bind_canvas("第二生图", "out-b2", "canvas-b")
+            self.assertEqual([reference.path for reference in panel.references], [second.path])
+            self.assertEqual(panel.reference_list.count(), 1)
+            panel.deleteLater()
+
+    def test_ai_image_panel_merges_canvas_and_request_references(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "MergedRefs.gdc"
+            settings = AppSettings(
+                workspace_dir=folder,
+                export_dir=str(Path(folder) / "exports"),
+                ai_image_api_key="secret",
+            )
+            context_provider = lambda: ("ctx", Path(folder), project_path)
+            panel = AiImagePanel(None, settings, context_provider)
+            manual = AiImageReference(Path(folder) / "manual.png", 1, 1)
+            external = Path(folder) / "external.png"
+            panel.bind_canvas("生图", "out", "canvas")
+            panel.references.append(manual)
+            panel._store_current_references()
+
+            with mock.patch("gamedesigner.ui.ai_image_panel.ImageGenerationThread") as thread_cls:
+                thread = thread_cls.return_value
+                panel.generate_with_prompt("生成 UI", [external], output_node_id="out")
+
+            request = thread_cls.call_args.args[0]
+            self.assertEqual(request.reference_paths, [external, manual.path])
+            self.assertEqual(thread.start.call_count, 1)
+            panel._thread = None
+            panel.deleteLater()
+
+    def test_ai_image_panel_uses_cached_outputs_as_references(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "CachedRefs.gdc"
+            settings = AppSettings(
+                workspace_dir=folder,
+                export_dir=str(Path(folder) / "exports"),
+                ai_image_api_key="secret",
+            )
+            context_provider = lambda: ("工程上下文", Path(folder), project_path)
+            cached_path = Path(folder) / "cached.png"
+            cached_path.write_bytes(
+                bytes.fromhex(
+                    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+                    "000000097048597300000f6100000f6101a83fa7690000000d49444154089963f8cfc0f01f"
+                    "00050001ffabce36890000000049454e44ae426082"
+                )
+            )
+            panel = AiImagePanel(None, settings, context_provider)
+            panel.cached_images = [CachedAiImage(cached_path, 1, 1)]
+
+            with mock.patch("gamedesigner.ui.ai_image_panel.ImageGenerationThread") as thread_cls:
+                thread = thread_cls.return_value
+                panel.generate_with_prompt("生成图标")
+
+            request = thread_cls.call_args.args[0]
+            self.assertEqual(request.reference_paths, [cached_path])
+            self.assertIn("工程上下文", request.prompt)
+            self.assertEqual(thread.start.call_count, 1)
+            panel._thread = None
+            panel.deleteLater()
+
+    def test_ai_image_panel_prioritizes_cache_for_retouch_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "RetouchRefs.gdc"
+            settings = AppSettings(
+                workspace_dir=folder,
+                export_dir=str(Path(folder) / "exports"),
+                ai_image_api_key="secret",
+            )
+            context_provider = lambda: ("生图画布上下文", Path(folder), project_path)
+            cached_path = Path(folder) / "cached.png"
+            external_path = Path(folder) / "external.png"
+            manual_path = Path(folder) / "manual.png"
+            for path in (cached_path, external_path, manual_path):
+                path.write_bytes(
+                    bytes.fromhex(
+                        "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+                        "000000097048597300000f6100000f6101a83fa7690000000d49444154089963f8cfc0f01f"
+                        "00050001ffabce36890000000049454e44ae426082"
+                    )
+                )
+            panel = AiImagePanel(None, settings, context_provider)
+            panel.bind_canvas("生图", "out", "canvas-a")
+            panel.cached_images = [CachedAiImage(cached_path, 1, 1)]
+            panel.references.append(AiImageReference(manual_path, 1, 1))
+
+            with mock.patch("gamedesigner.ui.ai_image_panel.ImageGenerationThread") as thread_cls:
+                thread = thread_cls.return_value
+                panel.generate_with_prompt("继续修改成蓝色", [external_path], output_node_id="out")
+
+            request = thread_cls.call_args.args[0]
+            self.assertEqual(request.reference_paths, [cached_path, external_path, manual_path])
+            self.assertIn("当前生图画布上下文（最高权重）", request.prompt)
+            self.assertIn("高权重参考说明", request.prompt)
+            self.assertEqual(thread.start.call_count, 1)
+            panel._thread = None
+            panel.deleteLater()
+
+    def test_ai_image_panel_deletes_cached_output(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "DeleteCache.gdc"
+            png_1x1 = bytes.fromhex(
+                "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+                "000000097048597300000f6100000f6101a83fa7690000000d49444154089963f8cfc0f01f"
+                "00050001ffabce36890000000049454e44ae426082"
+            )
+            cached = cache_generated_ai_image(project_path, AiGeneratedImage(png_1x1, "png"))
+            settings = AppSettings(workspace_dir=folder, export_dir=str(Path(folder) / "exports"))
+            context_provider = lambda: ("ctx", Path(folder), project_path)
+            panel = AiImagePanel(None, settings, context_provider)
+
+            panel._delete_cached_output_paths([cached.path])
+
+            self.assertFalse(cached.path.exists())
+            self.assertEqual(panel.output_list.count(), 0)
+            self.assertEqual(panel.cached_images, [])
+            self.assertIsNone(panel._current_image_path)
+            panel.deleteLater()
+
+    def test_ai_image_panel_keeps_cached_outputs_per_canvas(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "CanvasCache.gdc"
+            valid_png = bytes.fromhex(
+                "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+                "000000097048597300000f6100000f6101a83fa7690000000d49444154089963f8cfc0f01f"
+                "00050001ffabce36890000000049454e44ae426082"
+            )
+            first = cache_generated_ai_image(
+                project_path,
+                AiGeneratedImage(valid_png, "png"),
+                cache_key="canvas-a",
+            )
+            second = cache_generated_ai_image(
+                project_path,
+                AiGeneratedImage(valid_png, "png"),
+                cache_key="canvas-b",
+            )
+            settings = AppSettings(workspace_dir=folder, export_dir=str(Path(folder) / "exports"))
+            context_provider = lambda: ("ctx", Path(folder), project_path)
+            panel = AiImagePanel(None, settings, context_provider)
+
+            panel.bind_canvas("第一", "out-a", "canvas-a")
+            self.assertEqual([image.path for image in panel.cached_images], [first.path])
+
+            panel.bind_canvas("第二", "out-b", "canvas-b")
+            self.assertEqual([image.path for image in panel.cached_images], [second.path])
+
+            panel.bind_canvas("", "")
+            self.assertEqual(panel.cached_images, [])
+            panel.deleteLater()
 
     def test_ai_settings_dialog_one_click_uses_ollama_free_preset(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -335,6 +552,32 @@ class AppEditingTests(unittest.TestCase):
                 self.assertEqual(settings.ai_reasoning_effort, "low")
                 loaded = load_settings()
                 self.assertEqual(loaded.ai_reasoning_effort, "low")
+                dialog.deleteLater()
+
+    def test_ai_settings_dialog_keeps_existing_api_key_when_inputs_are_blank(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            settings = AppSettings(
+                workspace_dir=folder,
+                export_dir=str(Path(folder) / "exports"),
+                ai_provider="codex",
+                ai_model="gpt-5.5",
+                ai_auth_mode="api_key",
+                ai_api_key="saved-secret",
+                ai_base_url="https://api.example.test/v1",
+            )
+            with mock.patch.dict(os.environ, {"APPDATA": folder}):
+                save_settings(settings)
+                dialog = AiSettingsDialog(None, settings)
+                dialog.api_key_edit.clear()
+                dialog.base_url_edit.clear()
+
+                dialog._save()
+
+                self.assertEqual(settings.ai_api_key, "saved-secret")
+                self.assertEqual(settings.ai_base_url, "https://api.example.test/v1")
+                loaded = load_settings()
+                self.assertEqual(loaded.ai_api_key, "saved-secret")
+                self.assertEqual(loaded.ai_base_url, "https://api.example.test/v1")
                 dialog.deleteLater()
 
     def test_ai_settings_dialog_shows_no_free_model_for_own_api_key(self) -> None:
@@ -466,6 +709,70 @@ class AppEditingTests(unittest.TestCase):
         panel._clear_screen()
 
         self.assertEqual(panel.activity_log.toPlainText(), "")
+        panel.deleteLater()
+
+    def test_ai_panel_reports_qprocess_error_when_cli_fails_to_start(self) -> None:
+        class SignalStub:
+            def connect(self, *_args) -> None:
+                pass
+
+        class FailedProcess:
+            def __init__(self) -> None:
+                self.program = ""
+                self.arguments = []
+                self.cwd = ""
+                self.started = False
+                self._error = "拒绝访问"
+                self.readyReadStandardOutput = SignalStub()
+                self.readyReadStandardError = SignalStub()
+                self.errorOccurred = SignalStub()
+                self.finished = SignalStub()
+
+            def setProgram(self, program: str) -> None:
+                self.program = program
+
+            def setArguments(self, arguments: list[str]) -> None:
+                self.arguments = list(arguments)
+
+            def setWorkingDirectory(self, cwd: str) -> None:
+                self.cwd = cwd
+
+            def setProcessEnvironment(self, _env) -> None:
+                pass
+
+            def start(self) -> None:
+                self.started = True
+
+            def waitForStarted(self, _ms: int) -> bool:
+                return False
+
+            def errorString(self) -> str:
+                return self._error
+
+            def write(self, _data: bytes) -> None:
+                raise AssertionError("should not write after failed start")
+
+            def closeWriteChannel(self) -> None:
+                pass
+
+        project_path = Path("D:/GameDesigner/FailedCli.gdc")
+        panel = AiChatPanel(
+            None,
+            AppSettings(ai_provider="codex", ai_model="gpt-5.4"),
+            lambda: ("项目上下文", project_path.parent, project_path),
+        )
+        process = FailedProcess()
+
+        with mock.patch("gamedesigner.ui.ai_chat_dialog.QProcess", return_value=process):
+            with mock.patch.object(QMessageBox, "warning") as warning:
+                with mock.patch.object(panel, "_cleanup_pending_output_file") as cleanup:
+                    panel.input.setPlainText("帮我检查")
+                    panel._send()
+
+        self.assertTrue(process.started)
+        self.assertIn("拒绝访问", panel.transcript.toPlainText())
+        warning.assert_called_once()
+        cleanup.assert_called_once()
         panel.deleteLater()
 
     def test_submit_plain_text_edit_enter_submits_shift_enter_inserts_newline(self) -> None:
@@ -1128,6 +1435,125 @@ class AppEditingTests(unittest.TestCase):
         self.assertEqual(canvas.template_id, template.id)
         window.deleteLater()
 
+    def test_add_image_canvas_creates_default_generation_flow(self) -> None:
+        window = GameDesignerApp()
+        project = ProjectData(name="生图画布测试")
+        project.ensure_canvas_structure()
+        page = window._add_page(project, None, dirty=False, canvas_data=project.root_canvas())
+        window.tabs.setCurrentWidget(page)
+
+        parent_node_id = window._add_image_canvas_node_at(260, 180)
+
+        parent_node = project.root_canvas().find_node(parent_node_id)
+        self.assertIsNotNone(parent_node)
+        canvas = project.find_canvas(parent_node.canvas_id)
+        self.assertIsNotNone(canvas)
+        self.assertEqual(parent_node.icon, "图")
+        self.assertEqual(canvas.canvas_type, "image")
+        self.assertEqual([node.title for node in canvas.nodes], ["入口", "输出"])
+        self.assertEqual(len(canvas.valid_edges()), 1)
+        self.assertTrue(window.ai_assistant_expanded)
+        window.deleteLater()
+
+    def test_connection_drop_image_canvas_keeps_parent_edge_and_selection(self) -> None:
+        window = GameDesignerApp()
+        project = ProjectData(name="拖线生图画布测试")
+        project.ensure_canvas_structure()
+        root = project.root_canvas()
+        source = root.add_node(Node(title="来源"))
+        page = window._add_page(project, None, dirty=False, canvas_data=root)
+        window.tabs.setCurrentWidget(page)
+
+        def choose_image_canvas(menu, *_args):
+            return next(action for action in menu.actions() if action.text() == "生图画布")
+
+        with mock.patch.object(window, "_exec_app_context_menu", side_effect=choose_image_canvas):
+            window._handle_connection_drop_on_empty(page, source.id, QPointF(460, 220))
+
+        target = next(node for node in root.nodes if node.id != source.id)
+        self.assertTrue(target.canvas_id)
+        self.assertTrue(any(edge.source == source.id and edge.target == target.id for edge in root.valid_edges()))
+        self.assertEqual(page.canvas.selected_node_ids, {target.id})
+        window.deleteLater()
+
+    def test_image_generation_writes_back_to_origin_canvas_after_tab_change(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            window = GameDesignerApp()
+            project = ProjectData(name="生图回写测试")
+            project.ensure_canvas_structure()
+            root_page = window._add_page(project, None, dirty=False, canvas_data=project.root_canvas())
+            image_canvas = project.add_canvas("角色生图", canvas_type="image", parent_canvas_id=project.root_canvas_id)
+            _entry, output, edge = default_image_canvas_nodes()
+            image_canvas.nodes.extend([_entry, output])
+            image_canvas.edges.append(edge)
+            image_page = window._add_page(project, None, dirty=False, canvas_data=image_canvas)
+            window.tabs.setCurrentWidget(root_page)
+
+            generated = CachedAiImage(Path(folder) / "result.png", 1, 1)
+            window._on_ai_image_generation_succeeded(generated, "角色立绘", output.id)
+
+            image_field = next(field for field in output.fields if field.name == "生成图片")
+            self.assertEqual(image_field.image_path, str(generated.path))
+            self.assertEqual(output.title, "角色立绘")
+            self.assertEqual(image_page.canvas.selected_node_ids, {output.id})
+            self.assertIs(window._current_page(), root_page)
+            window.deleteLater()
+
+    def test_image_canvas_request_includes_parent_chain_images_and_link_docs(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "ImageParentChain.gdc"
+            project = ProjectData(name="父画布链路生图")
+            project.ensure_canvas_structure()
+            root = project.root_canvas()
+            reference_image = str(Path(folder) / "ui_refs.png")
+            reference = root.add_node(
+                Node(
+                    title="图片参考",
+                    fields=[
+                        NodeField("说明", "长文本", "参考暖色木质 UI、俯视地图和像素素材"),
+                        NodeField("拼图", "图片", "UI 拼图", image_path=reference_image),
+                    ],
+                )
+            )
+            link_path = create_link_document(project_path, "UI规则", "md")
+            write_link_document(project_path, link_path, "## UI规则\n按钮圆角小，材质保持木质，避免赛博霓虹。")
+            doc = root.add_node(
+                Node(
+                    title="UI规则文档",
+                    node_type="超文本",
+                    link_path=link_path,
+                    link_format="md",
+                )
+            )
+            canvas_node = root.add_node(Node(title="UI 图片生成", node_type="画布", icon="图"))
+            image_canvas = project.add_canvas(
+                "UI 图片生成",
+                canvas_type="image",
+                parent_canvas_id=root.id,
+                parent_node_id=canvas_node.id,
+            )
+            canvas_node.canvas_id = image_canvas.id
+            entry, output, edge = default_image_canvas_nodes()
+            image_canvas.nodes.extend([entry, output])
+            image_canvas.edges.append(edge)
+            root.add_edge(reference.id, doc.id).label = "参考文档"
+            root.add_edge(doc.id, canvas_node.id).label = "输入给生图"
+
+            request = build_image_canvas_request(
+                image_canvas,
+                find_image_output_node(image_canvas).id,
+                project=project,
+                project_path=project_path,
+            )
+
+            self.assertIn("父画布外部输入链路", request.prompt)
+            self.assertIn("图片参考", request.prompt)
+            self.assertIn("参考暖色木质 UI", request.prompt)
+            self.assertIn("UI规则文档", request.prompt)
+            self.assertIn("按钮圆角小", request.prompt)
+            self.assertIn("输入给生图", request.prompt)
+            self.assertEqual([str(path) for path in request.reference_paths], [reference_image])
+
     def test_add_node_in_data_canvas_uses_canvas_template_and_forces_lock(self) -> None:
         window = GameDesignerApp()
         title_field = NodeField("名称", "文本", "条目")
@@ -1641,6 +2067,38 @@ class AppEditingTests(unittest.TestCase):
         self.assertFalse(dialog.templates[-1].icon_from_title)
         dialog.deleteLater()
 
+    def test_node_editor_image_preview_reuses_pixmap_cache(self) -> None:
+        node = Node(
+            title="图片节点",
+            width=360,
+            height=300,
+            fields=[
+                NodeField(
+                    "图片",
+                    "图片",
+                    "",
+                    image_path="D:/assets/large.png",
+                    width=240,
+                    height=180,
+                    image_fit="contain",
+                )
+            ],
+        )
+        dialog = NodeEditorDialog(None, node, templates=[])
+        pixmap = QPixmap(128, 96)
+        pixmap.fill(Qt.white)
+
+        with mock.patch.object(dialog.canvas._pixmap_cache, "_load_source", return_value=pixmap) as load_source:
+            first = dialog.canvas.source_image_pixmap("D:/assets/large.png")
+            second = dialog.canvas.source_image_pixmap("D:/assets/large.png")
+            scaled_first = dialog.canvas.scaled_image_pixmap("D:/assets/large.png", 240, 180, "contain")
+            scaled_second = dialog.canvas.scaled_image_pixmap("D:/assets/large.png", 240, 180, "contain")
+
+        self.assertEqual(load_source.call_count, 1)
+        self.assertIs(first, second)
+        self.assertIs(scaled_first, scaled_second)
+        dialog.deleteLater()
+
     def test_save_template_dialog_lists_existing_templates(self) -> None:
         templates = [NodeTemplate(name="启程"), NodeTemplate(name="战斗")]
         dialog = TemplateSaveDialog(None, "新模板", templates)
@@ -2044,6 +2502,29 @@ class AppEditingTests(unittest.TestCase):
                 self.assertEqual(reopened_recent.width, 420)
                 self.assertEqual(reopened_recent.height, 220)
                 reopened.deleteLater()
+
+    def test_welcome_page_discovers_recent_projects_from_workspace_when_settings_are_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "RecoveredRecent.gdc"
+            project_path.write_text("{}", encoding="utf-8")
+            settings = AppSettings(
+                workspace_dir=folder,
+                export_dir=str(Path(folder) / "exports"),
+                last_project="",
+                recent_projects=[],
+            )
+            with mock.patch.dict(os.environ, {"APPDATA": folder}):
+                save_settings(settings)
+
+                window = GameDesignerApp()
+                welcome_page = window._current_page()
+                self.assertIsNotNone(welcome_page)
+                self.assertTrue(welcome_page.is_welcome)
+                recent = next(node for node in welcome_page.project.nodes if node.id.startswith("welcome_recent_"))
+
+                self.assertEqual(recent.title, "RecoveredRecent")
+                self.assertEqual(window.settings.recent_projects, [str(project_path)])
+                window.deleteLater()
 
     def test_reopen_same_project_path_reloads_from_disk(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

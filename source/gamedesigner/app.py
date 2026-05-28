@@ -48,6 +48,16 @@ from .ai_canvas_tools import (
     validate_ai_canvas_tool_call,
 )
 from .canvas_io import import_canvas_sheet
+from .image_canvas import (
+    IMAGE_CANVAS_EDIT_EDGE_LABEL,
+    IMAGE_CANVAS_IMAGE_FIELD,
+    apply_image_output_result,
+    build_image_canvas_request,
+    convert_output_node_to_reference,
+    edge_with_label,
+    find_image_output_node,
+    new_image_output_node_from_previous,
+)
 from .data_canvas import apply_template_to_node, data_canvas_template, sync_data_canvas, sync_locked_template_nodes
 from .models import (
     EDGE_STYLES,
@@ -60,6 +70,7 @@ from .models import (
     ProjectData,
     DesignNote,
     default_label_node,
+    default_image_canvas_nodes,
     default_project,
     new_id,
 )
@@ -163,6 +174,8 @@ class ProjectPage(QWidget):
     dataLayoutRequested = Signal(str)
     dataGridRowsRequested = Signal(int)
     dataRowStyleRequested = Signal(str)
+    imageGenerateRequested = Signal()
+    imageRetouchRequested = Signal()
 
     def __init__(
         self,
@@ -257,6 +270,20 @@ class ProjectPage(QWidget):
         self.reset_view_button.setAutoRaise(True)
         self.reset_view_button.clicked.connect(self.resetViewRequested.emit)
         function_layout.addWidget(self.reset_view_button)
+        self.image_generate_button = QToolButton(self.function_bar)
+        self.image_generate_button.setObjectName("canvasFunctionButton")
+        self.image_generate_button.setText("生图")
+        self.image_generate_button.setToolTip("生成当前生图画布输出")
+        self.image_generate_button.setAutoRaise(True)
+        self.image_generate_button.clicked.connect(self.imageGenerateRequested.emit)
+        function_layout.addWidget(self.image_generate_button)
+        self.image_retouch_button = QToolButton(self.function_bar)
+        self.image_retouch_button.setObjectName("canvasFunctionButton")
+        self.image_retouch_button.setText("修图")
+        self.image_retouch_button.setToolTip("把当前输出转成参考图并创建新的输出")
+        self.image_retouch_button.setAutoRaise(True)
+        self.image_retouch_button.clicked.connect(self.imageRetouchRequested.emit)
+        function_layout.addWidget(self.image_retouch_button)
         layout.addWidget(self.function_bar)
         self.content = QWidget(self)
         self.content_layout = QStackedLayout(self.content)
@@ -362,6 +389,9 @@ class ProjectPage(QWidget):
         self.table_layout_button.setChecked(is_data_canvas and self.canvas_data.data_layout == "table")
         self.independent_row_button.setChecked(show_row_style and self.canvas_data.data_row_style != "thumbnail")
         self.thumbnail_row_button.setChecked(show_row_style and self.canvas_data.data_row_style == "thumbnail")
+        show_image_tools = bool(self.canvas_data.is_image_canvas())
+        self.image_generate_button.setVisible(show_image_tools)
+        self.image_retouch_button.setVisible(show_image_tools)
 
     def _position_preview_overlay(self) -> None:
         if not hasattr(self, "preview_panel"):
@@ -900,8 +930,10 @@ class GameDesignerApp(QMainWindow):
         canvas.edgeDeleteRequested.connect(self._delete_edge_by_id)
         canvas.edgeStyleRequested.connect(self._set_edge_style)
         canvas.edgeCreated.connect(self._create_edge)
+        canvas.connectionDroppedOnEmpty.connect(lambda source_id, scene_pos, _global_pos, page=page: self._handle_connection_drop_on_empty(page, source_id, scene_pos))
         canvas.createNodeRequested.connect(self._add_node_at)
         canvas.createCanvasNodeRequested.connect(self._add_canvas_node_at)
+        canvas.createImageCanvasRequested.connect(self._add_image_canvas_node_at)
         canvas.createDataCanvasRequested.connect(self._add_data_canvas_node_at)
         canvas.createLinkNodeRequested.connect(self._add_link_node_at)
         canvas.createGroupRequested.connect(self._add_blueprint_group_at)
@@ -916,6 +948,10 @@ class GameDesignerApp(QMainWindow):
         canvas.templateManagerRequested.connect(self._manage_templates)
         canvas.openProjectRequested.connect(self._open_project)
         canvas.aiIterateRequested.connect(self._open_ai_iteration_assistant)
+        canvas.imageGenerateRequested.connect(lambda page=page: self._generate_image_canvas(page))
+        canvas.imageRetouchRequested.connect(lambda page=page: self._retouch_image_canvas(page))
+        page.imageGenerateRequested.connect(lambda page=page: self._generate_image_canvas(page))
+        page.imageRetouchRequested.connect(lambda page=page: self._retouch_image_canvas(page))
         page.table_view.projectChanged.connect(lambda page=page: self._mark_dirty(page))
         page.parentJumpRequested.connect(lambda page=page: self._jump_to_parent_canvas(page))
         page.returnCloseRequested.connect(lambda page=page: self._return_to_previous_canvas(page))
@@ -1084,6 +1120,8 @@ class GameDesignerApp(QMainWindow):
         if self.settings.last_project:
             candidates.append(self.settings.last_project)
         candidates.extend(self.settings.recent_projects)
+        if not candidates:
+            candidates.extend(self._discover_recent_project_paths())
         result: list[Path] = []
         seen: set[str] = set()
         for raw_path in candidates:
@@ -1095,6 +1133,25 @@ class GameDesignerApp(QMainWindow):
             result.append(path)
         self.settings.recent_projects = [str(path) for path in result[:8]]
         return result
+
+    def _discover_recent_project_paths(self) -> list[Path]:
+        roots = []
+        if self.settings.workspace_dir:
+            roots.append(Path(self.settings.workspace_dir))
+        roots.append(Path.home() / "Documents" / "GameDesigner")
+        paths: list[Path] = []
+        seen_roots: set[str] = set()
+        for root in roots:
+            key = str(root).casefold()
+            if key in seen_roots or not root.exists() or not root.is_dir():
+                continue
+            seen_roots.add(key)
+            try:
+                paths.extend(path for path in root.rglob(f"*{PROJECT_SUFFIX}") if path.is_file())
+            except OSError:
+                continue
+        paths.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+        return paths[:8]
 
     def _remove_welcome_pages(self) -> None:
         for index in reversed(range(self.tabs.count())):
@@ -1156,6 +1213,14 @@ class GameDesignerApp(QMainWindow):
         for index in range(self.tabs.count()):
             page = self.tabs.widget(index)
             if isinstance(page, ProjectPage) and page.project is project and not page.is_welcome:
+                pages.append(page)
+        return pages
+
+    def _open_project_pages(self) -> list[ProjectPage]:
+        pages: list[ProjectPage] = []
+        for index in range(self.tabs.count()):
+            page = self.tabs.widget(index)
+            if isinstance(page, ProjectPage) and not page.is_welcome:
                 pages.append(page)
         return pages
 
@@ -1292,6 +1357,9 @@ class GameDesignerApp(QMainWindow):
     def _on_current_tab_changed(self) -> None:
         self._update_title()
         self._update_status()
+        page = self._current_page()
+        if page and not page.is_welcome and page.canvas_data.is_image_canvas():
+            self._open_ai_image_assistant()
         QTimer.singleShot(0, self._sync_current_canvas_cursor)
 
     def _sync_current_canvas_cursor(self) -> None:
@@ -1508,7 +1576,10 @@ class GameDesignerApp(QMainWindow):
             ):
                 if source_canvas_id:
                     page.source_canvas_id = source_canvas_id
+                already_current = page is self._current_page()
                 self.tabs.setCurrentIndex(index)
+                if canvas.is_image_canvas() and already_current:
+                    self._open_ai_image_assistant()
                 return page
         page = self._add_page(
             project,
@@ -1548,7 +1619,67 @@ class GameDesignerApp(QMainWindow):
             canvas.parent_node_id = canvas.parent_node_id or node.id
         if canvas.is_data_canvas() and not node.icon:
             node.icon = "数"
+        if canvas.is_image_canvas() and not node.icon:
+            node.icon = "图"
         return canvas
+
+    def _image_canvas_output_node_id(self, canvas: CanvasData) -> str:
+        output = find_image_output_node(canvas)
+        return output.id if output is not None else ""
+
+    def _handle_connection_drop_on_empty(self, page: ProjectPage, source_id: str, scene_pos: QPointF) -> None:
+        if page is not self._current_page() or page.is_welcome:
+            return
+        menu = QMenu(self)
+        actions: dict[str, QAction] = {
+            "node": menu.addAction("节点"),
+            "canvas": menu.addAction("画布节点"),
+            "image_canvas": menu.addAction("生图画布"),
+            "data_canvas": menu.addAction("数据画布"),
+            "note": menu.addAction("便签"),
+            "group": menu.addAction("蓝图组"),
+        }
+        action = self._exec_app_context_menu(menu)
+        if action is None:
+            return
+        before_nodes = {node.id for node in page.canvas_data.nodes}
+        before_groups = {group.id for group in page.canvas_data.groups}
+        created_node_id = ""
+        if action == actions["node"]:
+            self._add_node_at(scene_pos.x(), scene_pos.y())
+        elif action == actions["canvas"]:
+            created_node_id = self._add_canvas_node_at(scene_pos.x(), scene_pos.y()) or ""
+        elif action == actions["image_canvas"]:
+            created_node_id = self._add_image_canvas_node_at(scene_pos.x(), scene_pos.y()) or ""
+        elif action == actions["data_canvas"]:
+            created_node_id = self._add_data_canvas_node_at(scene_pos.x(), scene_pos.y()) or ""
+        elif action == actions["note"]:
+            self._add_note_at(scene_pos.x(), scene_pos.y(), None)
+        elif action == actions["group"]:
+            self._add_blueprint_group_at(scene_pos.x(), scene_pos.y())
+        created_nodes = [node for node in page.canvas_data.nodes if node.id not in before_nodes]
+        created_groups = [group for group in page.canvas_data.groups if group.id not in before_groups]
+        if created_node_id:
+            target_id = created_node_id
+        elif created_nodes:
+            target_id = created_nodes[0].id
+        elif created_groups:
+            target_id = created_groups[0].id
+        else:
+            return
+        if target_id == source_id:
+            return
+        edge = page.canvas_data.add_edge(source_id, target_id)
+        if edge is None:
+            return
+        if self._last_edge_style in EDGE_STYLES:
+            edge.style = self._last_edge_style
+        page.canvas.rebuild()
+        if created_node_id or created_nodes:
+            page.canvas.select_node(target_id)
+        else:
+            page.canvas.select_group(target_id)
+        self._mark_dirty(page)
 
     def _ensure_project_path_for_files(self, page: ProjectPage) -> Path:
         self._ensure_project_dirs(page.project, page.path)
@@ -1908,62 +2039,74 @@ class GameDesignerApp(QMainWindow):
         page.canvas.select_node(node.id)
         self._mark_dirty(page)
 
-    def _add_canvas_node_at(self, x: float, y: float) -> None:
+    def _add_canvas_node_at(self, x: float, y: float) -> str:
         page = self._current_page()
         if not page:
-            return
+            return ""
         if page.is_welcome:
             self._new_project()
-            return
+            return ""
         if page.canvas_data.is_data_canvas():
-            return
-        node = Node(
-            title="新画布",
-            node_type="画布",
-            icon="画",
-            x=x - 155,
-            y=y - 72,
-            fields=[
-                NodeField("入口", "画布", "双击打开子画布"),
-            ],
-        )
-        canvas = page.project.add_canvas(
-            node.title,
-            parent_canvas_id=page.canvas_id,
-            parent_node_id=node.id,
-        )
-        node.canvas_id = canvas.id
-        node.group_id = page.canvas.group_id_at_scene_pos(QPointF(x, y))
-        page.canvas_data.add_node(node)
-        page.canvas.rebuild()
-        page.canvas.select_node(node.id)
-        self._mark_dirty(page)
-        self._open_canvas_page(page.project, page.path, canvas.id, source_canvas_id=page.canvas_id)
+            return ""
+        return self._add_canvas_node(page, x, y, canvas_type="normal")
 
-    def _add_data_canvas_node_at(self, x: float, y: float) -> None:
+    def _add_data_canvas_node_at(self, x: float, y: float) -> str:
         page = self._current_page()
         if not page:
-            return
+            return ""
         if page.is_welcome:
             self._new_project()
-            return
+            return ""
         template = page.project.find_template(page.active_template_id or "") or (
             page.project.templates[0] if page.project.templates else None
         )
         template_id = template.id if template is not None else ""
+        return self._add_canvas_node(page, x, y, canvas_type="data", template_id=template_id)
+
+    def _add_image_canvas_node_at(self, x: float, y: float) -> str:
+        page = self._current_page()
+        if not page:
+            return ""
+        if page.is_welcome:
+            self._new_project()
+            return ""
+        return self._add_canvas_node(page, x, y, canvas_type="image")
+
+    def _add_canvas_node(
+        self,
+        page: ProjectPage,
+        x: float,
+        y: float,
+        *,
+        canvas_type: str = "normal",
+        template_id: str = "",
+    ) -> str:
+        if page.canvas_data.is_data_canvas():
+            return ""
+        canvas_type = canvas_type if canvas_type in {"normal", "data", "image"} else "normal"
+        if canvas_type == "data":
+            title = "数据画布"
+            icon = "数"
+            fields = [NodeField("入口", "画布", "双击打开数据画布")]
+        elif canvas_type == "image":
+            title = "生图画布"
+            icon = "图"
+            fields = [NodeField("入口", "画布", "双击打开生图画布")]
+        else:
+            title = "新画布"
+            icon = "画"
+            fields = [NodeField("入口", "画布", "双击打开子画布")]
         node = Node(
-            title="数据画布",
+            title=title,
             node_type="画布",
-            icon="数",
+            icon=icon,
             x=x - 155,
             y=y - 72,
-            fields=[
-                NodeField("入口", "画布", "双击打开数据画布"),
-            ],
+            fields=fields,
         )
         canvas = page.project.add_canvas(
             node.title,
-            canvas_type="data",
+            canvas_type=canvas_type,
             data_layout="grid",
             template_id=template_id,
             parent_canvas_id=page.canvas_id,
@@ -1972,11 +2115,18 @@ class GameDesignerApp(QMainWindow):
         node.canvas_id = canvas.id
         node.group_id = page.canvas.group_id_at_scene_pos(QPointF(x, y))
         page.canvas_data.add_node(node)
-        self._sync_project_templates(page.project)
-        self._refresh_project_views(page.project)
+        if canvas.is_image_canvas():
+            entry, output, edge = default_image_canvas_nodes()
+            canvas.nodes.extend([entry, output])
+            canvas.edges.append(edge)
+        if canvas.is_data_canvas():
+            self._sync_project_templates(page.project)
+            self._refresh_project_views(page.project)
+        page.canvas.rebuild()
         page.canvas.select_node(node.id)
         self._mark_dirty(page)
         self._open_canvas_page(page.project, page.path, canvas.id, source_canvas_id=page.canvas_id)
+        return node.id
 
     def _add_link_node_at(self, x: float, y: float, file_format: str = "md") -> None:
         page = self._current_page()
@@ -2756,6 +2906,108 @@ class GameDesignerApp(QMainWindow):
         page.canvas.select_edge(edge.id)
         self._mark_dirty(page)
 
+    def _exec_app_context_menu(self, menu: QMenu) -> QAction | None:
+        return menu.exec(QCursor.pos())
+
+    def _generate_image_canvas(self, page: ProjectPage | None = None) -> None:
+        page = page or self._current_page()
+        if not page or page.is_welcome or not page.canvas_data.is_image_canvas():
+            return
+        output = find_image_output_node(page.canvas_data)
+        if output is None:
+            QMessageBox.information(self, "生图画布", "当前生图画布没有输出节点。")
+            return
+        request_data = build_image_canvas_request(
+            page.canvas_data,
+            output.id,
+            project=page.project,
+            project_path=page.path,
+        )
+        if not request_data.prompt.strip():
+            QMessageBox.information(self, "生图画布", "请先在入口节点或输出节点写入提示词。")
+            return
+        set_prompt = request_data.prompt.strip()
+        apply_image_output_result(output, set_prompt, next((field.image_path for field in output.fields if field.name == IMAGE_CANVAS_IMAGE_FIELD), ""))
+        page.canvas.rebuild()
+        page.canvas.select_node(output.id)
+        self._mark_dirty(page)
+        self._open_ai_image_assistant()
+        if hasattr(self.ai_assistant_panel, "bind_canvas"):
+            self.ai_assistant_panel.bind_canvas(page.canvas_data.name, output.id, page.canvas_data.id)
+        if hasattr(self.ai_assistant_panel, "generate_with_prompt"):
+            self.ai_assistant_panel.generate_with_prompt(
+                set_prompt,
+                request_data.reference_paths,
+                output_node_id=output.id,
+            )
+
+    def _on_ai_image_generation_succeeded(self, cached_image: object, prompt: str, output_node_id: str) -> None:
+        from .image_ai import CachedAiImage
+
+        if not isinstance(cached_image, CachedAiImage):
+            return
+        target = self._image_canvas_output_target(output_node_id)
+        if target is None:
+            return
+        project, canvas, output = target
+        if output is None:
+            return
+        apply_image_output_result(output, prompt, str(cached_image.path))
+        open_pages = [
+            project_page
+            for project_page in self._project_pages(project)
+            if project_page.canvas_id == canvas.id
+        ]
+        for project_page in open_pages:
+            project_page.canvas.rebuild()
+            project_page.canvas.select_node(output.id)
+        dirty_page = open_pages[0] if open_pages else next(iter(self._project_pages(project)), None)
+        if dirty_page is not None:
+            self._mark_dirty(dirty_page)
+
+    def _image_canvas_output_target(self, output_node_id: str) -> tuple[ProjectData, CanvasData, Node] | None:
+        if output_node_id:
+            seen_projects: set[int] = set()
+            for project_page in self._open_project_pages():
+                project_key = id(project_page.project)
+                if project_key in seen_projects:
+                    continue
+                seen_projects.add(project_key)
+                for canvas in project_page.project.canvases:
+                    if not canvas.is_image_canvas():
+                        continue
+                    output = canvas.find_node(output_node_id)
+                    if output is not None:
+                        return project_page.project, canvas, output
+        page = self._current_page()
+        if page and not page.is_welcome and page.canvas_data.is_image_canvas():
+            output = find_image_output_node(page.canvas_data)
+            if output is not None:
+                return page.project, page.canvas_data, output
+        return None
+
+    def _retouch_image_canvas(self, page: ProjectPage | None = None) -> None:
+        page = page or self._current_page()
+        if not page or page.is_welcome or not page.canvas_data.is_image_canvas():
+            return
+        output = find_image_output_node(page.canvas_data)
+        if output is None:
+            return
+        previous_id = output.id
+        convert_output_node_to_reference(output)
+        new_output = new_image_output_node_from_previous(output)
+        page.canvas_data.add_node(new_output)
+        edge = edge_with_label(previous_id, new_output.id, IMAGE_CANVAS_EDIT_EDGE_LABEL)
+        if self._last_edge_style in EDGE_STYLES:
+            edge.style = self._last_edge_style
+        page.canvas_data.edges.append(edge)
+        page.canvas.rebuild()
+        page.canvas.select_node(new_output.id)
+        self._mark_dirty(page)
+        self._open_ai_image_assistant()
+        if hasattr(self.ai_assistant_panel, "bind_canvas"):
+            self.ai_assistant_panel.bind_canvas(page.canvas_data.name, new_output.id, page.canvas_data.id)
+
     def _remember_last_edge_style(self, style: str) -> None:
         if style not in EDGE_STYLES or self._last_edge_style == style:
             return
@@ -2789,6 +3041,7 @@ class GameDesignerApp(QMainWindow):
         if not isinstance(self.ai_assistant_panel, AiImagePanel):
             panel = AiImagePanel(self, self.settings, self._current_ai_project_context)
             panel.collapseRequested.connect(self._collapse_ai_assistant)
+            panel.generationSucceeded.connect(self._on_ai_image_generation_succeeded)
             self.ai_assistant_panel = panel
             self.ai_assistant_stack.addWidget(panel)
         self.ai_assistant_expanded = True
@@ -2796,6 +3049,16 @@ class GameDesignerApp(QMainWindow):
         self.ai_assistant_stack.setCurrentWidget(self.ai_assistant_panel)
         if hasattr(self.ai_assistant_panel, "load_project_cache"):
             self.ai_assistant_panel.load_project_cache()
+        if hasattr(self.ai_assistant_panel, "bind_canvas"):
+            page = self._current_page()
+            if page and not page.is_welcome and page.canvas_data.is_image_canvas():
+                self.ai_assistant_panel.bind_canvas(
+                    page.canvas_data.name,
+                    self._image_canvas_output_node_id(page.canvas_data),
+                    page.canvas_data.id,
+                )
+            else:
+                self.ai_assistant_panel.bind_canvas("", "")
         self.ai_assistant_panel.show()
         self.ai_assistant_panel.input.setFocus(Qt.OtherFocusReason)
 

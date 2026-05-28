@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import math
-from collections import OrderedDict
 from dataclasses import dataclass
 
 from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, Qt, QTimer, Signal
@@ -42,7 +41,7 @@ from .data_canvas import (
     layout_data_canvas,
     reorder_data_canvas_node,
 )
-from .image_rendering import draw_field_pixmap
+from .image_rendering import PixmapCache, draw_field_pixmap
 from .models import (
     NOTE_DEFAULT_HEIGHT,
     NOTE_DEFAULT_WIDTH,
@@ -107,7 +106,6 @@ EDGE_LABEL_PADDING_X = 10.0
 IMAGE_SOURCE_CACHE_LIMIT = 96
 IMAGE_SCALED_CACHE_LIMIT = 192
 INTERACTION_PREVIEW_DELAY_MS = 140
-_MISSING_PIXMAP = object()
 NOTE_MIME_TYPE = "application/x-gamedesigner-design-note"
 
 
@@ -562,6 +560,15 @@ class NodeItem(QGraphicsObject):
             if is_image and field.image_path:
                 pixmap = self.view._source_image_pixmap(field.image_path)
                 if pixmap is not None:
+                    scaled_pixmap = None
+                    fit = field.image_fit if field.image_fit in {"stretch", "contain", "cover"} else ""
+                    if fit:
+                        scaled_pixmap = self.view._scaled_image_pixmap(
+                            field.image_path,
+                            max(1, int(w)),
+                            max(1, int(h)),
+                            fit,
+                        )
                     painter.save()
                     painter.setClipPath(path)
                     draw_field_pixmap(
@@ -570,6 +577,7 @@ class NodeItem(QGraphicsObject):
                         card,
                         field,
                         smooth=not self.view.is_interaction_preview(),
+                        scaled_pixmap=scaled_pixmap,
                     )
                     painter.restore()
             elif is_image:
@@ -2126,6 +2134,7 @@ class NodeGraphView(QGraphicsView):
     edgeCreated = Signal(str, str)
     createNodeRequested = Signal(float, float)
     createCanvasNodeRequested = Signal(float, float)
+    createImageCanvasRequested = Signal(float, float)
     createDataCanvasRequested = Signal(float, float)
     createLinkNodeRequested = Signal(float, float, str)
     createGroupRequested = Signal(float, float)
@@ -2140,6 +2149,9 @@ class NodeGraphView(QGraphicsView):
     templateManagerRequested = Signal()
     openProjectRequested = Signal()
     aiIterateRequested = Signal()
+    imageGenerateRequested = Signal()
+    imageRetouchRequested = Signal()
+    connectionDroppedOnEmpty = Signal(str, object, object)
 
     def __init__(
         self,
@@ -2206,8 +2218,10 @@ class NodeGraphView(QGraphicsView):
         self._cursor_sync_timer = QTimer(self)
         self._cursor_sync_timer.setSingleShot(True)
         self._cursor_sync_timer.timeout.connect(self._apply_scheduled_cursor_sync)
-        self._source_pixmap_cache: OrderedDict[str, QPixmap | None] = OrderedDict()
-        self._scaled_pixmap_cache: OrderedDict[tuple[str, int, int], QPixmap | None] = OrderedDict()
+        self._pixmap_cache = PixmapCache(
+            source_limit=IMAGE_SOURCE_CACHE_LIMIT,
+            scaled_limit=IMAGE_SCALED_CACHE_LIMIT,
+        )
 
         self.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing | QPainter.SmoothPixmapTransform)
         self.setViewportUpdateMode(QGraphicsView.FullViewportUpdate)
@@ -2433,6 +2447,10 @@ class NodeGraphView(QGraphicsView):
     def is_data_canvas(self) -> bool:
         canvas = self.active_canvas()
         return bool(canvas and canvas.is_data_canvas())
+
+    def is_image_canvas(self) -> bool:
+        canvas = self.active_canvas()
+        return bool(canvas and canvas.is_image_canvas())
 
     def uses_horizontal_thumbnail_rows(self) -> bool:
         canvas = self.active_canvas()
@@ -2725,8 +2743,7 @@ class NodeGraphView(QGraphicsView):
         self.viewport().update()
 
     def _clear_pixmap_caches(self) -> None:
-        self._source_pixmap_cache.clear()
-        self._scaled_pixmap_cache.clear()
+        self._pixmap_cache.clear()
 
     def _load_source_pixmap(self, path: str) -> QPixmap | None:
         pixmap = QPixmap(path)
@@ -2735,35 +2752,12 @@ class NodeGraphView(QGraphicsView):
         return pixmap
 
     def _source_image_pixmap(self, path: str) -> QPixmap | None:
-        cache_key = path.strip()
-        if not cache_key:
-            return None
-        cached = self._source_pixmap_cache.get(cache_key, _MISSING_PIXMAP)
-        if cached is not _MISSING_PIXMAP:
-            self._source_pixmap_cache.move_to_end(cache_key)
-            return cached
-        pixmap = self._load_source_pixmap(cache_key)
-        self._remember_pixmap(self._source_pixmap_cache, cache_key, pixmap, IMAGE_SOURCE_CACHE_LIMIT)
-        return pixmap
+        self._pixmap_cache._load_source = self._load_source_pixmap  # type: ignore[method-assign]
+        return self._pixmap_cache.source(path)
 
-    def _scaled_image_pixmap(self, path: str, width: int, height: int) -> QPixmap | None:
-        source = self._source_image_pixmap(path)
-        if source is None:
-            return None
-        cache_key = (path.strip(), max(1, width), max(1, height))
-        cached = self._scaled_pixmap_cache.get(cache_key, _MISSING_PIXMAP)
-        if cached is not _MISSING_PIXMAP:
-            self._scaled_pixmap_cache.move_to_end(cache_key)
-            return cached
-        pixmap = source.scaled(cache_key[1], cache_key[2], Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self._remember_pixmap(self._scaled_pixmap_cache, cache_key, pixmap, IMAGE_SCALED_CACHE_LIMIT)
-        return pixmap
-
-    def _remember_pixmap(self, cache: OrderedDict, key, pixmap, limit: int) -> None:
-        cache[key] = pixmap
-        cache.move_to_end(key)
-        while len(cache) > limit:
-            cache.popitem(last=False)
+    def _scaled_image_pixmap(self, path: str, width: int, height: int, mode: str = "contain") -> QPixmap | None:
+        self._pixmap_cache._load_source = self._load_source_pixmap  # type: ignore[method-assign]
+        return self._pixmap_cache.scaled(path, width, height, mode)
 
     def start_connection(self, source_id: str | None) -> None:
         if not self.can_create_edges():
@@ -2823,6 +2817,9 @@ class NodeGraphView(QGraphicsView):
             if not self._route_note_connection(source, target_id):
                 self._pending_drag_edge = (source, target_id)
                 QTimer.singleShot(0, self._emit_pending_drag_edge)
+        elif source and self._connectable_endpoint_item(source) is not None:
+            global_pos = self.mapToGlobal(self.mapFromScene(scene_pos))
+            self.connectionDroppedOnEmpty.emit(source, QPointF(scene_pos), global_pos)
 
     def _emit_pending_drag_edge(self) -> None:
         edge = self._pending_drag_edge
@@ -3807,6 +3804,11 @@ class NodeGraphView(QGraphicsView):
                 open_canvas = menu.addAction("打开画布")
             elif node.node.node_type == "超文本":
                 open_link = menu.addAction("打开文档")
+            image_generate = None
+            image_retouch = None
+            if self.is_image_canvas():
+                image_generate = menu.addAction("生图")
+                image_retouch = menu.addAction("创建修图节点")
             edit = menu.addAction("编辑节点")
             notes = menu.addAction("便签...")
             create_note = menu.addAction("创建便签")
@@ -3820,6 +3822,10 @@ class NodeGraphView(QGraphicsView):
                 self.nodeActivated.emit(node.node.id)
             elif open_link and action == open_link:
                 self.nodeActivated.emit(node.node.id)
+            elif image_generate and action == image_generate:
+                self.imageGenerateRequested.emit()
+            elif image_retouch and action == image_retouch:
+                self.imageRetouchRequested.emit()
             elif action == edit:
                 self.nodeEditRequested.emit(node.node.id)
             elif action == notes:
@@ -3978,6 +3984,7 @@ class NodeGraphView(QGraphicsView):
             return create_menu, actions
 
         create_canvas = create_menu.addAction("画布节点")
+        create_image_canvas = create_menu.addAction("生图画布")
         create_data_canvas = create_menu.addAction("数据画布")
         create_note = create_menu.addAction("便签")
         create_group = create_menu.addAction("蓝图组")
@@ -3996,6 +4003,7 @@ class NodeGraphView(QGraphicsView):
         actions.update(
             {
                 "create_canvas": create_canvas,
+                "create_image_canvas": create_image_canvas,
                 "create_data_canvas": create_data_canvas,
                 "create_note": create_note,
                 "create_group": create_group,
@@ -4012,6 +4020,9 @@ class NodeGraphView(QGraphicsView):
             return True
         if action == create_actions.get("create_canvas"):
             self.createCanvasNodeRequested.emit(scene_pos.x(), scene_pos.y())
+            return True
+        if action == create_actions.get("create_image_canvas"):
+            self.createImageCanvasRequested.emit(scene_pos.x(), scene_pos.y())
             return True
         if action == create_actions.get("create_data_canvas"):
             self.createDataCanvasRequested.emit(scene_pos.x(), scene_pos.y())

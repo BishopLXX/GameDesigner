@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import OrderedDict
+
 from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QPainter, QPixmap
 
@@ -7,6 +9,71 @@ from .models import NodeField
 
 
 IMAGE_FIT_MODES = ["stretch", "contain", "cover", "nine_slice"]
+IMAGE_SOURCE_CACHE_LIMIT = 32
+IMAGE_SCALED_CACHE_LIMIT = 64
+_MISSING_PIXMAP = object()
+
+
+class PixmapCache:
+    def __init__(
+        self,
+        *,
+        source_limit: int = IMAGE_SOURCE_CACHE_LIMIT,
+        scaled_limit: int = IMAGE_SCALED_CACHE_LIMIT,
+    ) -> None:
+        self.source_limit = max(1, int(source_limit))
+        self.scaled_limit = max(1, int(scaled_limit))
+        self._source_pixmap_cache: OrderedDict[str, QPixmap | None] = OrderedDict()
+        self._scaled_pixmap_cache: OrderedDict[tuple[str, int, int, str], QPixmap | None] = OrderedDict()
+
+    def clear(self) -> None:
+        self._source_pixmap_cache.clear()
+        self._scaled_pixmap_cache.clear()
+
+    def source(self, path: str) -> QPixmap | None:
+        cache_key = path.strip()
+        if not cache_key:
+            return None
+        cached = self._source_pixmap_cache.get(cache_key, _MISSING_PIXMAP)
+        if cached is not _MISSING_PIXMAP:
+            self._source_pixmap_cache.move_to_end(cache_key)
+            return cached
+        pixmap = self._load_source(cache_key)
+        self._remember(self._source_pixmap_cache, cache_key, pixmap, self.source_limit)
+        return pixmap
+
+    def scaled(self, path: str, width: int, height: int, mode: str = "contain") -> QPixmap | None:
+        source = self.source(path)
+        if source is None:
+            return None
+        normalized_mode = mode if mode in {"stretch", "contain", "cover"} else "contain"
+        cache_key = (path.strip(), max(1, width), max(1, height), normalized_mode)
+        cached = self._scaled_pixmap_cache.get(cache_key, _MISSING_PIXMAP)
+        if cached is not _MISSING_PIXMAP:
+            self._scaled_pixmap_cache.move_to_end(cache_key)
+            return cached
+        aspect_mode = (
+            Qt.IgnoreAspectRatio
+            if normalized_mode == "stretch"
+            else Qt.KeepAspectRatioByExpanding
+            if normalized_mode == "cover"
+            else Qt.KeepAspectRatio
+        )
+        pixmap = source.scaled(cache_key[1], cache_key[2], aspect_mode, Qt.SmoothTransformation)
+        self._remember(self._scaled_pixmap_cache, cache_key, pixmap, self.scaled_limit)
+        return pixmap
+
+    def _load_source(self, path: str) -> QPixmap | None:
+        pixmap = QPixmap(path)
+        if pixmap.isNull():
+            return None
+        return pixmap
+
+    def _remember(self, cache: OrderedDict, key, pixmap, limit: int) -> None:
+        cache[key] = pixmap
+        cache.move_to_end(key)
+        while len(cache) > limit:
+            cache.popitem(last=False)
 
 
 def draw_field_pixmap(
@@ -16,6 +83,7 @@ def draw_field_pixmap(
     field: NodeField,
     *,
     smooth: bool = True,
+    scaled_pixmap: QPixmap | None = None,
 ) -> None:
     if pixmap.isNull() or target.width() <= 0 or target.height() <= 0:
         return
@@ -23,18 +91,21 @@ def draw_field_pixmap(
     painter.setRenderHint(QPainter.SmoothPixmapTransform, smooth)
     fit = field.image_fit if field.image_fit in IMAGE_FIT_MODES else "stretch"
     if fit == "contain":
-        _draw_contain(painter, pixmap, target)
+        _draw_contain(painter, pixmap, target, scaled_pixmap)
     elif fit == "cover":
-        _draw_cover(painter, pixmap, target)
+        _draw_cover(painter, pixmap, target, scaled_pixmap)
     elif fit == "nine_slice":
         _draw_nine_slice(painter, pixmap, target, field)
     else:
-        painter.drawPixmap(target.toRect(), pixmap, pixmap.rect())
+        if scaled_pixmap is not None and not scaled_pixmap.isNull():
+            painter.drawPixmap(target.toRect(), scaled_pixmap, scaled_pixmap.rect())
+        else:
+            painter.drawPixmap(target.toRect(), pixmap, pixmap.rect())
     painter.restore()
 
 
-def _draw_contain(painter: QPainter, pixmap: QPixmap, target: QRectF) -> None:
-    scaled = pixmap.scaled(
+def _draw_contain(painter: QPainter, pixmap: QPixmap, target: QRectF, scaled_pixmap: QPixmap | None = None) -> None:
+    scaled = scaled_pixmap or pixmap.scaled(
         max(1, int(target.width())),
         max(1, int(target.height())),
         Qt.KeepAspectRatio,
@@ -45,8 +116,8 @@ def _draw_contain(painter: QPainter, pixmap: QPixmap, target: QRectF) -> None:
     painter.drawPixmap(int(x), int(y), scaled)
 
 
-def _draw_cover(painter: QPainter, pixmap: QPixmap, target: QRectF) -> None:
-    scaled = pixmap.scaled(
+def _draw_cover(painter: QPainter, pixmap: QPixmap, target: QRectF, scaled_pixmap: QPixmap | None = None) -> None:
+    scaled = scaled_pixmap or pixmap.scaled(
         max(1, int(target.width())),
         max(1, int(target.height())),
         Qt.KeepAspectRatioByExpanding,

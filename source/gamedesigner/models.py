@@ -31,7 +31,7 @@ FIELD_TYPES = [
 ]
 
 NODE_TYPES = ["普通", "画布", "超文本"]
-CANVAS_TYPES = ["normal", "data"]
+CANVAS_TYPES = ["normal", "data", "image"]
 DATA_LAYOUT_MODES = ["horizontal", "grid", "table"]
 DATA_ROW_STYLE_MODES = ["independent", "thumbnail"]
 IMAGE_FIT_MODES = ["stretch", "contain", "cover", "nine_slice"]
@@ -440,6 +440,9 @@ class CanvasData:
     def is_data_canvas(self) -> bool:
         return self.canvas_type == "data"
 
+    def is_image_canvas(self) -> bool:
+        return self.canvas_type == "image"
+
     def find_node(self, node_id: str) -> Node | None:
         return next((node for node in self.nodes if node.id == node_id), None)
 
@@ -806,6 +809,34 @@ def default_label_fields() -> list[NodeField]:
     return [
         _visual_field("描述", "长文本", "节点的描述", 10, 0, 450, 230, 13),
     ]
+
+
+def default_image_canvas_nodes() -> tuple[Node, Node, Edge]:
+    prompt_field = _visual_field("提示词", "长文本", "写入核心画面、主体、风格和限制。", 16, 16, 420, 142, 13)
+    entry = Node(
+        title="入口",
+        x=-520,
+        y=-90,
+        width=470,
+        height=230,
+        color=DEFAULT_NODE_COLOR,
+        icon="入",
+        fields=[prompt_field],
+    )
+    output_prompt = _visual_field("生成提示词", "长文本", "输出节点会汇总画布上下文生成最终提示词。", 16, 16, 456, 120, 13)
+    output_image = _visual_field("生成图片", "图片", "", 16, 150, 456, 256, 12)
+    output = Node(
+        title="输出",
+        x=80,
+        y=-140,
+        width=506,
+        height=480,
+        color=DEFAULT_NODE_COLOR,
+        icon="图",
+        fields=[output_prompt, output_image],
+    )
+    edge = Edge(source=entry.id, target=output.id, label="生成目标")
+    return entry, output, edge
 
 
 def default_tech_tree_node(x: float = 0.0, y: float = 0.0) -> Node:

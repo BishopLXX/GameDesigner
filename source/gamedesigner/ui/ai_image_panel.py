@@ -4,8 +4,8 @@ import shutil
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QSize, Qt, QThread, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QImage, QPixmap
+from PySide6.QtCore import QSize, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QIcon, QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMessageBox,
+    QMenu,
     QPushButton,
     QSpinBox,
     QTextBrowser,
@@ -44,6 +45,7 @@ from ..image_ai import (
     save_ai_image_reference,
     save_ai_image_reference_from_qimage,
 )
+from ..image_rendering import PixmapCache
 from ..storage import AppSettings, save_settings
 from ..window_layouts import restore_window_layout, save_window_layout
 from .submit_text_edit import SubmitPlainTextEdit
@@ -106,8 +108,6 @@ class AiImageSettingsDialog(QDialog):
     def _refresh_provider_fields(self) -> None:
         official = self.provider_combo.currentData() == "openai"
         self.base_url_edit.setEnabled(not official)
-        if official:
-            self.base_url_edit.setText("")
 
     def _save(self) -> None:
         self.settings.ai_image_provider = str(self.provider_combo.currentData() or "openai")
@@ -173,16 +173,23 @@ class ImageGenerationThread(QThread):
     succeeded = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, request: AiImageRequest, project_path: Path, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        request: AiImageRequest,
+        project_path: Path,
+        cache_key: str = "",
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self.request = request
         self.project_path = project_path
+        self.cache_key = cache_key
 
     def run(self) -> None:  # type: ignore[override]
         try:
             images = generate_ai_images(self.request)
             cached = [
-                cache_generated_ai_image(self.project_path, image, index=index)
+                cache_generated_ai_image(self.project_path, image, index=index, cache_key=self.cache_key)
                 for index, image in enumerate(images, start=1)
             ]
         except Exception as exc:
@@ -191,8 +198,21 @@ class ImageGenerationThread(QThread):
         self.succeeded.emit(cached)
 
 
+def _unique_paths(paths: list[Path]) -> list[Path]:
+    seen: set[str] = set()
+    result: list[Path] = []
+    for path in paths:
+        key = str(path)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(path)
+    return result
+
+
 class AiImagePanel(QWidget):
     collapseRequested = Signal()
+    generationSucceeded = Signal(object, str, str)
 
     def __init__(
         self,
@@ -206,9 +226,19 @@ class AiImagePanel(QWidget):
         self.context_provider = context_provider
         self.references: list[AiImageReference] = []
         self.cached_images: list[CachedAiImage] = []
+        self._pixmap_cache = PixmapCache(source_limit=64, scaled_limit=128)
         self._cache_project_path: Path | None = None
+        self._cache_binding_key = ""
         self._current_image_path: Path | None = None
         self._thread: ImageGenerationThread | None = None
+        self._active_prompt = ""
+        self._bound_canvas_name = ""
+        self._bound_canvas_key = ""
+        self._bound_output_node_id = ""
+        self._active_output_node_id = ""
+        self._references_by_canvas: dict[str, list[AiImageReference]] = {}
+        self._activity_step = 0
+        self._activity_phases = ("Connecting", "Thinking", "Generating")
 
         title_label = QLabel("AI 生图助手")
         title_label.setObjectName("aiAssistantTitle")
@@ -278,11 +308,21 @@ class AiImagePanel(QWidget):
         self.output_list.setIconSize(QSize(74, 74))
         self.output_list.setGridSize(QSize(88, 92))
         self.output_list.setMaximumHeight(104)
+        self.output_list.setSelectionMode(QListWidget.ExtendedSelection)
+        self.output_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.output_list.customContextMenuRequested.connect(self._show_output_cache_menu)
         self.output_list.currentItemChanged.connect(lambda _current, _previous: self._select_output_item())
 
         self.transcript = QTextBrowser()
         self.transcript.setOpenExternalLinks(True)
         self.transcript.setMaximumHeight(150)
+
+        self.activity_label = QLabel("Ready")
+        self.activity_label.setObjectName("aiImageActivityLabel")
+        self.activity_label.hide()
+        self.activity_timer = QTimer(self)
+        self.activity_timer.setInterval(420)
+        self.activity_timer.timeout.connect(self._tick_activity)
 
         self.input = SubmitPlainTextEdit()
         self.input.setPlaceholderText("描述要生成的图片，例如：绿色史莱姆图标，透明背景，Q版游戏资产。")
@@ -302,7 +342,7 @@ class AiImagePanel(QWidget):
         self.clear_button.clicked.connect(self._clear_screen)
         self.send_button = QPushButton("生成")
         self.send_button.setObjectName("accentButton")
-        self.send_button.clicked.connect(self._send)
+        self.send_button.clicked.connect(self._send_from_button)
 
         action_row = QHBoxLayout()
         action_row.setContentsMargins(0, 0, 0, 0)
@@ -320,6 +360,7 @@ class AiImagePanel(QWidget):
         left.addLayout(controls2)
         left.addWidget(self.preview, 1)
         left.addWidget(self.output_list)
+        left.addWidget(self.activity_label)
         left.addWidget(self.transcript)
         left.addWidget(self.input)
         left.addLayout(action_row)
@@ -378,7 +419,28 @@ class AiImagePanel(QWidget):
         base_url = self.settings.ai_image_base_url.strip() if self.settings.ai_image_provider == "compatible" else "api.openai.com"
         if self.settings.ai_image_provider == "compatible" and base_url and "/v1" not in base_url.rstrip("/"):
             base_url = f"{base_url.rstrip('/')}/v1"
-        self.header_label.setText(f"服务: {provider}    地址: {base_url}")
+        binding = f"    绑定: {self._bound_canvas_name}" if self._bound_canvas_name else ""
+        self.header_label.setText(f"服务: {provider}    地址: {base_url}{binding}")
+
+    def bind_canvas(self, canvas_name: str, output_node_id: str = "", canvas_key: str = "") -> None:
+        self._store_current_references()
+        self._bound_canvas_name = canvas_name.strip()
+        self._bound_canvas_key = canvas_key.strip()
+        self._bound_output_node_id = output_node_id.strip()
+        self._load_bound_references()
+        self._refresh_header()
+        self.load_project_cache()
+
+    def generate_with_prompt(
+        self,
+        prompt: str,
+        reference_paths: list[str | Path] | None = None,
+        output_node_id: str = "",
+    ) -> None:
+        if output_node_id.strip():
+            self._bound_output_node_id = output_node_id.strip()
+        self.input.setPlainText(prompt.strip())
+        self._send(prompt_override=prompt, reference_paths=reference_paths, output_node_id=output_node_id)
 
     def _save_inline_settings(self, *_args) -> None:
         self.settings.ai_image_model = self.model_combo.currentText().strip() or AI_IMAGE_MODEL_PRESETS[0]
@@ -388,34 +450,51 @@ class AiImagePanel(QWidget):
         self.settings.ai_image_count = self.count_spin.value()
         save_settings(self.settings)
 
-    def _send(self) -> None:
+    def _send_from_button(self, _checked: bool = False) -> None:
+        self._send()
+
+    def _send(
+        self,
+        prompt_override: str = "",
+        reference_paths: list[str | Path] | None = None,
+        output_node_id: str = "",
+    ) -> None:
         if self._thread is not None:
             return
-        prompt = self.input.toPlainText().strip()
-        if not prompt and not self.references:
-            return
-        if not prompt:
-            prompt = "基于参考图生成一张新的游戏美术资产。"
+        prompt_override = str(prompt_override or "")
+        user_prompt = prompt_override.strip() or self.input.toPlainText().strip()
         try:
-            _context, _cwd, project_path = self.context_provider()
+            context, _cwd, project_path = self.context_provider()
         except ValueError as exc:
             QMessageBox.information(self, "没有可用工程", str(exc))
             return
+        prompt = self._build_prompt(user_prompt, context, auto_prompt=bool(prompt_override.strip()))
+        effective_references = self._collect_effective_references(reference_paths, user_prompt)
+        if not prompt and not effective_references:
+            return
+        if not prompt:
+            prompt = "基于参考图生成一张新的游戏美术资产。"
+        display_prompt = user_prompt or "基于参考图生成一张新的游戏美术资产。"
         self._save_inline_settings()
         try:
-            request = build_ai_image_request(self.settings, prompt, [reference.path for reference in self.references])
+            request = build_ai_image_request(self.settings, prompt, effective_references)
         except AiImageError as exc:
             QMessageBox.information(self, "需要设置", str(exc))
             self._open_settings()
             return
-        self._append_user(prompt)
-        if self.references:
-            self._append_system(f"已带入 {len(self.references)} 张参考图。")
+        self._active_prompt = display_prompt
+        if output_node_id.strip():
+            self._bound_output_node_id = output_node_id.strip()
+        self._active_output_node_id = self._bound_output_node_id
+        self._append_user(display_prompt)
+        if effective_references:
+            self._append_system(f"已带入 {len(effective_references)} 张参考图。")
         self.input.clear()
         self.send_button.setEnabled(False)
-        self.send_button.setText("生成中")
+        self.send_button.setText("等待")
+        self._start_activity()
         self._append_system(f"正在调用 {request.model} 生成图片...")
-        thread = ImageGenerationThread(request, project_path, self)
+        thread = ImageGenerationThread(request, project_path, self._cache_key(), self)
         thread.succeeded.connect(self._generation_succeeded)
         thread.failed.connect(self._generation_failed)
         thread.finished.connect(self._thread_finished)
@@ -436,6 +515,8 @@ class AiImagePanel(QWidget):
         if last.revised_prompt:
             self._append_system(f"优化后的提示词：{last.revised_prompt}")
         self._select_generated_image(last.path)
+        final_prompt = last.revised_prompt.strip() or self._active_prompt
+        self.generationSucceeded.emit(last, final_prompt, self._active_output_node_id)
 
     def _generation_failed(self, message: str) -> None:
         self._append_system(message or "生图失败。")
@@ -445,21 +526,43 @@ class AiImagePanel(QWidget):
         self._thread = None
         self.send_button.setEnabled(True)
         self.send_button.setText("生成")
+        self._stop_activity()
+
+    def _start_activity(self) -> None:
+        self._activity_step = 0
+        self.activity_label.show()
+        self._tick_activity()
+        if not self.activity_timer.isActive():
+            self.activity_timer.start()
+
+    def _tick_activity(self) -> None:
+        phase = self._activity_phases[(self._activity_step // 4) % len(self._activity_phases)]
+        dots = "." * (self._activity_step % 4)
+        self.activity_label.setText(f"{phase}{dots}")
+        self._activity_step += 1
+
+    def _stop_activity(self) -> None:
+        self.activity_timer.stop()
+        self.activity_label.hide()
+        self.activity_label.setText("Ready")
 
     def load_project_cache(self) -> None:
         try:
             _context, _cwd, project_path = self.context_provider()
         except ValueError:
             return
-        if self._cache_project_path == project_path:
+        cache_key = self._cache_key()
+        if self._cache_project_path == project_path and self._cache_binding_key == cache_key:
             return
         self._cache_project_path = project_path
+        self._cache_binding_key = cache_key
+        self._pixmap_cache.clear()
         self.output_list.clear()
         self._current_image_path = None
         self._render_current_preview()
         self.save_button.setEnabled(False)
         self.open_folder_button.setEnabled(False)
-        self.cached_images = load_cached_ai_images(project_path)
+        self.cached_images = load_cached_ai_images(project_path, cache_key=cache_key)
         for image in self.cached_images:
             self._add_output_item(image, select=False)
         if self.cached_images:
@@ -470,9 +573,9 @@ class AiImagePanel(QWidget):
         item = QListWidgetItem(image.path.name)
         item.setData(Qt.UserRole, str(image.path))
         item.setToolTip(str(image.path))
-        pixmap = QPixmap(str(image.path))
-        if not pixmap.isNull():
-            item.setIcon(pixmap.scaled(74, 74, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        pixmap = self._pixmap_cache.scaled(str(image.path), 74, 74)
+        if pixmap is not None and not pixmap.isNull():
+            item.setIcon(QIcon(pixmap))
         self.output_list.addItem(item)
         if select:
             self.output_list.setCurrentItem(item)
@@ -496,14 +599,14 @@ class AiImagePanel(QWidget):
             self.preview.setPixmap(QPixmap())
             self.preview.setText("未生成图片")
             return
-        pixmap = QPixmap(str(self._current_image_path))
-        if pixmap.isNull():
+        target = self.preview.size()
+        pixmap = self._pixmap_cache.scaled(str(self._current_image_path), max(1, target.width()), max(1, target.height()))
+        if pixmap is None or pixmap.isNull():
             self.preview.setPixmap(QPixmap())
             self.preview.setText("无法预览图片")
             return
-        target = self.preview.size()
         self.preview.setText("")
-        self.preview.setPixmap(pixmap.scaled(target, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        self.preview.setPixmap(pixmap)
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
@@ -533,6 +636,7 @@ class AiImagePanel(QWidget):
             self.references.append(reference)
             self._add_reference_item(reference)
         if paths:
+            self._store_current_references()
             self._append_system(f"参考图数量：{len(self.references)}")
 
     def _paste_clipboard_reference(self) -> None:
@@ -555,15 +659,16 @@ class AiImagePanel(QWidget):
             return
         self.references.append(reference)
         self._add_reference_item(reference)
+        self._store_current_references()
         self._append_system(f"已添加参考图：{reference.path.name}")
 
     def _add_reference_item(self, reference: AiImageReference) -> None:
         item = QListWidgetItem(reference.path.name)
         item.setData(Qt.UserRole, str(reference.path))
         item.setToolTip(str(reference.path))
-        pixmap = QPixmap(str(reference.path))
-        if not pixmap.isNull():
-            item.setIcon(pixmap.scaled(76, 76, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        pixmap = self._pixmap_cache.scaled(str(reference.path), 76, 76)
+        if pixmap is not None and not pixmap.isNull():
+            item.setIcon(QIcon(pixmap))
         self.reference_list.addItem(item)
 
     def _remove_selected_references(self) -> None:
@@ -573,12 +678,105 @@ class AiImagePanel(QWidget):
             path = Path(str(item.data(Qt.UserRole) or ""))
             self.references = [reference for reference in self.references if reference.path != path]
         if rows:
+            self._store_current_references()
             self._append_system(f"参考图数量：{len(self.references)}")
 
     def _clear_references(self) -> None:
         self.references = []
         self.reference_list.clear()
+        self._store_current_references()
         self._append_system("已清空参考图。")
+
+    def _show_output_cache_menu(self, position) -> None:
+        item = self.output_list.itemAt(position)
+        if item is not None and not item.isSelected():
+            self.output_list.setCurrentItem(item)
+            item.setSelected(True)
+        menu = QMenu(self)
+        delete_action = menu.addAction("删除缓存图")
+        if item is None:
+            delete_action.setEnabled(False)
+        action = menu.exec(self.output_list.mapToGlobal(position))
+        if action == delete_action and item is not None:
+            self._delete_cached_output_items(self.output_list.selectedItems() or [item])
+
+    def _delete_cached_output_items(self, items: list[QListWidgetItem]) -> None:
+        paths = []
+        for item in items:
+            path = Path(str(item.data(Qt.UserRole) or ""))
+            if path:
+                paths.append(path)
+        self._delete_cached_output_paths(paths)
+
+    def _delete_cached_output_paths(self, paths: list[Path]) -> None:
+        unique_paths = _unique_paths([path for path in paths if str(path).strip()])
+        if not unique_paths:
+            return
+        deleted_current = self._current_image_path in unique_paths
+        failed: list[str] = []
+        deleted_paths: list[Path] = []
+        for path in unique_paths:
+            if path.exists():
+                try:
+                    path.unlink()
+                except OSError as exc:
+                    failed.append(f"{path.name}: {exc}")
+                    continue
+            deleted_paths.append(path)
+
+        self.output_list.blockSignals(True)
+        try:
+            for path in deleted_paths:
+                path_str = str(path)
+                for row in range(self.output_list.count() - 1, -1, -1):
+                    item = self.output_list.item(row)
+                    if str(item.data(Qt.UserRole) or "") == path_str:
+                        self.output_list.takeItem(row)
+                self.cached_images = [image for image in self.cached_images if image.path != path]
+        finally:
+            self.output_list.blockSignals(False)
+
+        if deleted_current and self._current_image_path in deleted_paths:
+            if self.cached_images:
+                current = self.cached_images[-1].path
+                item = self._find_output_item(current)
+                if item is not None:
+                    self.output_list.setCurrentItem(item)
+                else:
+                    self._select_generated_image(current)
+            else:
+                self._current_image_path = None
+                self._render_current_preview()
+                self.save_button.setEnabled(False)
+                self.open_folder_button.setEnabled(False)
+        if deleted_paths:
+            self._append_system(f"已删除 {len(deleted_paths)} 张缓存图。")
+        if failed:
+            QMessageBox.warning(self, "删除缓存图失败", "\n".join(failed))
+
+    def _find_output_item(self, path: Path) -> QListWidgetItem | None:
+        path_str = str(path)
+        for row in range(self.output_list.count()):
+            item = self.output_list.item(row)
+            if str(item.data(Qt.UserRole) or "") == path_str:
+                return item
+        return None
+
+    def _cache_key(self) -> str:
+        return self._bound_canvas_key or self._bound_canvas_name or ""
+
+    def _reference_binding_key(self) -> str:
+        return self._bound_canvas_key or self._bound_canvas_name or "__global__"
+
+    def _store_current_references(self) -> None:
+        key = self._reference_binding_key()
+        self._references_by_canvas[key] = list(self.references)
+
+    def _load_bound_references(self) -> None:
+        self.references = list(self._references_by_canvas.get(self._reference_binding_key(), []))
+        self.reference_list.clear()
+        for reference in self.references:
+            self._add_reference_item(reference)
 
     def _save_current_image_as(self) -> None:
         if self._current_image_path is None:
@@ -637,4 +835,63 @@ class AiImagePanel(QWidget):
             .replace("<", "&lt;")
             .replace(">", "&gt;")
             .replace('"', "&quot;")
+        )
+
+    def _build_prompt(self, prompt: str, context: str, *, auto_prompt: bool) -> str:
+        prompt = prompt.strip()
+        context = context.strip()
+        sections: list[str] = []
+        if context:
+            if self._bound_canvas_key:
+                sections.append(f"当前生图画布上下文（最高权重）:\n{context}")
+                if auto_prompt:
+                    sections.append("自动生成模式：严格以当前生图画布为准，优先遵守该画布的节点、连线、输出节点和参考图。")
+            else:
+                sections.append(f"工程上下文:\n{context}")
+        if self._is_retouch_prompt(prompt):
+            sections.append(
+                "高权重参考说明：请优先保持缓存图的主体、构图、风格和已生成结果，只按本次要求继续修改。"
+            )
+        if prompt:
+            sections.append(prompt)
+        return "\n\n".join(sections).strip()
+
+    def _collect_effective_references(
+        self,
+        reference_paths: list[str | Path] | None,
+        prompt: str,
+    ) -> list[Path]:
+        request_references = [Path(path) for path in (reference_paths or [])]
+        canvas_references = [reference.path for reference in self.references]
+        cached_references = self._cached_reference_paths()
+        if cached_references and self._is_retouch_prompt(prompt):
+            ordered = cached_references + request_references + canvas_references
+        else:
+            ordered = request_references + canvas_references + cached_references
+        return _unique_paths(ordered)
+
+    def _cached_reference_paths(self) -> list[Path]:
+        return [image.path for image in self.cached_images if image.path.exists()]
+
+    def _is_retouch_prompt(self, prompt: str) -> bool:
+        text = prompt.strip()
+        if not text:
+            return False
+        return any(
+            phrase in text
+            for phrase in (
+                "继续修改",
+                "继续改",
+                "继续调整",
+                "继续优化",
+                "继续修",
+                "继续重绘",
+                "在上一张图基础上",
+                "基于上一张图",
+                "基于上一版",
+                "上一张图",
+                "上一版",
+                "修图",
+                "微调",
+            )
         )

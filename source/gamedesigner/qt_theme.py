@@ -357,6 +357,11 @@ def stylesheet(name: str) -> str:
         font-family: Consolas, "Cascadia Mono", monospace;
         font-size: 8pt;
     }}
+    QLabel#aiImageActivityLabel {{
+        color: {colors["text_muted"]};
+        font-size: 9pt;
+        padding: 2px 4px 0 4px;
+    }}
     QToolButton#aiAssistantCollapseButton {{
         background: transparent;
         color: {colors["text_muted"]};

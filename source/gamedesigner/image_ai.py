@@ -16,6 +16,7 @@ from typing import Any
 
 from PySide6.QtGui import QImage
 
+from .ai_presets import normalize_ai_credentials
 from .storage import AppSettings, project_bundle_dir
 
 
@@ -93,12 +94,16 @@ def build_ai_image_request(
     reference_paths: list[str | Path] | None = None,
 ) -> AiImageRequest:
     provider = normalized_ai_image_provider(getattr(settings, "ai_image_provider", "openai"))
-    base_url = str(getattr(settings, "ai_image_base_url", "") or "").strip()
+    configured_key, configured_base_url = normalize_ai_credentials(
+        str(getattr(settings, "ai_image_api_key", "") or ""),
+        str(getattr(settings, "ai_image_base_url", "") or ""),
+    )
+    base_url = configured_base_url
     if provider == "openai" or not base_url:
         base_url = "https://api.openai.com/v1"
     else:
         base_url = _normalized_compatible_base_url(base_url)
-    api_key = str(getattr(settings, "ai_image_api_key", "") or "").strip() or os.getenv("OPENAI_API_KEY", "").strip()
+    api_key = configured_key or os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise AiImageError("请先在生图设置里填写 OpenAI 或兼容服务的 API Key。")
     model = str(getattr(settings, "ai_image_model", "") or "").strip() or AI_IMAGE_MODEL_PRESETS[0]
@@ -173,8 +178,12 @@ def save_ai_image_reference_from_qimage(project_path: str | Path, image: QImage)
     return AiImageReference(path=path, width=image.width(), height=image.height())
 
 
-def ai_image_cache_dir(project_path: str | Path) -> Path:
-    return project_bundle_dir(project_path) / AI_IMAGE_DIR / AI_IMAGE_CACHE_DIR
+def ai_image_cache_dir(project_path: str | Path, cache_key: str = "") -> Path:
+    folder = project_bundle_dir(project_path) / AI_IMAGE_DIR / AI_IMAGE_CACHE_DIR
+    normalized_key = _safe_cache_key(cache_key)
+    if normalized_key:
+        return folder / normalized_key
+    return folder
 
 
 def cache_generated_ai_image(
@@ -182,8 +191,9 @@ def cache_generated_ai_image(
     image: AiGeneratedImage,
     *,
     index: int = 1,
+    cache_key: str = "",
 ) -> CachedAiImage:
-    folder = ai_image_cache_dir(project_path)
+    folder = ai_image_cache_dir(project_path, cache_key)
     folder.mkdir(parents=True, exist_ok=True)
     extension = _safe_output_extension(image.output_format)
     path = folder / f"cache_{_timestamp()}_{index}_{uuid.uuid4().hex[:8]}.{extension}"
@@ -191,8 +201,13 @@ def cache_generated_ai_image(
     return cached_ai_image_from_path(path, revised_prompt=image.revised_prompt)
 
 
-def load_cached_ai_images(project_path: str | Path, *, limit: int = 80) -> list[CachedAiImage]:
-    folder = ai_image_cache_dir(project_path)
+def load_cached_ai_images(
+    project_path: str | Path,
+    *,
+    limit: int = 80,
+    cache_key: str = "",
+) -> list[CachedAiImage]:
+    folder = ai_image_cache_dir(project_path, cache_key)
     if not folder.exists():
         return []
     paths = [
@@ -258,6 +273,8 @@ def _add_optional_image_params(payload: dict[str, Any], request: AiImageRequest)
         payload["quality"] = request.quality
     if _is_gpt_image_model(request.model):
         payload["output_format"] = request.output_format
+        if request.reference_paths and request.model in {"gpt-image-1.5", "gpt-image-1", "gpt-image-1-mini"}:
+            payload["input_fidelity"] = "high"
         if request.provider == "compatible":
             payload["response_format"] = "b64_json"
         if request.background != "auto":
@@ -447,14 +464,17 @@ def _encode_multipart(fields: list[tuple[str, str]], files: list[tuple[str, Path
         chunks.append(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"))
         chunks.append(str(value).encode("utf-8"))
         chunks.append(b"\r\n")
-    for name, path in files:
+    for index, (name, path) in enumerate(files, start=1):
         if not path.exists():
             raise AiImageError(f"参考图不存在：{path}")
         mime = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+        filename = _multipart_safe_filename(path, index)
+        encoded_name = urllib.parse.quote(path.name, safe="")
         chunks.append(f"--{boundary}\r\n".encode("utf-8"))
         chunks.append(
             (
-                f'Content-Disposition: form-data; name="{name}"; filename="{path.name}"\r\n'
+                f'Content-Disposition: form-data; name="{name}"; filename="{filename}"; '
+                f"filename*=UTF-8''{encoded_name}\r\n"
                 f"Content-Type: {mime}\r\n\r\n"
             ).encode("utf-8")
         )
@@ -462,6 +482,13 @@ def _encode_multipart(fields: list[tuple[str, str]], files: list[tuple[str, Path
         chunks.append(b"\r\n")
     chunks.append(f"--{boundary}--\r\n".encode("utf-8"))
     return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
+
+
+def _multipart_safe_filename(path: Path, index: int) -> str:
+    suffix = path.suffix.lower()
+    if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
+        suffix = mimetypes.guess_extension(mimetypes.guess_type(str(path))[0] or "") or ".png"
+    return f"reference_{max(1, index)}{suffix}"
 
 
 def _coerce_choice(value: str, choices: list[str]) -> str:
@@ -486,6 +513,14 @@ def _safe_output_extension(value: str) -> str:
     if value == "jpeg":
         return "jpg"
     return value if value in {"png", "webp", "jpg"} else "png"
+
+
+def _safe_cache_key(cache_key: str) -> str:
+    value = str(cache_key or "").strip()
+    if not value:
+        return ""
+    safe = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in value)
+    return safe[:80]
 
 
 def _extension_from_url(url: str) -> str:

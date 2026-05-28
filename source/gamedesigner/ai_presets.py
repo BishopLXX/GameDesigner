@@ -92,13 +92,14 @@ def ai_connection_snapshot(
     api_key: str,
     base_url: str,
 ) -> dict[str, str]:
+    api_key, base_url = normalize_ai_credentials(api_key, base_url)
     return {
         "ai_provider": provider.strip() or "codex",
         "ai_model": model.strip(),
         "ai_reasoning_effort": reasoning_effort.strip() or "xhigh",
         "ai_auth_mode": auth_mode.strip() or "official",
-        "ai_api_key": api_key.strip(),
-        "ai_base_url": base_url.strip(),
+        "ai_api_key": api_key,
+        "ai_base_url": base_url,
     }
 
 
@@ -130,13 +131,17 @@ def clean_ai_connection_snapshot(raw: Any) -> dict[str, str]:
     auth_mode = str(raw.get("ai_auth_mode", "official") or "official")
     if auth_mode not in {"official", "api_key"}:
         auth_mode = "official"
+    api_key, base_url = normalize_ai_credentials(
+        str(raw.get("ai_api_key", "") or ""),
+        str(raw.get("ai_base_url", "") or ""),
+    )
     return ai_connection_snapshot(
         provider=provider,
         model=str(raw.get("ai_model", "") or ""),
         reasoning_effort=reasoning_effort,
         auth_mode=auth_mode,
-        api_key=str(raw.get("ai_api_key", "") or ""),
-        base_url=str(raw.get("ai_base_url", "") or ""),
+        api_key=api_key,
+        base_url=base_url,
     )
 
 
@@ -155,3 +160,20 @@ def clean_ai_saved_connections(raw: Any) -> dict[str, dict[str, str]]:
 
 def _normalize_base_url(value: str) -> str:
     return value.strip().rstrip("/")
+
+
+def normalize_ai_credentials(api_key: str, base_url: str) -> tuple[str, str]:
+    key = api_key.strip()
+    url = base_url.strip()
+    if not key:
+        return "", url
+    if not _looks_like_url(key):
+        return key, url
+    if not url:
+        return "", key
+    return "", url
+
+
+def _looks_like_url(value: str) -> bool:
+    lowered = value.strip().lower()
+    return lowered.startswith("http://") or lowered.startswith("https://")

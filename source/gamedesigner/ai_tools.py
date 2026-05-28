@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
-import subprocess
-import sys
+import shutil
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -11,6 +11,7 @@ from typing import Any
 from PySide6.QtCore import QProcessEnvironment
 
 from .ai_canvas_tools import AI_CANVAS_TOOL_NAMES, ai_canvas_tool_protocol_text
+from .image_canvas import canvas_type_label, image_canvas_prompt_protocol
 from .ai_presets import AI_FREE_MODEL_PRESETS
 from .models import FIELD_TYPES, NODE_TYPES, BlueprintGroup, CanvasData, DesignNote, Edge, Node, ProjectData
 from .storage import AppSettings, project_bundle_dir
@@ -344,7 +345,7 @@ def build_ai_cli_invocation(settings: AppSettings, prompt: str, cwd: str | Path)
             "--color",
             "never",
             "-c",
-            f'model_reasoning_effort="{reasoning_effort}"',
+            f"model_reasoning_effort={reasoning_effort}",
             "-m",
             model,
             "-",
@@ -363,11 +364,27 @@ def process_environment(extra: dict[str, str]) -> QProcessEnvironment:
 
 
 def qprocess_command(invocation: AiCliInvocation, platform: str | None = None) -> tuple[str, list[str]]:
-    platform = platform or sys.platform
-    if platform.startswith("win"):
-        command = subprocess.list2cmdline([invocation.program, *invocation.arguments])
-        return "cmd.exe", ["/d", "/s", "/c", command]
+    platform = platform or os.name
+    if _is_windows_platform(platform):
+        resolved = _resolve_windows_cli_program(invocation.program)
+        if resolved:
+            return resolved, invocation.arguments
     return invocation.program, invocation.arguments
+
+
+def _is_windows_platform(platform: str) -> bool:
+    return platform.startswith("win") or platform == "nt"
+
+
+def _resolve_windows_cli_program(program: str) -> str:
+    path = Path(program)
+    if path.suffix:
+        return program
+    for extension in (".cmd", ".bat", ".exe", ".com"):
+        resolved = shutil.which(f"{program}{extension}")
+        if resolved:
+            return resolved
+    return program
 
 
 def invocation_with_last_message_output(invocation: AiCliInvocation, output_file: str | Path) -> AiCliInvocation:
@@ -598,10 +615,14 @@ def build_project_chat_context(
         f"源目录: {project.source_dir or '未设置'}",
         f"输出目录: {project.output_dir or '未设置'}",
         f"当前画布: {canvas.name} ({canvas.id})",
-        f"画布类型: {'排序画布' if canvas.is_data_canvas() else '自由画布'}",
+        f"画布类型: {canvas_type_label(canvas)}",
     ]
     if canvas.is_data_canvas():
         lines.append(f"排序布局: {canvas.data_layout}, 行样式: {canvas.data_row_style}, 每列行数: {canvas.data_grid_rows}")
+    if canvas.is_image_canvas():
+        lines.append("")
+        lines.append("当前画布生图规则（高权重）:")
+        lines.append(image_canvas_prompt_protocol())
     lines.extend(
         [
             f"当前画布节点数: {len(canvas.nodes)}",
@@ -794,7 +815,7 @@ def _other_canvas_summaries(project: ProjectData, current_canvas: CanvasData) ->
     for canvas in project.canvases:
         if canvas.id == current_canvas.id:
             continue
-        kind = "排序画布" if canvas.is_data_canvas() else "自由画布"
+        kind = canvas_type_label(canvas)
         summary = (
             f"- {canvas.name} ({canvas.id}), {kind}, 节点 {len(canvas.nodes)} 个, "
             f"蓝图组 {len(canvas.groups)} 个, 连接 {len(canvas.valid_edges())} 条"

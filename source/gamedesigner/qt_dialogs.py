@@ -49,7 +49,7 @@ from PySide6.QtWidgets import (
 
 from .csv_io import CanvasCsvExportSpec, CSV_SORT_MODE_LABELS, DATA_CANVAS_SORT_LABEL
 from .data_canvas import apply_template_to_node
-from .image_rendering import IMAGE_FIT_MODES, draw_field_pixmap
+from .image_rendering import IMAGE_FIT_MODES, PixmapCache, draw_field_pixmap
 from .models import (
     DEFAULT_NODE_COLOR,
     FIELD_EXPORT_PROPS,
@@ -714,11 +714,21 @@ class EditorFieldItem(QGraphicsObject):
 
         is_image = self.field.data_type == "图片"
         if is_image and self.field.image_path:
-            pixmap = QPixmap(self.field.image_path)
+            canvas = self._field_canvas()
+            pixmap = canvas.source_image_pixmap(self.field.image_path) if canvas is not None else QPixmap(self.field.image_path)
             if not pixmap.isNull():
+                scaled_pixmap = None
+                fit = self.field.image_fit if self.field.image_fit in {"stretch", "contain", "cover"} else ""
+                if canvas is not None and fit:
+                    scaled_pixmap = canvas.scaled_image_pixmap(
+                        self.field.image_path,
+                        max(1, int(rect.width())),
+                        max(1, int(rect.height())),
+                        fit,
+                    )
                 painter.save()
                 painter.setClipPath(path)
-                draw_field_pixmap(painter, pixmap, rect, self.field)
+                draw_field_pixmap(painter, pixmap, rect, self.field, scaled_pixmap=scaled_pixmap)
                 painter.restore()
             else:
                 painter.setPen(QColor(colors["accent_dark"]))
@@ -875,6 +885,7 @@ class FieldCanvas(QGraphicsView):
         self._inline_proxy: QGraphicsProxyWidget | None = None
         self._inline_editor: InlineFieldEditor | None = None
         self._inline_index: int | None = None
+        self._pixmap_cache = PixmapCache()
         self.snap_guides: list[FieldSnapGuide] = []
         self.scene_obj = QGraphicsScene(self)
         self.setScene(self.scene_obj)
@@ -901,6 +912,7 @@ class FieldCanvas(QGraphicsView):
 
     def set_project_path(self, project_path: str | Path | None) -> None:
         self.project_path = Path(project_path) if project_path else None
+        self._pixmap_cache.clear()
         self.refresh(self.selected_index)
 
     def drawBackground(self, painter: QPainter, rect: QRectF) -> None:  # type: ignore[override]
@@ -948,6 +960,12 @@ class FieldCanvas(QGraphicsView):
             item.setSelected(index == self.selected_index)
             self.scene_obj.addItem(item)
         self.scene_obj.setSceneRect(QRectF(-80, -80, width + 160, height + 160))
+
+    def source_image_pixmap(self, path: str) -> QPixmap:
+        return self._pixmap_cache.source(path) or QPixmap()
+
+    def scaled_image_pixmap(self, path: str, width: int, height: int, mode: str) -> QPixmap | None:
+        return self._pixmap_cache.scaled(path, width, height, mode)
 
     def _on_frame_resized(self, width: float, height: float) -> None:
         self.node_width = max(VISUAL_NODE_MIN_WIDTH, float(width))

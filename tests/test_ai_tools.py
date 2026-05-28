@@ -13,6 +13,8 @@ from gamedesigner.image_ai import (
     build_ai_image_request,
     cache_generated_ai_image,
     load_cached_ai_images,
+    _encode_multipart,
+    _multipart_body,
 )
 from gamedesigner.ai_tools import (
     AI_ACTION_BLOCK_END,
@@ -43,7 +45,7 @@ from gamedesigner.ai_presets import (
     clean_ai_saved_connections,
 )
 from gamedesigner.models import BlueprintGroup, CanvasData, DesignNote, Edge, Node, NodeField, ProjectData
-from gamedesigner.storage import AppSettings
+from gamedesigner.storage import AppSettings, load_settings, save_settings, settings_backup_path, settings_path
 
 
 PNG_1X1 = base64.b64decode(
@@ -53,6 +55,15 @@ PNG_1X1 = base64.b64decode(
 
 
 class AiToolsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._appdata_temp = tempfile.TemporaryDirectory()
+        self._appdata_patch = mock.patch.dict(os.environ, {"APPDATA": self._appdata_temp.name})
+        self._appdata_patch.start()
+
+    def tearDown(self) -> None:
+        self._appdata_patch.stop()
+        self._appdata_temp.cleanup()
+
     def test_ai_image_request_uses_official_base_url_and_model_settings(self) -> None:
         settings = AppSettings(
             ai_image_provider="openai",
@@ -134,6 +145,68 @@ class AiToolsTests(unittest.TestCase):
         self.assertEqual(loaded.ai_image_count, 3)
         self.assertEqual(loaded.ai_image_output_format, "jpeg")
 
+    def test_app_settings_normalizes_url_leaked_into_api_key_fields(self) -> None:
+        settings = AppSettings.from_dict(
+            {
+                "ai_auth_mode": "api_key",
+                "ai_api_key": "https://www.packyapi.com/v1",
+                "ai_base_url": "https://www.packyapi.com/v1",
+                "ai_image_api_key": "https://www.packyapi.com",
+                "ai_image_base_url": "https://www.packyapi.com",
+            }
+        )
+
+        self.assertEqual(settings.ai_api_key, "")
+        self.assertEqual(settings.ai_base_url, "https://www.packyapi.com/v1")
+        self.assertEqual(settings.ai_image_api_key, "")
+        self.assertEqual(settings.ai_image_base_url, "https://www.packyapi.com")
+
+    def test_settings_loads_backup_when_primary_file_is_invalid(self) -> None:
+        previous = AppSettings(
+            ai_model="gpt-5.5",
+            ai_auth_mode="api_key",
+            ai_api_key="saved-key",
+            ai_base_url="https://api.example.test/v1",
+            ai_image_model="gpt-image-2",
+            ai_image_api_key="image-key",
+        )
+        current = AppSettings(ai_model="gpt-5.4", ai_image_model="gpt-image-1.5")
+
+        save_settings(previous)
+        save_settings(current)
+        settings_path().write_text("{broken", encoding="utf-8")
+
+        loaded = load_settings()
+
+        self.assertTrue(settings_backup_path().exists())
+        self.assertEqual(loaded.ai_model, "gpt-5.5")
+        self.assertEqual(loaded.ai_api_key, "saved-key")
+        self.assertEqual(loaded.ai_base_url, "https://api.example.test/v1")
+        self.assertEqual(loaded.ai_image_model, "gpt-image-2")
+        self.assertEqual(loaded.ai_image_api_key, "image-key")
+
+    def test_save_settings_keeps_existing_recent_projects_when_new_snapshot_is_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            with mock.patch.dict(os.environ, {"APPDATA": folder}):
+                previous = AppSettings(
+                    workspace_dir="D:/unityObj/SlimeBarman设计案",
+                    export_dir="D:/unityObj/SlimeBarman设计案/exports",
+                    last_project="D:/unityObj/SlimeBarman设计案/酒保设计案.gdc",
+                    recent_projects=["D:/unityObj/SlimeBarman设计案/酒保设计案.gdc"],
+                )
+                save_settings(previous)
+
+                current = AppSettings(workspace_dir="D:/unityObj/SlimeBarman设计案")
+                save_settings(current)
+
+                loaded = load_settings()
+
+                self.assertEqual(loaded.last_project, "D:/unityObj/SlimeBarman设计案/酒保设计案.gdc")
+                self.assertEqual(
+                    loaded.recent_projects,
+                    ["D:/unityObj/SlimeBarman设计案/酒保设计案.gdc"],
+                )
+
     def test_ai_image_results_are_written_to_project_cache(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             project_path = Path(folder) / "CacheProject.gdc"
@@ -145,6 +218,46 @@ class AiToolsTests(unittest.TestCase):
             self.assertEqual(cached.path.parent, ai_image_cache_dir(project_path))
             self.assertEqual(len(loaded), 1)
             self.assertEqual(loaded[0].path, cached.path)
+
+    def test_ai_image_request_with_reference_omits_input_fidelity_for_gpt_image_2(self) -> None:
+        settings = AppSettings(
+            ai_image_provider="compatible",
+            ai_image_model="gpt-image-2",
+            ai_image_api_key="secret",
+            ai_image_base_url="https://images.example.test/v1",
+            ai_image_quality="high",
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            reference = Path(folder) / "ref.png"
+            reference.write_bytes(PNG_1X1)
+
+            request = build_ai_image_request(settings, "请基于酒吧场景生成更清晰的地面", [reference])
+            body, _content_type = _multipart_body(request)
+
+        text = body.decode("utf-8", errors="ignore")
+
+        self.assertIn("quality", text)
+        self.assertIn("high", text)
+        self.assertIn("output_format", text)
+        self.assertNotIn("input_fidelity", text)
+
+    def test_ai_image_multipart_handles_chinese_prompt_and_filename(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            reference = Path(folder) / "\u9152\u5427\u5730\u9762.png"
+            reference.write_bytes(PNG_1X1)
+
+            body, content_type = _encode_multipart(
+                [("prompt", "\u8bf7\u751f\u6210\u66f4\u6e05\u6670\u7684\u9152\u5427\u5730\u9762")],
+                [("image", reference)],
+            )
+
+        text = body.decode("utf-8", errors="ignore")
+
+        self.assertIn("multipart/form-data; boundary=", content_type)
+        self.assertIn("请生成更清晰的酒吧地面", text)
+        self.assertIn('filename="reference_1.png"', text)
+        self.assertIn("filename*=UTF-8''%E9%85%92%E5%90%A7%E5%9C%B0%E9%9D%A2.png", text)
+        self.assertNotIn('filename="酒吧地面.png"', text)
 
     def test_codex_invocation_uses_model_cwd_and_stdin_prompt(self) -> None:
         settings = AppSettings(ai_provider="codex", ai_model="gpt-5.5")
@@ -164,7 +277,7 @@ class AiToolsTests(unittest.TestCase):
 
         self.assertIn("-c", invocation.arguments)
         config_index = invocation.arguments.index("-c")
-        self.assertEqual(invocation.arguments[config_index + 1], 'model_reasoning_effort="medium"')
+        self.assertEqual(invocation.arguments[config_index + 1], "model_reasoning_effort=medium")
 
     def test_claude_invocation_can_pass_api_key_environment(self) -> None:
         settings = AppSettings(
@@ -233,16 +346,31 @@ class AiToolsTests(unittest.TestCase):
 
         self.assertEqual(key, AI_CUSTOM_API_PROFILE_KEY)
 
-    def test_qprocess_command_wraps_windows_cli_with_cmd(self) -> None:
-        settings = AppSettings(ai_provider="codex", ai_model="gpt-5.5")
-        invocation = build_ai_cli_invocation(settings, "hello", Path("D:/GameDesigner"))
+    def test_qprocess_command_uses_windows_cmd_shim_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            shim = Path(folder) / "codex.cmd"
+            shim.write_text("@echo off\r\nexit /b 0\r\n", encoding="ascii")
+            with mock.patch.dict(os.environ, {"PATH": folder}):
+                settings = AppSettings(ai_provider="codex", ai_model="gpt-5.5")
+                invocation = build_ai_cli_invocation(settings, "hello", Path("D:/GameDesigner"))
 
-        program, arguments = qprocess_command(invocation, "win32")
+                program, arguments = qprocess_command(invocation, "win32")
 
-        self.assertEqual(program, "cmd.exe")
-        self.assertEqual(arguments[:3], ["/d", "/s", "/c"])
-        self.assertIn("codex", arguments[3])
-        self.assertIn("gpt-5.5", arguments[3])
+        self.assertEqual(program, str(shim))
+        self.assertEqual(arguments, invocation.arguments)
+
+    def test_qprocess_command_uses_windows_claude_shim_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            shim = Path(folder) / "claude.cmd"
+            shim.write_text("@echo off\r\nexit /b 0\r\n", encoding="ascii")
+            with mock.patch.dict(os.environ, {"PATH": folder}):
+                settings = AppSettings(ai_provider="claude", ai_model="opus")
+                invocation = build_ai_cli_invocation(settings, "hello", Path("D:/GameDesigner"))
+
+                program, arguments = qprocess_command(invocation, "win32")
+
+        self.assertEqual(program, str(shim))
+        self.assertEqual(arguments, invocation.arguments)
 
     def test_qprocess_command_keeps_native_program_outside_windows(self) -> None:
         settings = AppSettings(ai_provider="codex", ai_model="gpt-5.5")

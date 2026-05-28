@@ -388,8 +388,14 @@ class AiSettingsDialog(QDialog):
         self.settings.ai_model = snapshot["ai_model"] or "gpt-5.4"
         self.settings.ai_reasoning_effort = snapshot.get("ai_reasoning_effort") or "xhigh"
         self.settings.ai_auth_mode = snapshot["ai_auth_mode"]
-        self.settings.ai_api_key = snapshot["ai_api_key"]
-        self.settings.ai_base_url = snapshot["ai_base_url"]
+        if snapshot["ai_auth_mode"] == "official":
+            self.settings.ai_api_key = ""
+            self.settings.ai_base_url = ""
+            return
+        if snapshot["ai_api_key"] or not self.settings.ai_api_key:
+            self.settings.ai_api_key = snapshot["ai_api_key"]
+        if snapshot["ai_base_url"] or not self.settings.ai_base_url:
+            self.settings.ai_base_url = snapshot["ai_base_url"]
 
     def _apply_snapshot_to_controls(self, snapshot: dict[str, str]) -> None:
         provider_index = self.provider_combo.findData(snapshot.get("ai_provider", "codex"))
@@ -622,6 +628,7 @@ class AiChatPanel(QWidget):
         process.setProcessEnvironment(process_environment(invocation.environment))
         process.readyReadStandardOutput.connect(self._read_stdout)
         process.readyReadStandardError.connect(self._read_stderr)
+        process.errorOccurred.connect(self._process_error)
         process.finished.connect(self._process_finished)
         self._process = process
         self._pending_user_message = prompt_message
@@ -645,20 +652,37 @@ class AiChatPanel(QWidget):
                 f"模型: {self.settings.ai_model or '未设置'}",
                 f"智能等级: {getattr(self.settings, 'ai_reasoning_effort', 'xhigh') or 'xhigh'}",
                 f"图片附件: {len(attachments)}" if attachments else "",
+                f"程序: {program}",
             ],
             "运行状态",
         )
         process.start()
         if not process.waitForStarted(1500):
+            error_text = process.errorString().strip() or "未知错误"
             self._process = None
             self.send_button.setEnabled(True)
             self.cancel_button.setEnabled(False)
             self._stop_activity("启动失败")
-            QMessageBox.warning(self, "AI 启动失败", f"无法启动 {invocation.program}。请确认 CLI 已安装并可在 PATH 中使用。")
+            self._append_system(f"无法启动 {invocation.program}。\n程序：{program}\n错误：{error_text}")
+            QMessageBox.warning(
+                self,
+                "AI 启动失败",
+                f"无法启动 {invocation.program}。\n\n程序：{program}\n错误：{error_text}\n\n"
+                "请确认 CLI 已安装，并且可执行文件在 PATH 中。",
+            )
             self._cleanup_pending_output_file()
             return
         process.write(invocation.stdin.encode("utf-8"))
         process.closeWriteChannel()
+
+    def _process_error(self, _error: QProcess.ProcessError) -> None:
+        if self._process is None:
+            return
+        error_text = self._process.errorString().strip()
+        if not error_text:
+            return
+        self._pending_error_chunks.append(error_text)
+        self._append_activity_lines([error_text], "进程错误")
 
     def _attach_clipboard_image(self, image) -> None:
         if image.isNull():
