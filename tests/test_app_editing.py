@@ -1566,6 +1566,10 @@ class AppEditingTests(unittest.TestCase):
             [node.title for node in canvas.nodes],
             ["像素目标", "制作规格", "完美像素线条", "高品质动作游戏像素方向", "输出"],
         )
+        output = find_image_output_node(canvas)
+        self.assertIsNotNone(output)
+        image_field = next(field for field in output.fields if field.name == "生成图片")
+        self.assertEqual(image_field.image_fit, "contain")
         self.assertEqual(len(canvas.valid_edges()), 4)
         self.assertTrue(window.ai_assistant_expanded)
         window.deleteLater()

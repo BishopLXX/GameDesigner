@@ -675,6 +675,10 @@ class ProjectData:
                     node.canvas_id = ""
                 if node.node_type != "超文本":
                     node.link_path = ""
+                if canvas.is_image_canvas() and node.title.strip() in {"输出", "修图输出"}:
+                    for field in node.fields:
+                        if field.name == "生成图片" and field.data_type == "图片":
+                            field.image_fit = "contain"
             canvas.normalize_node_order()
         root = self.root_canvas()
         self.nodes = root.nodes
@@ -828,6 +832,7 @@ def default_image_canvas_nodes() -> tuple[Node, Node, Edge]:
     )
     output_prompt = _visual_field("生成提示词", "长文本", "输出节点会汇总画布上下文生成最终提示词。", 16, 16, 456, 120, 13)
     output_image = _visual_field("生成图片", "图片", "", 16, 150, 456, 256, 12)
+    output_image.image_fit = "contain"
     output = Node(
         title="输出",
         x=80,
@@ -968,6 +973,7 @@ def default_pixel_canvas_nodes() -> tuple[list[Node], list[Edge]]:
         13,
     )
     output_image = _visual_field("生成图片", "图片", "", 16, 150, 456, 256, 12)
+    output_image.image_fit = "contain"
     output = Node(
         title="输出",
         x=1120,

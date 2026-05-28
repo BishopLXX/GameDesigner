@@ -296,6 +296,75 @@ class AiToolsTests(unittest.TestCase):
 
             self.assertEqual((processed.width(), processed.height()), (8, 8))
 
+    def test_pixel_ai_image_cache_contains_tall_source_in_square_output(self) -> None:
+        source = Image.new("RGBA", (24, 36), (0, 0, 0, 0))
+        pixels = source.load()
+        for y in range(36):
+            for x in range(8, 16):
+                pixels[x, y] = ((y * 7 + x * 3) % 255, 80 + (y % 80), 160, 255)
+        buffer = BytesIO()
+        source.save(buffer, format="PNG")
+
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "PixelContainProject.gdc"
+
+            cached = cache_generated_ai_image(
+                project_path,
+                AiGeneratedImage(buffer.getvalue(), "png"),
+                index=1,
+                cache_key="canvas-a",
+                pixel_mode=True,
+                pixel_output_size="8x8",
+            )
+            processed = QImage(str(cached.path))
+            opaque_positions = [
+                (x, y)
+                for y in range(processed.height())
+                for x in range(processed.width())
+                if processed.pixelColor(x, y).alpha() == 255
+            ]
+            colors = {
+                processed.pixelColor(x, y).rgba()
+                for x, y in opaque_positions
+            }
+
+            self.assertEqual((processed.width(), processed.height()), (8, 8))
+            self.assertEqual(min(y for _x, y in opaque_positions), 0)
+            self.assertEqual(max(y for _x, y in opaque_positions), 7)
+            self.assertLess(min(x for x, _y in opaque_positions), 3)
+            self.assertGreaterEqual(max(x for x, _y in opaque_positions), 4)
+            self.assertLessEqual(len(colors), 16)
+
+    def test_pixel_ai_image_cache_uses_limited_palette_without_gradient_spill(self) -> None:
+        source = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        pixels = source.load()
+        for y in range(64):
+            for x in range(64):
+                pixels[x, y] = (x * 3 % 256, y * 4 % 256, (x + y) * 2 % 256, 255)
+        buffer = BytesIO()
+        source.save(buffer, format="PNG")
+
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "PixelPaletteProject.gdc"
+
+            cached = cache_generated_ai_image(
+                project_path,
+                AiGeneratedImage(buffer.getvalue(), "png"),
+                index=1,
+                cache_key="canvas-a",
+                pixel_mode=True,
+                pixel_output_size="16x16",
+            )
+            processed = QImage(str(cached.path))
+            colors = {
+                processed.pixelColor(x, y).rgba()
+                for y in range(processed.height())
+                for x in range(processed.width())
+                if processed.pixelColor(x, y).alpha() == 255
+            }
+
+            self.assertLessEqual(len(colors), 16)
+
     def test_ai_image_request_with_reference_omits_input_fidelity_for_gpt_image_2(self) -> None:
         settings = AppSettings(
             ai_image_provider="compatible",

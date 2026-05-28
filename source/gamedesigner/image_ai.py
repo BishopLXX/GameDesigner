@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 from io import BytesIO
 import json
+import math
 import mimetypes
 import os
 import shutil
@@ -16,12 +17,13 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtGui import QImage
-from PIL import Image, ImageChops, ImageOps, ImageStat
+from PIL import Image, ImageOps
 from PIL.PngImagePlugin import PngInfo
 
 from .ai_presets import normalize_ai_credentials
 from .pixel_art import (
     PIXEL_ART_ALPHA_THRESHOLD,
+    PIXEL_ART_MAX_COLORS,
     PIXEL_ART_SAMPLE_BLOCK,
     normalized_pixel_output_size,
     pixel_output_size_dimensions,
@@ -570,66 +572,23 @@ def _pixel_grid_sample(image: Image.Image, *, pixel_output_size: str = "auto") -
         return image.copy()
     target_width = min(target_width, image.width)
     target_height = min(target_height, image.height)
-    block = max(1, min(image.width // target_width, image.height // target_height))
-    if block <= 0:
-        return image.copy()
-    crop_width = min(image.width, target_width * block)
-    crop_height = min(image.height, target_height * block)
-    crop_x = _best_axis_crop_start(image, crop_width, block, axis="x")
-    crop_y = _best_axis_crop_start(image, crop_height, block, axis="y")
-    if crop_x + crop_width > image.width:
-        crop_x = max(0, image.width - crop_width)
-    if crop_y + crop_height > image.height:
-        crop_y = max(0, image.height - crop_height)
-    working = image.crop((crop_x, crop_y, crop_x + crop_width, crop_y + crop_height))
-    result = Image.new("RGBA", (target_width, target_height))
+    block = max(1, math.ceil(max(image.width / target_width, image.height / target_height)))
+    sampled_width = max(1, min(target_width, math.ceil(image.width / block)))
+    sampled_height = max(1, min(target_height, math.ceil(image.height / block)))
+    result = Image.new("RGBA", (target_width, target_height), (0, 0, 0, 0))
     pixels = result.load()
-    for y in range(target_height):
-        top = y * block
-        for x in range(target_width):
-            left = x * block
-            cell = working.crop((left, top, left + block, top + block))
-            pixels[x, y] = _dominant_cell_color(cell)
+    x_pad = max(0, (target_width - sampled_width) // 2)
+    y_pad = max(0, (target_height - sampled_height) // 2)
+    for y in range(sampled_height):
+        top = min(image.height - 1, y * block)
+        bottom = min(image.height, top + block)
+        for x in range(sampled_width):
+            left = min(image.width - 1, x * block)
+            right = min(image.width, left + block)
+            cell = image.crop((left, top, right, bottom))
+            pixels[x + x_pad, y + y_pad] = _dominant_cell_color(cell)
+    _apply_palette_quantization(result)
     return result
-
-
-def _best_axis_crop_start(image: Image.Image, span: int, block: int, *, axis: str) -> int:
-    dimension = image.width if axis == "x" else image.height
-    span = max(1, min(int(span), dimension))
-    if span >= dimension:
-        return 0
-    available = dimension - span
-    center = available // 2
-    lower = max(0, center - block + 1)
-    upper = min(available, center + block - 1)
-    best_start = center
-    best_score = float("-inf")
-    for start in range(lower, upper + 1):
-        if axis == "x":
-            strip = image.crop((start, 0, start + span, image.height))
-        else:
-            strip = image.crop((0, start, image.width, start + span))
-        score = _grid_boundary_score(strip, block, axis=axis)
-        if score > best_score or (score == best_score and abs(start - center) < abs(best_start - center)):
-            best_score = score
-            best_start = start
-    return best_start
-
-
-def _grid_boundary_score(image: Image.Image, block: int, *, axis: str) -> float:
-    grayscale = ImageOps.grayscale(image.convert("RGB"))
-    scores: list[float] = []
-    positions = range(block, image.width, block) if axis == "x" else range(block, image.height, block)
-    for position in positions:
-        if axis == "x":
-            left = grayscale.crop((position - 1, 0, position, image.height))
-            right = grayscale.crop((position, 0, position + 1, image.height))
-        else:
-            left = grayscale.crop((0, position - 1, image.width, position))
-            right = grayscale.crop((0, position, image.width, position + 1))
-        diff = ImageChops.difference(left, right)
-        scores.append(float(ImageStat.Stat(diff).mean[0]))
-    return sum(scores) / len(scores) if scores else float("-inf")
 
 
 def _dominant_cell_color(cell: Image.Image) -> tuple[int, int, int, int]:
@@ -643,6 +602,49 @@ def _dominant_cell_color(cell: Image.Image) -> tuple[int, int, int, int]:
         return 0, 0, 0, 0
     channels = list(zip(*opaque, strict=False))
     return tuple(int(sorted(channel)[len(channel) // 2]) for channel in channels)  # type: ignore[return-value]
+
+
+def _apply_palette_quantization(image: Image.Image) -> None:
+    if hasattr(image, "get_flattened_data"):
+        raw_pixels = list(image.get_flattened_data())
+    else:  # pragma: no cover - Pillow compatibility fallback.
+        raw_pixels = list(image.getdata())
+    opaque_pixels = [
+        tuple(pixel[:3])
+        for pixel in raw_pixels
+        if len(pixel) >= 4 and pixel[3] >= PIXEL_ART_ALPHA_THRESHOLD
+    ]
+    if len({pixel for pixel in opaque_pixels}) <= PIXEL_ART_MAX_COLORS:
+        return
+    quantized_rgb = _quantized_palette_image(opaque_pixels, PIXEL_ART_MAX_COLORS)
+    if not quantized_rgb:
+        return
+    replacements = iter(quantized_rgb)
+    quantized: list[tuple[int, int, int, int]] = []
+    for pixel in raw_pixels:
+        if len(pixel) < 4 or pixel[3] < PIXEL_ART_ALPHA_THRESHOLD:
+            quantized.append((0, 0, 0, 0))
+            continue
+        quantized.append((*next(replacements), 255))
+    image.putdata(quantized)
+
+
+def _quantized_palette_image(
+    colors: list[tuple[int, int, int]],
+    limit: int,
+) -> list[tuple[int, int, int]]:
+    if not colors:
+        return []
+    swatch = Image.new("RGB", (len(colors), 1))
+    swatch.putdata(colors)
+    quantized = swatch.quantize(
+        colors=max(1, int(limit)),
+        method=Image.Quantize.MEDIANCUT,
+        dither=Image.Dither.NONE,
+    )
+    if hasattr(quantized, "get_flattened_data"):
+        return [tuple(pixel[:3]) for pixel in quantized.convert("RGB").get_flattened_data()]
+    return [tuple(pixel[:3]) for pixel in quantized.convert("RGB").getdata()]
 
 
 def _image_to_png_bytes(image: Image.Image) -> bytes:
