@@ -46,6 +46,7 @@ from ..ai_tools import (
     load_project_chat_memory,
     process_environment,
     qprocess_command,
+    resolve_ai_cli_program,
     save_project_chat_history,
     split_ai_canvas_action_response,
 )
@@ -426,12 +427,26 @@ class AiSettingsDialog(QDialog):
         provider = str(self.provider_combo.currentData() or "codex")
         program = "codex" if provider == "codex" else "claude"
         args = ["login"] if provider == "codex" else ["auth"]
+        resolved_program = resolve_ai_cli_program(program)
+        if resolved_program == program and not Path(resolved_program).exists():
+            QMessageBox.warning(
+                self,
+                "无法打开登录",
+                f"找不到 {program} CLI。请先运行 release 里的 GameDesigner-Setup.exe 安装 AI 运行环境，"
+                "或确认 CLI 已安装并在 PATH 中。",
+            )
+            return
         if sys.platform.startswith("win"):
-            started = QProcess.startDetached("cmd.exe", ["/c", "start", "", program, *args])
+            started = QProcess.startDetached("cmd.exe", ["/d", "/c", "start", "", resolved_program, *args])
         else:
-            started = QProcess.startDetached(program, args)
+            started = QProcess.startDetached(resolved_program, args)
         if not started:
-            QMessageBox.warning(self, "无法打开登录", f"无法启动 {program} {' '.join(args)}。请确认 CLI 已安装并在 PATH 中。")
+            QMessageBox.warning(
+                self,
+                "无法打开登录",
+                f"无法启动 {program} CLI。请先运行 release 里的 GameDesigner-Setup.exe 安装 AI 运行环境，"
+                "或确认 CLI 已安装并在 PATH 中。",
+            )
 
     def done(self, result: int) -> None:  # type: ignore[override]
         save_window_layout(self, "ai_settings_dialog")

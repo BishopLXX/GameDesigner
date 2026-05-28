@@ -4,6 +4,7 @@ import sys
 
 from PySide6.QtWidgets import QApplication, QWidget
 
+from .ai_tools import configure_ai_runtime_environment
 from .startup_splash import StartupSplash, build_startup_splash
 
 try:
@@ -70,6 +71,7 @@ def _finish_runtime_splash(app: QApplication, splash: StartupSplash, window: QWi
 
 
 def main() -> int:
+    configure_ai_runtime_environment()
     app = QApplication(sys.argv)
     splash = _show_runtime_splash(app)
 

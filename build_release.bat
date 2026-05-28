@@ -76,5 +76,28 @@ if errorlevel 1 (
 )
 
 echo.
-echo Build complete: %CD%\release\GameDesigner.exe
+echo [GameDesigner] Building release\GameDesigner-Setup.exe...
+py -3.13 -m PyInstaller ^
+  --noconfirm ^
+  --clean ^
+  --onefile ^
+  --console ^
+  --name GameDesigner-Setup ^
+  --icon icon.ico ^
+  --add-binary "release\GameDesigner.exe;." ^
+  --distpath release ^
+  --workpath build_setup ^
+  source\setup_installer.py
+
+if errorlevel 1 (
+    echo.
+    echo Setup build failed.
+    pause
+    exit /b 1
+)
+
+echo.
+echo Build complete:
+echo   %CD%\release\GameDesigner.exe
+echo   %CD%\release\GameDesigner-Setup.exe
 pause

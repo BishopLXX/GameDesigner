@@ -35,7 +35,9 @@ from gamedesigner.ai_tools import (
     load_project_chat_memory,
     parse_ai_canvas_actions,
     project_chat_history_path,
+    resolve_ai_cli_program,
     qprocess_command,
+    portable_ai_runtime_environment,
     save_project_chat_history,
     split_ai_canvas_action_response,
 )
@@ -526,6 +528,22 @@ class AiToolsTests(unittest.TestCase):
 
         self.assertEqual(program, "codex")
         self.assertEqual(arguments, invocation.arguments)
+
+    def test_resolve_ai_cli_program_prefers_portable_runtime_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            runtime_root = Path(folder) / "runtime"
+            cli_bin = runtime_root / "ai-cli" / "node_modules" / ".bin"
+            cli_bin.mkdir(parents=True)
+            (cli_bin / "codex").write_text("#!/bin/sh\n", encoding="ascii")
+            shim = cli_bin / "codex.cmd"
+            shim.write_text("@echo off\r\nexit /b 0\r\n", encoding="ascii")
+            with mock.patch.dict(os.environ, {"GAMEDESIGNER_RUNTIME_DIR": str(runtime_root)}):
+                resolved = resolve_ai_cli_program("codex", "win32")
+                env = portable_ai_runtime_environment()
+
+        self.assertEqual(resolved, str(shim))
+        self.assertIn(str(cli_bin), env["PATH"])
+        self.assertEqual(env["GAMEDESIGNER_RUNTIME_DIR"], str(runtime_root))
 
     def test_codex_invocation_can_write_last_message_to_file(self) -> None:
         settings = AppSettings(ai_provider="codex", ai_model="gpt-5.5")

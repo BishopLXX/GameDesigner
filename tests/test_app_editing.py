@@ -664,6 +664,19 @@ class AppEditingTests(unittest.TestCase):
                 self.assertTrue(dialog.api_key_edit.isEnabled())
                 dialog.deleteLater()
 
+    def test_ai_settings_dialog_official_login_uses_visible_cli_launch(self) -> None:
+        settings = AppSettings(ai_provider="codex", ai_model="gpt-5.4")
+        dialog = AiSettingsDialog(None, settings)
+
+        with mock.patch("gamedesigner.ui.ai_chat_dialog.resolve_ai_cli_program", return_value="D:/tools/codex.exe"), \
+             mock.patch("gamedesigner.ui.ai_chat_dialog.QProcess.startDetached", return_value=True) as started:
+            dialog._open_official_login()
+
+        started.assert_called_once()
+        self.assertIn("D:/tools/codex.exe", started.call_args.args[1])
+        self.assertIn("login", started.call_args.args[1])
+        dialog.deleteLater()
+
     def test_ai_panel_clear_screen_keeps_project_memory(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             project_path = Path(folder) / "MemoryProject.gdc"

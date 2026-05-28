@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -358,18 +359,109 @@ def build_ai_cli_invocation(settings: AppSettings, prompt: str, cwd: str | Path)
 
 def process_environment(extra: dict[str, str]) -> QProcessEnvironment:
     env = QProcessEnvironment.systemEnvironment()
+    runtime_env = portable_ai_runtime_environment()
+    for key, value in runtime_env.items():
+        env.insert(key, value)
     for key, value in extra.items():
         env.insert(key, value)
     return env
 
 
+def configure_ai_runtime_environment() -> None:
+    runtime_env = portable_ai_runtime_environment()
+    for key, value in runtime_env.items():
+        os.environ[key] = value
+
+
+def portable_ai_runtime_environment() -> dict[str, str]:
+    runtime_root = _portable_ai_runtime_root()
+    path_entries: list[str] = []
+    for candidate in (
+        runtime_root / "node",
+        runtime_root / "ai-cli" / "node_modules" / ".bin",
+        runtime_root / "node_modules" / ".bin",
+        runtime_root / "ai-cli",
+    ):
+        if candidate.is_dir():
+            path_entries.append(str(candidate))
+    existing_path = os.environ.get("PATH", "").strip()
+    if existing_path:
+        path_entries.append(existing_path)
+    environment = {
+        "GAMEDESIGNER_RUNTIME_DIR": str(runtime_root),
+    }
+    if path_entries:
+        environment["PATH"] = os.pathsep.join(_dedupe_paths(path_entries))
+    return environment
+
+
 def qprocess_command(invocation: AiCliInvocation, platform: str | None = None) -> tuple[str, list[str]]:
+    return resolve_ai_cli_program(invocation.program, platform), invocation.arguments
+
+
+def resolve_ai_cli_program(program: str, platform: str | None = None) -> str:
     platform = platform or os.name
-    if _is_windows_platform(platform):
-        resolved = _resolve_windows_cli_program(invocation.program)
+    path = Path(program)
+    if path.is_absolute() or path.suffix:
+        return program
+    for directory in _portable_ai_cli_directories():
+        resolved = _resolve_cli_program_in_directory(directory, program, platform)
         if resolved:
-            return resolved, invocation.arguments
-    return invocation.program, invocation.arguments
+            return resolved
+    if _is_windows_platform(platform):
+        return _resolve_windows_cli_program(program)
+    return program
+
+
+def _portable_ai_cli_directories() -> list[Path]:
+    runtime_root = _portable_ai_runtime_root()
+    candidates = [
+        runtime_root / "ai-cli" / "node_modules" / ".bin",
+        runtime_root / "node_modules" / ".bin",
+        runtime_root / "bin",
+        runtime_root,
+    ]
+    return [path for path in candidates if path.is_dir()]
+
+
+def _portable_ai_runtime_root() -> Path:
+    override = os.getenv("GAMEDESIGNER_RUNTIME_DIR", "").strip()
+    if override:
+        return Path(override)
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent / "runtime"
+    return Path(__file__).resolve().parents[2] / "runtime"
+
+
+def _dedupe_paths(paths: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for raw_path in paths:
+        path = str(raw_path).strip()
+        if not path:
+            continue
+        key = path.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(path)
+    return result
+
+
+def _resolve_cli_program_in_directory(directory: Path, program: str, platform: str) -> str | None:
+    if not Path(program).suffix:
+        if _is_windows_platform(platform):
+            candidate_names = [f"{program}{extension}" for extension in (".exe", ".cmd", ".bat", ".com")]
+            candidate_names.append(program)
+        else:
+            candidate_names = [program]
+    else:
+        candidate_names = [program]
+    for name in candidate_names:
+        candidate = directory / name
+        if candidate.is_file():
+            return str(candidate)
+    return None
 
 
 def _is_windows_platform(platform: str) -> bool:

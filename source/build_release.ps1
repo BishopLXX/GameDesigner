@@ -32,4 +32,18 @@ py -3.13 -m PyInstaller `
   --workpath (Join-Path $ProjectRoot "build") `
   (Join-Path $PSScriptRoot "main.py")
 
-Write-Host "打包完成：" (Join-Path $ReleaseDir "GameDesigner.exe")
+$GameDesignerExe = Join-Path $ReleaseDir "GameDesigner.exe"
+py -3.13 -m PyInstaller `
+  --noconfirm `
+  --clean `
+  --onefile `
+  --console `
+  --name GameDesigner-Setup `
+  --icon $IconIcoPath `
+  --add-binary "$GameDesignerExe;." `
+  --distpath $ReleaseDir `
+  --workpath (Join-Path $ProjectRoot "build_setup") `
+  (Join-Path $PSScriptRoot "setup_installer.py")
+
+Write-Host "主程序打包完成：" $GameDesignerExe
+Write-Host "安装器打包完成：" (Join-Path $ReleaseDir "GameDesigner-Setup.exe")
