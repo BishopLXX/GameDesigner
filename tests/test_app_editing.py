@@ -388,6 +388,28 @@ class AppEditingTests(unittest.TestCase):
             panel._thread = None
             panel.deleteLater()
 
+    def test_ai_image_panel_passes_pixel_output_size_to_generation_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "PixelSizeRefs.gdc"
+            settings = AppSettings(
+                workspace_dir=folder,
+                export_dir=str(Path(folder) / "exports"),
+                ai_image_api_key="secret",
+                ai_pixel_output_size="256x384",
+            )
+            context_provider = lambda: ("ctx", Path(folder), project_path)
+            panel = AiImagePanel(None, settings, context_provider)
+            panel.bind_canvas("像素生图", "out", "pixel-canvas", True)
+
+            with mock.patch("gamedesigner.ui.ai_image_panel.ImageGenerationThread") as thread_cls:
+                thread = thread_cls.return_value
+                panel.generate_with_prompt("生成像素角色", output_node_id="out")
+
+            self.assertEqual(thread_cls.call_args.args[4], "256x384")
+            self.assertEqual(thread.start.call_count, 1)
+            panel._thread = None
+            panel.deleteLater()
+
     def test_ai_image_panel_uses_cached_outputs_as_references(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             project_path = Path(folder) / "CachedRefs.gdc"

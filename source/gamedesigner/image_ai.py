@@ -16,10 +16,16 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtGui import QImage
-from PIL import Image, ImageOps, ImageStat
+from PIL import Image, ImageChops, ImageOps, ImageStat
 from PIL.PngImagePlugin import PngInfo
 
 from .ai_presets import normalize_ai_credentials
+from .pixel_art import (
+    PIXEL_ART_ALPHA_THRESHOLD,
+    PIXEL_ART_SAMPLE_BLOCK,
+    normalized_pixel_output_size,
+    pixel_output_size_dimensions,
+)
 from .storage import AppSettings, project_bundle_dir
 
 
@@ -44,7 +50,6 @@ AI_IMAGE_QUALITY_PRESETS = ["auto", "low", "medium", "high"]
 AI_IMAGE_BACKGROUND_PRESETS = ["auto", "transparent", "opaque"]
 AI_IMAGE_OUTPUT_FORMAT_PRESETS = ["png", "webp", "jpeg"]
 AI_IMAGE_PROVIDERS = {"openai", "compatible"}
-PIXEL_ART_ALPHA_THRESHOLD = 128
 
 
 class AiImageError(RuntimeError):
@@ -197,14 +202,13 @@ def cache_generated_ai_image(
     index: int = 1,
     cache_key: str = "",
     pixel_mode: bool = False,
+    pixel_output_size: str = "auto",
 ) -> CachedAiImage:
-    folder = ai_image_cache_dir(project_path, cache_key)
-    if pixel_mode:
-        folder = folder / "pixel"
+    folder = _ai_image_cache_folder(project_path, cache_key, pixel_mode=pixel_mode, pixel_output_size=pixel_output_size)
     folder.mkdir(parents=True, exist_ok=True)
     extension = "png" if pixel_mode else _safe_output_extension(image.output_format)
     path = folder / f"cache_{_timestamp()}_{index}_{uuid.uuid4().hex[:8]}.{extension}"
-    data = _pixel_art_image_bytes(image.data) if pixel_mode else image.data
+    data = _pixel_art_image_bytes(image.data, pixel_output_size=pixel_output_size) if pixel_mode else image.data
     path.write_bytes(data)
     return cached_ai_image_from_path(path, revised_prompt=image.revised_prompt)
 
@@ -215,10 +219,9 @@ def load_cached_ai_images(
     limit: int = 80,
     cache_key: str = "",
     pixel_mode: bool = False,
+    pixel_output_size: str = "auto",
 ) -> list[CachedAiImage]:
-    folder = ai_image_cache_dir(project_path, cache_key)
-    if pixel_mode:
-        folder = folder / "pixel"
+    folder = _ai_image_cache_folder(project_path, cache_key, pixel_mode=pixel_mode, pixel_output_size=pixel_output_size)
     if not folder.exists():
         return []
     paths = [
@@ -526,19 +529,120 @@ def _safe_output_extension(value: str) -> str:
     return value if value in {"png", "webp", "jpg"} else "png"
 
 
-def _pixel_art_image_bytes(raw: bytes) -> bytes:
+def _ai_image_cache_folder(
+    project_path: str | Path,
+    cache_key: str,
+    *,
+    pixel_mode: bool = False,
+    pixel_output_size: str = "auto",
+) -> Path:
+    folder = ai_image_cache_dir(project_path, cache_key)
+    if not pixel_mode:
+        return folder
+    folder = folder / "pixel"
+    size_key = normalized_pixel_output_size(pixel_output_size)
+    if size_key != "auto":
+        folder = folder / size_key
+    return folder
+
+
+def _pixel_art_image_bytes(raw: bytes, *, pixel_output_size: str = "auto") -> bytes:
     with Image.open(BytesIO(raw)) as source:
         source = ImageOps.exif_transpose(source).convert("RGBA")
-        alpha = source.getchannel("A")
-        if _has_semitransparent_pixels(alpha):
-            alpha = alpha.point(lambda value: 255 if value >= PIXEL_ART_ALPHA_THRESHOLD else 0, mode="L")
-            source.putalpha(alpha)
-        return _image_to_png_bytes(source)
+        sampled = _pixel_grid_sample(source, pixel_output_size=pixel_output_size)
+        alpha = sampled.getchannel("A").point(
+            lambda value: 255 if value >= PIXEL_ART_ALPHA_THRESHOLD else 0,
+            mode="L",
+        )
+        sampled.putalpha(alpha)
+        return _image_to_png_bytes(sampled)
 
 
-def _has_semitransparent_pixels(alpha: Image.Image) -> bool:
-    extrema = alpha.getextrema()
-    return bool(extrema and 0 < extrema[0] and extrema[1] < 255)
+def _pixel_grid_sample(image: Image.Image, *, pixel_output_size: str = "auto") -> Image.Image:
+    target_size = pixel_output_size_dimensions(pixel_output_size)
+    if target_size is None:
+        block = max(1, int(PIXEL_ART_SAMPLE_BLOCK))
+        width = max(1, image.width // block)
+        height = max(1, image.height // block)
+        target_size = width, height
+    target_width, target_height = target_size
+    if target_width <= 0 or target_height <= 0:
+        return image.copy()
+    target_width = min(target_width, image.width)
+    target_height = min(target_height, image.height)
+    block = max(1, min(image.width // target_width, image.height // target_height))
+    if block <= 0:
+        return image.copy()
+    crop_width = min(image.width, target_width * block)
+    crop_height = min(image.height, target_height * block)
+    crop_x = _best_axis_crop_start(image, crop_width, block, axis="x")
+    crop_y = _best_axis_crop_start(image, crop_height, block, axis="y")
+    if crop_x + crop_width > image.width:
+        crop_x = max(0, image.width - crop_width)
+    if crop_y + crop_height > image.height:
+        crop_y = max(0, image.height - crop_height)
+    working = image.crop((crop_x, crop_y, crop_x + crop_width, crop_y + crop_height))
+    result = Image.new("RGBA", (target_width, target_height))
+    pixels = result.load()
+    for y in range(target_height):
+        top = y * block
+        for x in range(target_width):
+            left = x * block
+            cell = working.crop((left, top, left + block, top + block))
+            pixels[x, y] = _dominant_cell_color(cell)
+    return result
+
+
+def _best_axis_crop_start(image: Image.Image, span: int, block: int, *, axis: str) -> int:
+    dimension = image.width if axis == "x" else image.height
+    span = max(1, min(int(span), dimension))
+    if span >= dimension:
+        return 0
+    available = dimension - span
+    center = available // 2
+    lower = max(0, center - block + 1)
+    upper = min(available, center + block - 1)
+    best_start = center
+    best_score = float("-inf")
+    for start in range(lower, upper + 1):
+        if axis == "x":
+            strip = image.crop((start, 0, start + span, image.height))
+        else:
+            strip = image.crop((0, start, image.width, start + span))
+        score = _grid_boundary_score(strip, block, axis=axis)
+        if score > best_score or (score == best_score and abs(start - center) < abs(best_start - center)):
+            best_score = score
+            best_start = start
+    return best_start
+
+
+def _grid_boundary_score(image: Image.Image, block: int, *, axis: str) -> float:
+    grayscale = ImageOps.grayscale(image.convert("RGB"))
+    scores: list[float] = []
+    positions = range(block, image.width, block) if axis == "x" else range(block, image.height, block)
+    for position in positions:
+        if axis == "x":
+            left = grayscale.crop((position - 1, 0, position, image.height))
+            right = grayscale.crop((position, 0, position + 1, image.height))
+        else:
+            left = grayscale.crop((0, position - 1, image.width, position))
+            right = grayscale.crop((0, position, image.width, position + 1))
+        diff = ImageChops.difference(left, right)
+        scores.append(float(ImageStat.Stat(diff).mean[0]))
+    return sum(scores) / len(scores) if scores else float("-inf")
+
+
+def _dominant_cell_color(cell: Image.Image) -> tuple[int, int, int, int]:
+    rgba = cell.convert("RGBA")
+    if hasattr(rgba, "get_flattened_data"):
+        pixels = list(rgba.get_flattened_data())
+    else:  # pragma: no cover - Pillow compatibility fallback.
+        pixels = list(rgba.getdata())
+    opaque = [pixel for pixel in pixels if pixel[3] >= PIXEL_ART_ALPHA_THRESHOLD]
+    if not opaque:
+        return 0, 0, 0, 0
+    channels = list(zip(*opaque, strict=False))
+    return tuple(int(sorted(channel)[len(channel) // 2]) for channel in channels)  # type: ignore[return-value]
 
 
 def _image_to_png_bytes(image: Image.Image) -> bytes:

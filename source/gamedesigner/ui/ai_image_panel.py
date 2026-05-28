@@ -46,6 +46,7 @@ from ..image_ai import (
     save_ai_image_reference_from_qimage,
 )
 from ..image_rendering import PixmapCache
+from ..pixel_art import AI_IMAGE_PIXEL_OUTPUT_SIZE_PRESETS, normalized_pixel_output_size
 from ..storage import AppSettings, save_settings
 from ..window_layouts import restore_window_layout, save_window_layout
 from .submit_text_edit import SubmitPlainTextEdit
@@ -82,6 +83,11 @@ class AiImageSettingsDialog(QDialog):
         output_index = self.output_format_combo.findText(settings.ai_image_output_format or "png")
         self.output_format_combo.setCurrentIndex(output_index if output_index >= 0 else 0)
 
+        self.pixel_output_combo = QComboBox()
+        self.pixel_output_combo.setEditable(True)
+        self.pixel_output_combo.addItems(AI_IMAGE_PIXEL_OUTPUT_SIZE_PRESETS)
+        self.pixel_output_combo.setEditText(normalized_pixel_output_size(settings.ai_pixel_output_size))
+
         form = QFormLayout()
         form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         form.addRow("服务", self.provider_combo)
@@ -89,6 +95,7 @@ class AiImageSettingsDialog(QDialog):
         form.addRow("API Key", self.api_key_edit)
         form.addRow("Base URL", self.base_url_edit)
         form.addRow("输出格式", self.output_format_combo)
+        form.addRow("像素输出尺寸", self.pixel_output_combo)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Save).setText("保存")
@@ -115,6 +122,7 @@ class AiImageSettingsDialog(QDialog):
         self.settings.ai_image_api_key = self.api_key_edit.text().strip()
         self.settings.ai_image_base_url = self.base_url_edit.text().strip()
         self.settings.ai_image_output_format = self.output_format_combo.currentText().strip() or "png"
+        self.settings.ai_pixel_output_size = normalized_pixel_output_size(self.pixel_output_combo.currentText())
         save_settings(self.settings)
         self.accept()
 
@@ -179,6 +187,7 @@ class ImageGenerationThread(QThread):
         project_path: Path,
         cache_key: str = "",
         pixel_mode: bool = False,
+        pixel_output_size: str = "auto",
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -186,6 +195,7 @@ class ImageGenerationThread(QThread):
         self.project_path = project_path
         self.cache_key = cache_key
         self.pixel_mode = pixel_mode
+        self.pixel_output_size = normalized_pixel_output_size(pixel_output_size)
 
     def run(self) -> None:  # type: ignore[override]
         try:
@@ -197,6 +207,7 @@ class ImageGenerationThread(QThread):
                     index=index,
                     cache_key=self.cache_key,
                     pixel_mode=self.pixel_mode,
+                    pixel_output_size=self.pixel_output_size,
                 )
                 for index, image in enumerate(images, start=1)
             ]
@@ -238,6 +249,7 @@ class AiImagePanel(QWidget):
         self._cache_project_path: Path | None = None
         self._cache_binding_key = ""
         self._cache_pixel_mode = False
+        self._cache_pixel_output_size = ""
         self._current_image_path: Path | None = None
         self._thread: ImageGenerationThread | None = None
         self._active_prompt = ""
@@ -288,6 +300,18 @@ class AiImagePanel(QWidget):
         self.count_spin.setValue(max(1, min(4, int(settings.ai_image_count or 1))))
         self.count_spin.valueChanged.connect(self._save_inline_settings)
 
+        self.pixel_output_label = QLabel("像素输出")
+        self.pixel_output_combo = QComboBox()
+        self.pixel_output_combo.setEditable(True)
+        self._fill_combo(
+            self.pixel_output_combo,
+            AI_IMAGE_PIXEL_OUTPUT_SIZE_PRESETS,
+            normalized_pixel_output_size(settings.ai_pixel_output_size),
+        )
+        self.pixel_output_combo.currentTextChanged.connect(self._save_inline_settings)
+        if self.pixel_output_combo.lineEdit() is not None:
+            self.pixel_output_combo.lineEdit().editingFinished.connect(self._save_inline_settings)
+
         controls = QHBoxLayout()
         controls.setContentsMargins(0, 0, 0, 0)
         controls.setSpacing(6)
@@ -305,6 +329,8 @@ class AiImagePanel(QWidget):
         controls2.addWidget(self.background_combo)
         controls2.addWidget(QLabel("数量"))
         controls2.addWidget(self.count_spin)
+        controls2.addWidget(self.pixel_output_label)
+        controls2.addWidget(self.pixel_output_combo)
         controls2.addStretch(1)
 
         self.preview = QLabel("未生成图片")
@@ -417,12 +443,18 @@ class AiImagePanel(QWidget):
         layout.addLayout(body, 1)
         self._append_system("准备就绪。")
         self._refresh_header()
+        self._refresh_pixel_controls()
         self.load_project_cache()
 
     def _fill_combo(self, combo: QComboBox, values: list[str], current: str) -> None:
         combo.addItems(values)
         index = combo.findText(current or values[0])
-        combo.setCurrentIndex(index if index >= 0 else 0)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+        elif combo.isEditable():
+            combo.setEditText(current.strip() or values[0])
+        else:
+            combo.setCurrentIndex(0)
 
     def _refresh_header(self) -> None:
         provider = "OpenAI 官方" if self.settings.ai_image_provider == "openai" else "兼容 API"
@@ -446,7 +478,13 @@ class AiImagePanel(QWidget):
         self._bound_output_node_id = output_node_id.strip()
         self._load_bound_references()
         self._refresh_header()
+        self._refresh_pixel_controls()
         self.load_project_cache()
+
+    def _refresh_pixel_controls(self) -> None:
+        show_pixel = self._bound_pixel_mode
+        self.pixel_output_label.setVisible(show_pixel)
+        self.pixel_output_combo.setVisible(show_pixel)
 
     def generate_with_prompt(
         self,
@@ -465,7 +503,10 @@ class AiImagePanel(QWidget):
         self.settings.ai_image_quality = self.quality_combo.currentText().strip() or "auto"
         self.settings.ai_image_background = self.background_combo.currentText().strip() or "auto"
         self.settings.ai_image_count = self.count_spin.value()
+        self.settings.ai_pixel_output_size = normalized_pixel_output_size(self.pixel_output_combo.currentText())
         save_settings(self.settings)
+        if self._bound_pixel_mode and self._cache_pixel_output_size != self.settings.ai_pixel_output_size:
+            self._cache_pixel_output_size = ""
 
     def _send_from_button(self, _checked: bool = False) -> None:
         self._send()
@@ -511,7 +552,14 @@ class AiImagePanel(QWidget):
         self.send_button.setText("等待")
         self._start_activity()
         self._append_system(f"正在调用 {request.model} 生成图片...")
-        thread = ImageGenerationThread(request, project_path, self._cache_key(), self._bound_pixel_mode, self)
+        thread = ImageGenerationThread(
+            request,
+            project_path,
+            self._cache_key(),
+            self._bound_pixel_mode,
+            self.settings.ai_pixel_output_size,
+            self,
+        )
         thread.succeeded.connect(self._generation_succeeded)
         thread.failed.connect(self._generation_failed)
         thread.finished.connect(self._thread_finished)
@@ -573,18 +621,25 @@ class AiImagePanel(QWidget):
             self._cache_project_path == project_path
             and self._cache_binding_key == cache_key
             and self._cache_pixel_mode == self._bound_pixel_mode
+            and self._cache_pixel_output_size == self.settings.ai_pixel_output_size
         ):
             return
         self._cache_project_path = project_path
         self._cache_binding_key = cache_key
         self._cache_pixel_mode = self._bound_pixel_mode
+        self._cache_pixel_output_size = self.settings.ai_pixel_output_size
         self._pixmap_cache.clear()
         self.output_list.clear()
         self._current_image_path = None
         self._render_current_preview()
         self.save_button.setEnabled(False)
         self.open_folder_button.setEnabled(False)
-        self.cached_images = load_cached_ai_images(project_path, cache_key=cache_key, pixel_mode=self._bound_pixel_mode)
+        self.cached_images = load_cached_ai_images(
+            project_path,
+            cache_key=cache_key,
+            pixel_mode=self._bound_pixel_mode,
+            pixel_output_size=self.settings.ai_pixel_output_size,
+        )
         for image in self.cached_images:
             self._add_output_item(image, select=False)
         if self.cached_images:
@@ -829,6 +884,7 @@ class AiImagePanel(QWidget):
         dialog = AiImageSettingsDialog(self, self.settings)
         if dialog.exec() == QDialog.Accepted:
             self.model_combo.setEditText(self.settings.ai_image_model or AI_IMAGE_MODEL_PRESETS[0])
+            self.pixel_output_combo.setEditText(normalized_pixel_output_size(self.settings.ai_pixel_output_size))
             self._refresh_header()
 
     def _clear_screen(self) -> None:

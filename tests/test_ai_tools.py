@@ -136,6 +136,7 @@ class AiToolsTests(unittest.TestCase):
             ai_image_background="opaque",
             ai_image_count=3,
             ai_image_output_format="jpeg",
+            ai_pixel_output_size="256x384",
         )
 
         loaded = AppSettings.from_dict(settings.to_dict())
@@ -149,6 +150,7 @@ class AiToolsTests(unittest.TestCase):
         self.assertEqual(loaded.ai_image_background, "opaque")
         self.assertEqual(loaded.ai_image_count, 3)
         self.assertEqual(loaded.ai_image_output_format, "jpeg")
+        self.assertEqual(loaded.ai_pixel_output_size, "256x384")
 
     def test_app_settings_normalizes_url_leaked_into_api_key_fields(self) -> None:
         settings = AppSettings.from_dict(
@@ -225,15 +227,18 @@ class AiToolsTests(unittest.TestCase):
             self.assertEqual(loaded[0].path, cached.path)
 
     def test_pixel_ai_image_cache_enforces_fixed_grid_png(self) -> None:
-        source = Image.new("RGBA", (2, 2))
-        source.putdata(
-            [
-                (240, 96, 48, 255),
-                (240, 96, 48, 96),
-                (32, 96, 200, 32),
-                (32, 200, 96, 255),
-            ]
-        )
+        source = Image.new("RGBA", (8, 8))
+        pixels = source.load()
+        colors = [
+            (240, 96, 48, 255),
+            (32, 96, 200, 255),
+            (32, 200, 96, 255),
+            (220, 180, 64, 96),
+        ]
+        for y in range(8):
+            for x in range(8):
+                index = (x // 4) + (y // 4) * 2
+                pixels[x, y] = colors[index]
         buffer = BytesIO()
         source.save(buffer, format="PNG")
 
@@ -246,8 +251,14 @@ class AiToolsTests(unittest.TestCase):
                 index=1,
                 cache_key="canvas-a",
                 pixel_mode=True,
+                pixel_output_size="2x2",
             )
-            loaded = load_cached_ai_images(project_path, cache_key="canvas-a", pixel_mode=True)
+            loaded = load_cached_ai_images(
+                project_path,
+                cache_key="canvas-a",
+                pixel_mode=True,
+                pixel_output_size="2x2",
+            )
             normal_loaded = load_cached_ai_images(project_path, cache_key="canvas-a")
             processed = QImage(str(cached.path))
             alpha_values = {
@@ -259,10 +270,31 @@ class AiToolsTests(unittest.TestCase):
             self.assertEqual(cached.path.suffix.lower(), ".png")
             self.assertIn("pixel", {part.lower() for part in cached.path.parts})
             self.assertTrue(is_pixel_art_image_path(str(cached.path)))
-            self.assertEqual((processed.width(), processed.height()), (32, 32))
+            self.assertEqual((processed.width(), processed.height()), (2, 2))
             self.assertTrue(alpha_values.issubset({0, 255}))
+            self.assertEqual(processed.pixelColor(0, 0).rgba(), QImage.fromData(buffer.getvalue()).pixelColor(0, 0).rgba())
             self.assertEqual([image.path for image in loaded], [cached.path])
             self.assertEqual(normal_loaded, [])
+
+    def test_pixel_ai_image_cache_clamps_output_size_to_source(self) -> None:
+        source = Image.new("RGBA", (8, 8), (10, 20, 30, 255))
+        buffer = BytesIO()
+        source.save(buffer, format="PNG")
+
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "PixelClampProject.gdc"
+
+            cached = cache_generated_ai_image(
+                project_path,
+                AiGeneratedImage(buffer.getvalue(), "png"),
+                index=1,
+                cache_key="canvas-a",
+                pixel_mode=True,
+                pixel_output_size="256x384",
+            )
+            processed = QImage(str(cached.path))
+
+            self.assertEqual((processed.width(), processed.height()), (8, 8))
 
     def test_ai_image_request_with_reference_omits_input_fidelity_for_gpt_image_2(self) -> None:
         settings = AppSettings(
