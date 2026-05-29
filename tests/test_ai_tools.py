@@ -16,11 +16,23 @@ from gamedesigner.image_ai import (
     ai_image_cache_dir,
     build_ai_image_request,
     cache_generated_ai_image,
+    generate_pixel_refiner_candidates,
     generate_pixel_downscale_candidates,
     load_cached_ai_images,
     pixel_source_path_for_candidate,
     _encode_multipart,
     _multipart_body,
+)
+from gamedesigner.pixel_refiner import (
+    DEFAULT_PIXEL_REFINER_CANDIDATES,
+    DEFAULT_PIXEL_REFINER_MODEL_ID,
+    DEFAULT_PIXEL_REFINER_SERVICE_URL,
+    DEFAULT_PIXEL_REFINER_STRENGTH,
+    PixelRefinerOutput,
+    PixelRefinerRequest,
+    PixelRefinerResult,
+    normalize_pixel_refiner_service_url,
+    refine_pixel_art_with_service,
 )
 from gamedesigner.image_rendering import is_pixel_art_image_path
 from gamedesigner.ai_tools import (
@@ -66,7 +78,13 @@ PNG_1X1 = base64.b64decode(
 class AiToolsTests(unittest.TestCase):
     def setUp(self) -> None:
         self._appdata_temp = tempfile.TemporaryDirectory()
-        self._appdata_patch = mock.patch.dict(os.environ, {"APPDATA": self._appdata_temp.name})
+        self._appdata_patch = mock.patch.dict(
+            os.environ,
+            {
+                "APPDATA": self._appdata_temp.name,
+                "GAMEDESIGNER_DATA_DIR": str(Path(self._appdata_temp.name) / "GameDesignerData"),
+            },
+        )
         self._appdata_patch.start()
 
     def tearDown(self) -> None:
@@ -191,6 +209,11 @@ class AiToolsTests(unittest.TestCase):
             ai_image_output_format="jpeg",
             ai_pixel_output_size="256x384",
             aseprite_cli_path="D:/Tools/Aseprite/Aseprite.exe",
+            pixel_refiner_service_url="127.0.0.1:9001",
+            pixel_refiner_model_dir="D:/Models/pixel-refiner-v1",
+            pixel_refiner_model_id="pixel-refiner-custom",
+            pixel_refiner_strength=0.8,
+            pixel_refiner_candidates=3,
         )
 
         loaded = AppSettings.from_dict(settings.to_dict())
@@ -206,6 +229,26 @@ class AiToolsTests(unittest.TestCase):
         self.assertEqual(loaded.ai_image_output_format, "jpeg")
         self.assertEqual(loaded.ai_pixel_output_size, "256x384")
         self.assertEqual(loaded.aseprite_cli_path, "D:/Tools/Aseprite/Aseprite.exe")
+        self.assertEqual(loaded.pixel_refiner_service_url, "http://127.0.0.1:9001")
+        self.assertEqual(loaded.pixel_refiner_model_dir, "D:/Models/pixel-refiner-v1")
+        self.assertEqual(loaded.pixel_refiner_model_id, "pixel-refiner-custom")
+        self.assertEqual(loaded.pixel_refiner_strength, 0.8)
+        self.assertEqual(loaded.pixel_refiner_candidates, 3)
+
+    def test_pixel_refiner_settings_fall_back_to_v1_defaults(self) -> None:
+        settings = AppSettings.from_dict(
+            {
+                "pixel_refiner_service_url": "not a url",
+                "pixel_refiner_strength": 8,
+                "pixel_refiner_candidates": 99,
+                "pixel_refiner_model_id": "",
+            }
+        )
+
+        self.assertEqual(settings.pixel_refiner_service_url, DEFAULT_PIXEL_REFINER_SERVICE_URL)
+        self.assertEqual(settings.pixel_refiner_strength, 1.0)
+        self.assertEqual(settings.pixel_refiner_candidates, 8)
+        self.assertEqual(settings.pixel_refiner_model_id, DEFAULT_PIXEL_REFINER_MODEL_ID)
 
     def test_app_settings_normalizes_url_leaked_into_api_key_fields(self) -> None:
         settings = AppSettings.from_dict(
@@ -297,6 +340,85 @@ class AiToolsTests(unittest.TestCase):
             source_path = pixel_source_path_for_candidate(cached.path)
             self.assertTrue(source_path.exists())
             self.assertIn("sources", {part.lower() for part in source_path.parts})
+
+    def test_pixel_refiner_client_posts_v1_payload_and_reads_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            input_path = Path(folder) / "input.png"
+            output_dir = Path(folder) / "outputs"
+            output_dir.mkdir()
+            output_path = output_dir / "refined.png"
+            Image.new("RGBA", (8, 8), (40, 80, 180, 255)).save(input_path)
+            Image.new("RGBA", (8, 8), (60, 90, 200, 255)).save(output_path)
+
+            def fake_post(_url: str, payload: dict, *, timeout: int) -> dict:
+                self.assertEqual(payload["input_path"], str(input_path.resolve()))
+                self.assertEqual(payload["output_dir"], str(output_dir.resolve()))
+                self.assertEqual(payload["target_size"], "8x8")
+                self.assertEqual(payload["palette_limit"], 48)
+                self.assertEqual(payload["return_candidates"], 2)
+                self.assertEqual(payload["model"]["id"], "pixel-refiner-test")
+                self.assertEqual(payload["client"]["protocol"], "pixel-refiner-v1")
+                self.assertEqual(timeout, 180)
+                return {
+                    "ok": True,
+                    "model": "pixel-refiner-test",
+                    "outputs": [{"path": str(output_path), "label": "Refined A"}],
+                    "checks": {"transparent_png": True},
+                }
+
+            request = PixelRefinerRequest(
+                input_path=input_path,
+                output_dir=output_dir,
+                target_size="8x8",
+                palette_limit=48,
+                return_candidates=2,
+                model_id="pixel-refiner-test",
+            )
+            with mock.patch("gamedesigner.pixel_refiner._post_json", side_effect=fake_post):
+                result = refine_pixel_art_with_service(request, service_url="127.0.0.1:9999")
+
+            self.assertEqual(result.model, "pixel-refiner-test")
+            self.assertEqual(result.outputs[0].path, output_path)
+            self.assertEqual(result.outputs[0].label, "Refined A")
+            self.assertTrue(result.checks["transparent_png"])
+
+    def test_pixel_refiner_candidates_finalize_service_pngs_in_pixel_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "PixelRefinerProject.gdc"
+            source_path = Path(folder) / "source.png"
+            Image.new("RGBA", (16, 16), (120, 90, 200, 255)).save(source_path)
+            hidden_source_dir = source_path.parent / "sources"
+            hidden_source_dir.mkdir()
+            hidden_source_path = hidden_source_dir / f"{source_path.stem}_source.png"
+            Image.new("RGBA", (32, 32), (240, 240, 240, 255)).save(hidden_source_path)
+
+            def fake_refine(request: PixelRefinerRequest, *, service_url: str | None = None) -> PixelRefinerResult:
+                self.assertEqual(service_url, "http://127.0.0.1:8765")
+                self.assertEqual(request.input_path, source_path)
+                self.assertEqual(request.target_size, "8x8")
+                self.assertEqual(request.return_candidates, 2)
+                output_path = request.output_dir / "service_output.png"
+                Image.new("RGBA", (12, 12), (12, 34, 56, 180)).save(output_path)
+                return PixelRefinerResult(
+                    outputs=[PixelRefinerOutput(output_path, "Service A")],
+                    model="pixel-refiner-test",
+                )
+
+            with mock.patch("gamedesigner.image_ai.refine_pixel_art_with_service", side_effect=fake_refine):
+                candidates = generate_pixel_refiner_candidates(
+                    project_path,
+                    source_path,
+                    cache_key="canvas-a",
+                    pixel_output_size="8x8",
+                    candidates=2,
+                )
+
+            self.assertEqual(len(candidates), 1)
+            self.assertEqual(candidates[0].label, "Service A")
+            self.assertTrue(is_pixel_art_image_path(str(candidates[0].image.path)))
+            processed = QImage(str(candidates[0].image.path))
+            self.assertEqual((processed.width(), processed.height()), (8, 8))
+            self.assertIn(processed.pixelColor(4, 4).alpha(), {0, 255})
 
     def test_pixel_ai_image_cache_auto_preserves_source_detail(self) -> None:
         source = Image.new("RGBA", (12, 20), (0, 0, 0, 0))

@@ -42,3 +42,18 @@
 - Project-owned data that can grow large belongs in the adjacent `.gdc.files` folder, with clear subfolders such as `canvases/`, `linked_docs/`, and focused JSON/text files.
 - UI dialogs that are not core window orchestration should live outside `app.py`; prefer dedicated modules under `ui/`.
 - File and persistence helpers should live outside UI code; prefer dedicated modules under `project_files/` or storage-focused modules.
+
+## Pixel Refiner Console And Training
+
+- Pixel Refiner is a separate local service, model package, dataset pipeline, and control console. Do not fold its training or service controls into the main canvas UI unless the user explicitly asks.
+- The visible control app is `source/pixel_refiner_service_window.py`. Start it from source with `start_pixel_refiner_service_window.bat`; build a standalone GUI with `build_pixel_refiner_console.bat`.
+- Keep the console organized around the existing tabs: `service`, `dataset`, `training/retrain`, and `help`. The Help tab should stay current whenever service behavior, dataset layout, training commands, or model limitations change.
+- Default service URL is `http://127.0.0.1:8765`. The service exposes `GET /v1/health`, `GET /v1/stats`, and `POST /v1/pixel/refine`.
+- Default dataset root is `D:\GameDesignerData\pixel_refiner\character_large_v1`. Important subfolders are `targets`, `generated_inputs`, `pairs`, `raw`, `manifests`, and `eval`.
+- Default model package root is `D:\GameDesignerData\pixel_refiner\models\pixel-refiner-v2`. The runtime package must contain `model_manifest.json` and `weights/pixel_refiner_v2.onnx` plus any ONNX external data file. Keep old `D:\GameDesignerData\models\...` paths as legacy-only and migrate them into `D:\GameDesignerData\pixel_refiner\models\...`.
+- Default training Python is `D:\GameDesignerData\venvs\pixel-refiner-train\Scripts\python.exe`. Use this venv for PyTorch training instead of installing training dependencies into the main app runtime.
+- The training CLI is `source/pixel_refiner_training_main.py`. Use `summary` and `evaluate` to inspect data, `train` for full training, `smoke-model` for package/service validation, and `generate-ai-pseudo` only when intentionally expanding pseudo-AI pairs. `train_pixel_refiner_v2.bat` is the default full training launcher.
+- Open/authorized dataset collection lives in `source/gamedesigner/pixel_refiner_open_assets.py` with the wrapper `tools/collect_open_pixel_character_assets.py`. Its default FreeGameSprites mode records CC0 provenance, uses strict character-like slug filtering, and writes targets under `D:\GameDesignerData\pixel_refiner\character_large_v1\targets\freegamesprites_cc0`.
+- After any train or retrain that overwrites the model package, restart the Pixel Refiner service so ONNX Runtime reloads the new weights.
+- Always verify Pixel Refiner changes with targeted tests, at minimum `py -3 -m unittest tests.test_pixel_refiner_service tests.test_pixel_refiner_dataset tests.test_pixel_refiner_ai_pseudo tests.test_pixel_site_downloader tests.test_pixel_refiner_open_assets` when those areas are touched.
+- Pixel Refiner v2 is a supervised U-Net/NAFNet-style image-to-image ONNX refiner with palette/alpha cleanup, not a from-scratch image generator. If outputs remain soft, hazy, or non-pixel-accurate, first inspect `/v1/stats` to confirm requests are reaching the service, then improve real software-candidate pairs, sampling weights, loss/post-processing, or retraining strategy instead of assuming the service did not run.

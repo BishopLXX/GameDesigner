@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -42,6 +43,7 @@ from ..image_ai import (
     cache_generated_ai_image,
     generate_ai_images,
     generate_pixel_downscale_candidates,
+    generate_pixel_refiner_candidates,
     load_cached_ai_images,
     normalize_aseprite_cli_path,
     pixel_source_path_for_candidate,
@@ -56,6 +58,14 @@ from ..pixel_art import (
     normalized_pixel_output_size,
     pixel_output_size_dimensions,
 )
+from ..pixel_refiner import (
+    DEFAULT_PIXEL_REFINER_CANDIDATES,
+    DEFAULT_PIXEL_REFINER_MODEL_ID,
+    DEFAULT_PIXEL_REFINER_STRENGTH,
+    normalize_pixel_refiner_service_url,
+    pixel_refiner_package_label,
+)
+from ..pixel_refiner_dataset import dataset_dir, ingest_software_candidate_pair
 from ..storage import AppSettings, save_settings
 from ..window_layouts import restore_window_layout, save_window_layout
 from .submit_text_edit import SubmitPlainTextEdit
@@ -117,6 +127,39 @@ class AiImageSettingsDialog(QDialog):
         self.aseprite_cli_edit = QLineEdit(getattr(settings, "aseprite_cli_path", ""))
         self.aseprite_cli_edit.setPlaceholderText(r"例如 C:\Program Files\Aseprite\Aseprite.exe")
 
+        self.pixel_refiner_url_edit = QLineEdit(
+            normalize_pixel_refiner_service_url(getattr(settings, "pixel_refiner_service_url", ""))
+        )
+        self.pixel_refiner_url_edit.setPlaceholderText("例如 http://127.0.0.1:8765")
+
+        self.pixel_refiner_model_dir_edit = QLineEdit(getattr(settings, "pixel_refiner_model_dir", ""))
+        self.pixel_refiner_model_dir_edit.setPlaceholderText(r"例如 D:\GameDesignerData\pixel_refiner\models\pixel-refiner-v2")
+        self.pixel_refiner_model_dir_button = QPushButton("选择")
+        self.pixel_refiner_model_dir_button.clicked.connect(self._choose_pixel_refiner_model_dir)
+        pixel_refiner_dir_row = QHBoxLayout()
+        pixel_refiner_dir_row.setContentsMargins(0, 0, 0, 0)
+        pixel_refiner_dir_row.addWidget(self.pixel_refiner_model_dir_edit, 1)
+        pixel_refiner_dir_row.addWidget(self.pixel_refiner_model_dir_button)
+
+        self.pixel_refiner_model_id_edit = QLineEdit(
+            getattr(settings, "pixel_refiner_model_id", DEFAULT_PIXEL_REFINER_MODEL_ID)
+            or DEFAULT_PIXEL_REFINER_MODEL_ID
+        )
+
+        self.pixel_refiner_strength_spin = QDoubleSpinBox()
+        self.pixel_refiner_strength_spin.setRange(0.0, 1.0)
+        self.pixel_refiner_strength_spin.setSingleStep(0.05)
+        self.pixel_refiner_strength_spin.setDecimals(2)
+        self.pixel_refiner_strength_spin.setValue(
+            max(0.0, min(1.0, float(getattr(settings, "pixel_refiner_strength", DEFAULT_PIXEL_REFINER_STRENGTH))))
+        )
+
+        self.pixel_refiner_candidates_spin = QSpinBox()
+        self.pixel_refiner_candidates_spin.setRange(1, 8)
+        self.pixel_refiner_candidates_spin.setValue(
+            max(1, min(8, int(getattr(settings, "pixel_refiner_candidates", DEFAULT_PIXEL_REFINER_CANDIDATES))))
+        )
+
         self.output_format_combo = QComboBox()
         self.output_format_combo.addItems(AI_IMAGE_OUTPUT_FORMAT_PRESETS)
         output_index = self.output_format_combo.findText(settings.ai_image_output_format or "png")
@@ -134,6 +177,11 @@ class AiImageSettingsDialog(QDialog):
         form.addRow("API Key", self.api_key_edit)
         form.addRow("Base URL", self.base_url_edit)
         form.addRow("Aseprite CLI", self.aseprite_cli_edit)
+        form.addRow("像素修正服务", self.pixel_refiner_url_edit)
+        form.addRow("像素修正模型包", pixel_refiner_dir_row)
+        form.addRow("像素修正模型 ID", self.pixel_refiner_model_id_edit)
+        form.addRow("像素修正强度", self.pixel_refiner_strength_spin)
+        form.addRow("像素修正候选数", self.pixel_refiner_candidates_spin)
         form.addRow("输出格式", self.output_format_combo)
         form.addRow("像素输出尺寸", self.pixel_output_combo)
 
@@ -156,12 +204,26 @@ class AiImageSettingsDialog(QDialog):
         official = self.provider_combo.currentData() == "openai"
         self.base_url_edit.setEnabled(not official)
 
+    def _choose_pixel_refiner_model_dir(self) -> None:
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "选择像素修正模型包",
+            self.pixel_refiner_model_dir_edit.text().strip() or str(Path.home()),
+        )
+        if folder:
+            self.pixel_refiner_model_dir_edit.setText(folder)
+
     def _save(self) -> None:
         self.settings.ai_image_provider = str(self.provider_combo.currentData() or "openai")
         self.settings.ai_image_model = self.model_combo.currentText().strip() or AI_IMAGE_MODEL_PRESETS[0]
         self.settings.ai_image_api_key = self.api_key_edit.text().strip()
         self.settings.ai_image_base_url = self.base_url_edit.text().strip()
         self.settings.aseprite_cli_path = normalize_aseprite_cli_path(self.aseprite_cli_edit.text())
+        self.settings.pixel_refiner_service_url = normalize_pixel_refiner_service_url(self.pixel_refiner_url_edit.text())
+        self.settings.pixel_refiner_model_dir = self.pixel_refiner_model_dir_edit.text().strip()
+        self.settings.pixel_refiner_model_id = self.pixel_refiner_model_id_edit.text().strip() or DEFAULT_PIXEL_REFINER_MODEL_ID
+        self.settings.pixel_refiner_strength = self.pixel_refiner_strength_spin.value()
+        self.settings.pixel_refiner_candidates = self.pixel_refiner_candidates_spin.value()
         self.settings.ai_image_output_format = self.output_format_combo.currentText().strip() or "png"
         self.settings.ai_pixel_output_size = normalized_pixel_output_size(self.pixel_output_combo.currentText())
         save_settings(self.settings)
@@ -836,25 +898,85 @@ class AiImagePanel(QWidget):
             item.setSelected(True)
         menu = QMenu(self)
         open_folder_action = menu.addAction("打开所在文件夹")
+        refiner_action = menu.addAction("AI 修正像素画")
         candidate_action = menu.addAction("生成粗像素候选")
         redraw_action = menu.addAction("作为参考重绘像素稿")
+        training_pair_action = menu.addAction("加入 Pixel Refiner 训练对...")
         menu.addSeparator()
         delete_action = menu.addAction("删除缓存图")
         pixel_ready = self._bound_pixel_mode and item is not None
         open_folder_action.setEnabled(item is not None)
+        refiner_action.setEnabled(pixel_ready and self._thread is None)
         candidate_action.setEnabled(pixel_ready and self._thread is None)
         redraw_action.setEnabled(pixel_ready and self._thread is None)
+        training_pair_action.setEnabled(pixel_ready and self._thread is None)
         if item is None:
             delete_action.setEnabled(False)
         action = menu.exec(self.output_list.mapToGlobal(position))
         if action == open_folder_action and item is not None:
             self._open_output_item_folder(item)
+        elif action == refiner_action and item is not None:
+            self._refine_pixel_output(item)
         elif action == candidate_action and item is not None:
             self._generate_pixel_candidates_from_output(item)
         elif action == redraw_action and item is not None:
             self._redraw_pixel_draft_from_output(item)
+        elif action == training_pair_action and item is not None:
+            self._add_pixel_refiner_training_pair(item)
         elif action == delete_action and item is not None:
             self._delete_cached_output_items(self.output_list.selectedItems() or [item])
+
+    def _refine_pixel_output(self, item: QListWidgetItem) -> None:
+        path = Path(str(item.data(Qt.UserRole) or ""))
+        if not path.exists():
+            QMessageBox.information(self, "AI 像素修正", "当前缓存图不存在。")
+            return
+        self._save_inline_settings()
+        try:
+            _context, _cwd, project_path = self.context_provider()
+        except ValueError as exc:
+            QMessageBox.information(self, "没有可用工程", str(exc))
+            return
+        try:
+            candidates = generate_pixel_refiner_candidates(
+                project_path,
+                path,
+                cache_key=self._cache_key(),
+                pixel_output_size=self.settings.ai_pixel_output_size,
+                service_url=self.settings.pixel_refiner_service_url,
+                model_dir=self.settings.pixel_refiner_model_dir,
+                model_id=self.settings.pixel_refiner_model_id,
+                strength=self.settings.pixel_refiner_strength,
+                candidates=self.settings.pixel_refiner_candidates,
+            )
+        except AiImageError as exc:
+            model_label = pixel_refiner_package_label(getattr(self.settings, "pixel_refiner_model_dir", ""))
+            message = (
+                f"{exc}\n\n"
+                "请确认 Pixel Refiner 本地服务已经启动，并且模型包已安装：\n"
+                f"服务：{normalize_pixel_refiner_service_url(getattr(self.settings, 'pixel_refiner_service_url', ''))}\n"
+                f"模型包：{model_label}"
+            )
+            QMessageBox.information(self, "AI 像素修正", message)
+            return
+        self._add_pixel_refiner_candidates(candidates)
+
+    def _add_pixel_refiner_candidates(self, candidates: list[object]) -> None:
+        typed = [candidate for candidate in candidates if hasattr(candidate, "image")]
+        if not typed:
+            self._append_system("AI 像素修正没有返回候选图。")
+            return
+        added_images = [candidate.image for candidate in typed if candidate.image.width > 0 and candidate.image.height > 0]
+        self.cached_images.extend(added_images)
+        for image in added_images:
+            self._add_output_item(image, select=False)
+        if added_images:
+            self._select_generated_image(added_images[-1].path)
+            item = self._find_output_item(added_images[-1].path)
+            if item is not None:
+                self.output_list.setCurrentItem(item)
+        labels = "、".join(str(getattr(candidate, "label", "") or getattr(candidate, "method", "")) for candidate in typed)
+        self._append_system(f"已生成 {len(typed)} 张 AI 像素修正候选：{labels}。")
 
     def _generate_pixel_candidates_from_output(self, item: QListWidgetItem) -> None:
         path = Path(str(item.data(Qt.UserRole) or ""))
@@ -901,6 +1023,58 @@ class AiImagePanel(QWidget):
             return
         prompt = self._native_pixel_redraw_prompt(path)
         self.generate_with_prompt(prompt, [path], output_node_id=self._bound_output_node_id)
+
+    def _add_pixel_refiner_training_pair(self, item: QListWidgetItem) -> None:
+        input_path = Path(str(item.data(Qt.UserRole) or ""))
+        if not input_path.exists():
+            QMessageBox.information(self, "Pixel Refiner 训练对", "当前缓存图不存在。")
+            return
+        target_path_text, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "选择目标真像素 PNG",
+            str(input_path.parent),
+            "PNG 图片 (*.png)",
+        )
+        if not target_path_text:
+            return
+        target_path = Path(target_path_text)
+        category = self._pixel_refiner_feedback_category(input_path)
+        try:
+            result = ingest_software_candidate_pair(
+                input_path,
+                target_path,
+                category=category,
+                notes=f"cache_key={self._cache_key()}",
+            )
+        except Exception as exc:
+            QMessageBox.information(
+                self,
+                "Pixel Refiner 训练对",
+                f"{exc}\n\n输入图和目标图必须是同尺寸 PNG。请用软件生成的坏候选图作为输入，用匹配的真像素图作为目标。",
+            )
+            return
+        status = "已加入" if result.created else "已存在，未重复加入"
+        pair_folder = result.record.target_path.parent
+        self._append_system(
+            f"{status} Pixel Refiner 训练对：{result.record.input_kind} / {result.record.category} / {result.record.width}x{result.record.height}。"
+        )
+        QMessageBox.information(
+            self,
+            "Pixel Refiner 训练对",
+            f"{status}。\n\nPair：{pair_folder}\n数据集：{dataset_dir()}",
+        )
+
+    def _pixel_refiner_feedback_category(self, path: Path) -> str:
+        image = QImage(str(path))
+        if image.isNull():
+            return "character_portrait"
+        width = max(1, image.width())
+        height = max(1, image.height())
+        if width > height * 1.2:
+            return "side_scroller_action_character"
+        if height > width * 1.2:
+            return "character_portrait"
+        return "character_portrait" if max(width, height) >= 384 else "character_sprite"
 
     def _native_pixel_redraw_prompt(self, reference_path: Path) -> str:
         output_size = normalized_pixel_output_size(self.pixel_output_combo.currentText())

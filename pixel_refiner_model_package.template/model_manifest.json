@@ -1,0 +1,10 @@
+{
+  "id": "pixel-refiner-v1",
+  "version": "0.1.0",
+  "runtime": "onnxruntime",
+  "weights": "weights/pixel_refiner_v1.onnx",
+  "target_sizes": ["32x32", "64x64", "128x128", "256x256", "256x384", "384x256"],
+  "alpha_modes": ["preserve"],
+  "recommended_vram_mb": 1024,
+  "notes": "Template only. Replace weights/pixel_refiner_v1.onnx with a real model-generated/refiner-trained ONNX weight file before using this package."
+}

@@ -34,6 +34,15 @@ from .pixel_art import (
     pixel_art_palette_limit,
     pixel_output_size_dimensions,
 )
+from .pixel_refiner import (
+    DEFAULT_PIXEL_REFINER_CANDIDATES,
+    DEFAULT_PIXEL_REFINER_MODEL_ID,
+    DEFAULT_PIXEL_REFINER_STRENGTH,
+    PixelRefinerError,
+    PixelRefinerRequest,
+    normalize_pixel_refiner_service_url,
+    refine_pixel_art_with_service,
+)
 from .storage import AppSettings, project_bundle_dir
 
 
@@ -101,6 +110,7 @@ class AiImageRequest:
     background: str = "auto"
     count: int = 1
     output_format: str = "png"
+    timeout: int = 180
 
 
 @dataclass(frozen=True)
@@ -171,6 +181,7 @@ def build_ai_image_request(
         background=requested_background,
         count=_coerce_count(getattr(settings, "ai_image_count", 1)),
         output_format=output_format,
+        timeout=180,
     )
 
 
@@ -184,6 +195,7 @@ def generate_ai_images(request: AiImageRequest) -> list[AiGeneratedImage]:
             request.api_key,
             body,
             content_type,
+            timeout=request.timeout,
         )
     else:
         payload = _json_payload(request)
@@ -192,6 +204,7 @@ def generate_ai_images(request: AiImageRequest) -> list[AiGeneratedImage]:
             request.api_key,
             json.dumps(payload, ensure_ascii=False).encode("utf-8"),
             "application/json",
+            timeout=request.timeout,
         )
     return _parse_images_response(raw, request.output_format)
 
@@ -294,6 +307,58 @@ def generate_pixel_downscale_candidates(
         if aseprite_candidate is not None:
             candidates.append(aseprite_candidate)
     return candidates[:PIXEL_DOWNSCALE_CANDIDATE_LIMIT + 1]
+
+
+def generate_pixel_refiner_candidates(
+    project_path: str | Path,
+    source_path: str | Path,
+    *,
+    cache_key: str = "",
+    pixel_output_size: str = "auto",
+    service_url: str = "",
+    model_dir: str | Path | None = None,
+    model_id: str = DEFAULT_PIXEL_REFINER_MODEL_ID,
+    strength: float = DEFAULT_PIXEL_REFINER_STRENGTH,
+    candidates: int = DEFAULT_PIXEL_REFINER_CANDIDATES,
+) -> list[PixelDownscaleCandidate]:
+    target_size = pixel_output_size_dimensions(pixel_output_size)
+    if target_size is None:
+        raise AiImageError("请先设置明确的像素输出尺寸，例如 128x128、256x256 或 256x384。")
+    source = Path(source_path)
+    if not source.exists():
+        raise AiImageError(f"源图不存在：{source}")
+    folder = _ai_image_cache_folder(project_path, cache_key, pixel_mode=True, pixel_output_size=pixel_output_size)
+    folder.mkdir(parents=True, exist_ok=True)
+    request = PixelRefinerRequest(
+        input_path=source,
+        output_dir=folder,
+        target_size=pixel_output_size,
+        palette_limit=pixel_art_palette_limit(*target_size),
+        strength=strength,
+        return_candidates=candidates,
+        model_dir=Path(model_dir) if model_dir else None,
+        model_id=model_id,
+    )
+    try:
+        result = refine_pixel_art_with_service(request, service_url=normalize_pixel_refiner_service_url(service_url))
+    except PixelRefinerError as exc:
+        raise AiImageError(str(exc)) from exc
+    refined: list[PixelDownscaleCandidate] = []
+    for index, output in enumerate(result.outputs, start=1):
+        if output.path.suffix.lower() != ".png":
+            raise AiImageError(f"像素修正服务返回了非 PNG 文件：{output.path}")
+        _finalize_refined_pixel_output(output.path, target_size)
+        image = cached_ai_image_from_path(output.path)
+        if image.width <= 0 or image.height <= 0:
+            raise AiImageError(f"像素修正服务返回的 PNG 无法读取：{output.path}")
+        refined.append(
+            PixelDownscaleCandidate(
+                image=image,
+                method=f"pixel_refiner_{index}",
+                label=output.label or f"AI 像素修正 {index}",
+            )
+        )
+    return refined
 
 
 def load_cached_ai_images(
@@ -399,7 +464,7 @@ def _normalized_compatible_base_url(base_url: str) -> str:
     return cleaned
 
 
-def _post(url: str, api_key: str, data: bytes, content_type: str) -> bytes:
+def _post(url: str, api_key: str, data: bytes, content_type: str, *, timeout: int = 180) -> bytes:
     request = urllib.request.Request(
         url,
         data=data,
@@ -411,7 +476,7 @@ def _post(url: str, api_key: str, data: bytes, content_type: str) -> bytes:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=180) as response:
+        with urllib.request.urlopen(request, timeout=max(1, int(timeout))) as response:
             return response.read()
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
@@ -694,6 +759,19 @@ def _finalize_pixel_candidate(image: Image.Image) -> None:
         mode="L",
     )
     image.putalpha(alpha)
+
+
+def _finalize_refined_pixel_output(path: Path, target_size: tuple[int, int]) -> None:
+    try:
+        with Image.open(path) as loaded:
+            image = ImageOps.exif_transpose(loaded).convert("RGBA")
+    except OSError as exc:
+        raise AiImageError(f"像素修正服务返回的 PNG 无法读取：{path}") from exc
+    if image.size != target_size:
+        image = _center_fit_pixel_image(image, target_size)
+    _finalize_pixel_candidate(image)
+    _apply_palette_quantization(image, pixel_art_palette_limit(*target_size))
+    path.write_bytes(_image_to_png_bytes(image, pixel_art=True))
 
 
 def _save_pixel_downscale_candidate(

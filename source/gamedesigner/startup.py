@@ -72,6 +72,9 @@ def _finish_runtime_splash(app: QApplication, splash: StartupSplash, window: QWi
 
 def main() -> int:
     configure_ai_runtime_environment()
+    from .storage import migrate_legacy_user_data
+    migrate_legacy_user_data()
+
     app = QApplication(sys.argv)
     splash = _show_runtime_splash(app)
 

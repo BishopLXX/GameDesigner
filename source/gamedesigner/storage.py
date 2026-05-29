@@ -10,6 +10,14 @@ from typing import Any
 from .ai_presets import clean_ai_saved_connections, normalize_ai_credentials
 from .models import EDGE_STYLES, ProjectData, default_project
 from .pixel_art import normalized_ai_image_size, normalized_pixel_output_size
+from .pixel_refiner import (
+    DEFAULT_PIXEL_REFINER_CANDIDATES,
+    DEFAULT_PIXEL_REFINER_MODEL_ID,
+    DEFAULT_PIXEL_REFINER_STRENGTH,
+    default_pixel_refiner_model_dir,
+    normalize_pixel_refiner_service_url,
+)
+from .paths import game_designer_config_dir, game_designer_data_root, game_designer_workspace_dir, pixel_refiner_model_dir
 
 
 APP_NAME = "GameDesigner"
@@ -53,6 +61,11 @@ class AppSettings:
     ai_image_output_format: str = "png"
     ai_pixel_output_size: str = "auto"
     aseprite_cli_path: str = ""
+    pixel_refiner_service_url: str = ""
+    pixel_refiner_model_dir: str = ""
+    pixel_refiner_model_id: str = DEFAULT_PIXEL_REFINER_MODEL_ID
+    pixel_refiner_strength: float = DEFAULT_PIXEL_REFINER_STRENGTH
+    pixel_refiner_candidates: int = DEFAULT_PIXEL_REFINER_CANDIDATES
     recent_projects: list[str] = field(default_factory=list)
     welcome_layout: dict[str, dict[str, float]] = field(default_factory=dict)
     welcome_recent_layouts: dict[str, dict[str, float]] = field(default_factory=dict)
@@ -86,6 +99,22 @@ class AppSettings:
             "ai_image_output_format": self.ai_image_output_format,
             "ai_pixel_output_size": normalized_pixel_output_size(self.ai_pixel_output_size),
             "aseprite_cli_path": str(self.aseprite_cli_path or "").strip(),
+            "pixel_refiner_service_url": normalize_pixel_refiner_service_url(self.pixel_refiner_service_url),
+            "pixel_refiner_model_dir": str(self.pixel_refiner_model_dir or "").strip(),
+            "pixel_refiner_model_id": str(self.pixel_refiner_model_id or DEFAULT_PIXEL_REFINER_MODEL_ID).strip()
+            or DEFAULT_PIXEL_REFINER_MODEL_ID,
+            "pixel_refiner_strength": _coerce_float(
+                self.pixel_refiner_strength,
+                0.0,
+                1.0,
+                DEFAULT_PIXEL_REFINER_STRENGTH,
+            ),
+            "pixel_refiner_candidates": _coerce_int(
+                self.pixel_refiner_candidates,
+                1,
+                8,
+                DEFAULT_PIXEL_REFINER_CANDIDATES,
+            ),
             "recent_projects": self.recent_projects,
             "welcome_layout": self.welcome_layout,
             "welcome_recent_layouts": self.welcome_recent_layouts,
@@ -143,6 +172,21 @@ class AppSettings:
             ai_image_output_format=_coerce_string_choice(raw.get("ai_image_output_format"), {"png", "webp", "jpeg"}, "png"),
             ai_pixel_output_size=normalized_pixel_output_size(raw.get("ai_pixel_output_size")),
             aseprite_cli_path=str(raw.get("aseprite_cli_path", "") or "").strip(),
+            pixel_refiner_service_url=normalize_pixel_refiner_service_url(raw.get("pixel_refiner_service_url")),
+            pixel_refiner_model_dir=str(raw.get("pixel_refiner_model_dir", "") or "").strip(),
+            pixel_refiner_model_id=str(raw.get("pixel_refiner_model_id", DEFAULT_PIXEL_REFINER_MODEL_ID) or DEFAULT_PIXEL_REFINER_MODEL_ID).strip(),
+            pixel_refiner_strength=_coerce_float(
+                raw.get("pixel_refiner_strength"),
+                0.0,
+                1.0,
+                DEFAULT_PIXEL_REFINER_STRENGTH,
+            ),
+            pixel_refiner_candidates=_coerce_int(
+                raw.get("pixel_refiner_candidates"),
+                1,
+                8,
+                DEFAULT_PIXEL_REFINER_CANDIDATES,
+            ),
             recent_projects=[str(item) for item in recent if item],
             welcome_layout=_coerce_layout_map(raw.get("welcome_layout")),
             welcome_recent_layouts=_coerce_layout_map(raw.get("welcome_recent_layouts")),
@@ -152,14 +196,11 @@ class AppSettings:
 
 
 def app_data_dir() -> Path:
-    base = os.getenv("APPDATA")
-    if base:
-        return Path(base) / APP_NAME
-    return Path.home() / f".{APP_NAME.lower()}"
+    return game_designer_config_dir()
 
 
 def default_workspace_dir() -> Path:
-    return Path.home() / "Documents" / APP_NAME
+    return game_designer_workspace_dir()
 
 
 def settings_path() -> Path:
@@ -175,6 +216,8 @@ def load_settings() -> AppSettings:
     if raw is None:
         raw = _read_settings_dict(settings_backup_path())
     if raw is None:
+        raw = _read_legacy_settings_dict()
+    if raw is None:
         return _default_settings()
     settings = AppSettings.from_dict(raw)
     if not settings.workspace_dir:
@@ -185,13 +228,86 @@ def load_settings() -> AppSettings:
         settings.theme = "dark"
     if settings.last_edge_style not in EDGE_STYLES:
         settings.last_edge_style = "curve"
+    _normalize_pixel_refiner_settings(settings)
     settings.recent_projects = _dedupe_existing(settings.recent_projects)
     return settings
 
 
 def _default_settings() -> AppSettings:
     workspace = default_workspace_dir()
-    return AppSettings(workspace_dir=str(workspace), export_dir=str(workspace / "exports"))
+    return AppSettings(
+        workspace_dir=str(workspace),
+        export_dir=str(workspace / "exports"),
+        pixel_refiner_model_dir=str(default_pixel_refiner_model_dir()),
+    )
+
+
+def _normalize_pixel_refiner_settings(settings: AppSettings) -> None:
+    raw_model_id = str(settings.pixel_refiner_model_id or "").strip()
+    raw_model_dir = str(settings.pixel_refiner_model_dir or "").strip()
+    if not raw_model_id:
+        raw_model_id = DEFAULT_PIXEL_REFINER_MODEL_ID
+
+    legacy_dir = _is_legacy_pixel_refiner_model_dir(raw_model_dir)
+    if legacy_dir and raw_model_id == "pixel-refiner-v1":
+        raw_model_id = DEFAULT_PIXEL_REFINER_MODEL_ID
+    settings.pixel_refiner_model_id = raw_model_id
+
+    if not raw_model_dir or legacy_dir:
+        settings.pixel_refiner_model_dir = str(pixel_refiner_model_dir(raw_model_id))
+
+
+def _is_legacy_pixel_refiner_model_dir(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    path = Path(text).expanduser()
+    legacy_roots = [
+        game_designer_data_root() / "models",
+        Path(os.getenv("LOCALAPPDATA") or "") / APP_NAME / "models",
+        Path(os.getenv("APPDATA") or "") / APP_NAME / "models",
+    ]
+    for root in legacy_roots:
+        if _path_is_relative_to(path, root):
+            return True
+    lowered = str(path).replace("/", "\\").casefold()
+    return "\\appdata\\local\\gamedesigner\\models\\" in lowered
+
+
+def _path_is_relative_to(path: Path, root: Path) -> bool:
+    if not str(root):
+        return False
+    try:
+        path.resolve(strict=False).relative_to(root.resolve(strict=False))
+        return True
+    except ValueError:
+        return False
+
+
+def migrate_legacy_user_data() -> dict[str, str]:
+    status: dict[str, str] = {}
+
+    for name in (SETTINGS_FILE, SETTINGS_BACKUP_FILE):
+        src = _legacy_settings_dir() / name
+        dst = app_data_dir() / name
+        if src.exists() and src.resolve() != dst.resolve() and not dst.exists():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            status[name] = str(dst)
+
+    legacy_pixel_refiner = Path(os.getenv("LOCALAPPDATA") or os.getenv("APPDATA") or "") / APP_NAME / "pixel_refiner"
+    new_pixel_refiner = game_designer_data_root() / "pixel_refiner"
+    if legacy_pixel_refiner.exists() and legacy_pixel_refiner.resolve() != new_pixel_refiner.resolve():
+        _move_directory_contents(legacy_pixel_refiner, new_pixel_refiner)
+        status["pixel_refiner"] = str(new_pixel_refiner)
+
+    legacy_workspace = Path.home() / "Documents" / APP_NAME
+    new_workspace = default_workspace_dir()
+    if legacy_workspace.exists() and legacy_workspace.resolve() != new_workspace.resolve():
+        _move_directory_contents(legacy_workspace, new_workspace)
+        status["workspace"] = str(new_workspace)
+
+    return status
 
 
 def _read_settings_dict(path: Path) -> dict[str, Any] | None:
@@ -203,6 +319,50 @@ def _read_settings_dict(path: Path) -> dict[str, Any] | None:
     except (OSError, json.JSONDecodeError):
         return None
     return raw if isinstance(raw, dict) else None
+
+
+def _legacy_settings_dir() -> Path:
+    base = os.getenv("APPDATA")
+    if base:
+        return Path(base) / APP_NAME
+    return Path.home() / f".{APP_NAME.lower()}"
+
+
+def _legacy_settings_path() -> Path:
+    return _legacy_settings_dir() / SETTINGS_FILE
+
+
+def _legacy_settings_backup_path() -> Path:
+    return _legacy_settings_dir() / SETTINGS_BACKUP_FILE
+
+
+def _read_legacy_settings_dict() -> dict[str, Any] | None:
+    raw = _read_settings_dict(_legacy_settings_path())
+    if raw is not None:
+        return raw
+    return _read_settings_dict(_legacy_settings_backup_path())
+
+
+def _move_directory_contents(source: Path, destination: Path) -> None:
+    if not source.exists():
+        return
+    destination.mkdir(parents=True, exist_ok=True)
+    for child in list(source.iterdir()):
+        target = destination / child.name
+        if child.is_dir():
+            _move_directory_contents(child, target)
+            try:
+                child.rmdir()
+            except OSError:
+                pass
+            continue
+        if target.exists():
+            continue
+        shutil.move(str(child), str(target))
+    try:
+        source.rmdir()
+    except OSError:
+        pass
 
 
 def _dedupe_existing(paths: list[str]) -> list[str]:
@@ -254,6 +414,14 @@ def _coerce_string_choice(raw: Any, choices: set[str], fallback: str) -> str:
 def _coerce_int(raw: Any, minimum: int, maximum: int, fallback: int) -> int:
     try:
         value = int(raw)
+    except (TypeError, ValueError):
+        return fallback
+    return min(maximum, max(minimum, value))
+
+
+def _coerce_float(raw: Any, minimum: float, maximum: float, fallback: float) -> float:
+    try:
+        value = float(raw)
     except (TypeError, ValueError):
         return fallback
     return min(maximum, max(minimum, value))

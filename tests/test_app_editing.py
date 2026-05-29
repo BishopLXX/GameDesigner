@@ -52,7 +52,13 @@ class AppEditingTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self._appdata_temp = tempfile.TemporaryDirectory()
-        self._appdata_patch = mock.patch.dict(os.environ, {"APPDATA": self._appdata_temp.name})
+        self._appdata_patch = mock.patch.dict(
+            os.environ,
+            {
+                "APPDATA": self._appdata_temp.name,
+                "GAMEDESIGNER_DATA_DIR": str(Path(self._appdata_temp.name) / "GameDesignerData"),
+            },
+        )
         self._appdata_patch.start()
 
     def tearDown(self) -> None:
@@ -281,6 +287,11 @@ class AppEditingTests(unittest.TestCase):
                 dialog.model_combo.setEditText("custom-image")
                 dialog.api_key_edit.setText("image-secret")
                 dialog.base_url_edit.setText("https://images.example.test/v1")
+                dialog.pixel_refiner_url_edit.setText("127.0.0.1:9001")
+                dialog.pixel_refiner_model_dir_edit.setText(str(Path(folder) / "models" / "pixel-refiner-v1"))
+                dialog.pixel_refiner_model_id_edit.setText("pixel-refiner-test")
+                dialog.pixel_refiner_strength_spin.setValue(0.75)
+                dialog.pixel_refiner_candidates_spin.setValue(3)
                 dialog.output_format_combo.setCurrentText("webp")
 
                 dialog._save()
@@ -290,8 +301,13 @@ class AppEditingTests(unittest.TestCase):
                 self.assertEqual(settings.ai_image_api_key, "image-secret")
                 self.assertEqual(settings.ai_image_base_url, "https://images.example.test/v1")
                 self.assertEqual(settings.ai_image_output_format, "webp")
+                self.assertEqual(settings.pixel_refiner_service_url, "http://127.0.0.1:9001")
+                self.assertEqual(settings.pixel_refiner_model_id, "pixel-refiner-test")
+                self.assertEqual(settings.pixel_refiner_strength, 0.75)
+                self.assertEqual(settings.pixel_refiner_candidates, 3)
                 loaded = load_settings()
                 self.assertEqual(loaded.ai_image_model, "custom-image")
+                self.assertEqual(loaded.pixel_refiner_service_url, "http://127.0.0.1:9001")
                 dialog.deleteLater()
 
     def test_ai_image_panel_shows_chinese_background_labels(self) -> None:
@@ -479,6 +495,54 @@ class AppEditingTests(unittest.TestCase):
             self.assertEqual(panel.output_list.count(), 6)
             self.assertEqual(len(panel.cached_images), 6)
             self.assertEqual(panel._current_image_path.parent.name, "8x8")
+            panel.deleteLater()
+
+    def test_ai_image_panel_refines_pixel_output_through_local_service(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "PixelRefinerPanel.gdc"
+            settings = AppSettings(
+                workspace_dir=folder,
+                export_dir=str(Path(folder) / "exports"),
+                ai_pixel_output_size="8x8",
+                pixel_refiner_service_url="http://127.0.0.1:9999",
+                pixel_refiner_model_dir=str(Path(folder) / "models" / "pixel-refiner-v1"),
+                pixel_refiner_model_id="pixel-refiner-test",
+                pixel_refiner_strength=0.7,
+                pixel_refiner_candidates=2,
+            )
+            source_path = Path(folder) / "source.png"
+            image = QImage(16, 16, QImage.Format_ARGB32)
+            image.fill(0xFF7848CC)
+            image.save(str(source_path), "PNG")
+            refined_path = Path(folder) / "refined.png"
+            refined = QImage(8, 8, QImage.Format_ARGB32)
+            refined.fill(0xFF224488)
+            refined.save(str(refined_path), "PNG")
+            context_provider = lambda: ("ctx", Path(folder), project_path)
+            panel = AiImagePanel(None, settings, context_provider)
+            panel.bind_canvas("像素生图", "out", "pixel-canvas", True)
+            panel.cached_images = [CachedAiImage(source_path, 16, 16)]
+            panel._add_output_item(panel.cached_images[0])
+            item = panel.output_list.currentItem()
+
+            with mock.patch("gamedesigner.ui.ai_image_panel.generate_pixel_refiner_candidates") as refine:
+                refine.return_value = [
+                    mock.Mock(
+                        image=CachedAiImage(refined_path, 8, 8),
+                        label="AI 像素修正 1",
+                        method="pixel_refiner_1",
+                    )
+                ]
+                panel._refine_pixel_output(item)
+
+            refine.assert_called_once()
+            self.assertEqual(refine.call_args.kwargs["service_url"], "http://127.0.0.1:9999")
+            self.assertEqual(refine.call_args.kwargs["model_id"], "pixel-refiner-test")
+            self.assertEqual(refine.call_args.kwargs["strength"], 0.7)
+            self.assertEqual(refine.call_args.kwargs["candidates"], 2)
+            self.assertEqual(panel.output_list.count(), 2)
+            self.assertEqual(len(panel.cached_images), 2)
+            self.assertEqual(panel._current_image_path, refined_path)
             panel.deleteLater()
 
     def test_ai_image_panel_redraws_selected_pixel_candidate_as_reference(self) -> None:
