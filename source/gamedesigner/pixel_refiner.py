@@ -13,9 +13,16 @@ from .paths import pixel_refiner_model_dir
 
 
 DEFAULT_PIXEL_REFINER_SERVICE_URL = "http://127.0.0.1:8765"
-DEFAULT_PIXEL_REFINER_MODEL_ID = "pixel-refiner-v2"
+DEFAULT_PIXEL_REFINER_MODEL_ID = "pixel-refiner-v4"
 DEFAULT_PIXEL_REFINER_STRENGTH = 0.45
 DEFAULT_PIXEL_REFINER_CANDIDATES = 4
+PIXEL_REFINER_AUTO_MODEL_ID = "auto"
+KNOWN_PIXEL_REFINER_MODEL_IDS = {
+    "pixel-refiner-v1",
+    "pixel-refiner-v2",
+    "pixel-refiner-v3",
+    "pixel-refiner-v4",
+}
 PIXEL_REFINER_HEALTH_PATH = "/v1/health"
 PIXEL_REFINER_REFINE_PATH = "/v1/pixel/refine"
 PIXEL_REFINER_MANIFEST_FILE = "model_manifest.json"
@@ -132,6 +139,31 @@ def refine_pixel_art_with_service(
     endpoint = _join_url(normalize_pixel_refiner_service_url(service_url), PIXEL_REFINER_REFINE_PATH)
     response = _post_json(endpoint, payload, timeout=timeout)
     return _parse_refine_response(response, output_dir)
+
+
+def resolve_pixel_refiner_service_model(
+    service_url: str | None = None,
+    *,
+    requested_model_id: str = "",
+    requested_model_dir: str | Path | None = None,
+    timeout: int = 2,
+) -> tuple[str, Path | None]:
+    """Prefer the model that the running local service reports for built-in refiner ids."""
+    raw_model_id = str(requested_model_id or "").strip()
+    model_dir = Path(requested_model_dir) if str(requested_model_dir or "").strip() else None
+    if raw_model_id and raw_model_id not in KNOWN_PIXEL_REFINER_MODEL_IDS and raw_model_id != PIXEL_REFINER_AUTO_MODEL_ID:
+        return raw_model_id, model_dir
+
+    health = check_pixel_refiner_service(service_url, timeout=max(1, int(timeout)))
+    if isinstance(health, dict) and health.get("ok"):
+        service_model_id = str(health.get("model") or "").strip()
+        service_model_dir = str(health.get("model_dir") or "").strip()
+        if service_model_id.startswith("pixel-refiner-"):
+            return service_model_id, Path(service_model_dir) if service_model_dir else model_dir
+
+    if raw_model_id and raw_model_id != PIXEL_REFINER_AUTO_MODEL_ID:
+        return raw_model_id, model_dir
+    return DEFAULT_PIXEL_REFINER_MODEL_ID, model_dir or default_pixel_refiner_model_dir()
 
 
 def check_pixel_refiner_service(

@@ -5,6 +5,7 @@ import hashlib
 import json
 import shutil
 import uuid
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -471,6 +472,8 @@ def summarize_dataset() -> dict[str, Any]:
     input_count = generated_input_count + external_input_count
     pair_count = len(records)
     categories = sorted({record.category for record in records if record.category})
+    input_kind_counts = Counter(record.input_kind or "unknown" for record in records)
+    category_counts = Counter(record.category or "unknown" for record in records)
     return {
         "dataset_dir": str(dataset_dir()),
         "dataset_id": PIXEL_REFINER_DATASET_VERSION,
@@ -480,6 +483,9 @@ def summarize_dataset() -> dict[str, Any]:
         "generated_inputs": generated_input_count,
         "external_inputs": external_input_count,
         "pairs": pair_count,
+        "software_candidate": input_kind_counts.get(PIXEL_REFINER_SOFTWARE_INPUT_KIND, 0),
+        "input_kinds": dict(sorted(input_kind_counts.items())),
+        "category_counts": dict(sorted(category_counts.items())),
         "categories": categories,
         "source_records": len(load_source_records()),
     }

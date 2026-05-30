@@ -11,6 +11,7 @@ from gamedesigner.pixel_site_downloader import (
     export_target_pngs,
     ImageInfo,
     inspect_image,
+    is_same_host_page_url,
     raw_path_for_url,
 )
 
@@ -30,6 +31,20 @@ class PixelSiteDownloaderTests(unittest.TestCase):
         self.assertEqual(len(images), 2)
         self.assertTrue(all("/p/n/d/pndsndn/" in item for item in images))
         self.assertEqual(entries, ["http://pndsndn.blog79.fc2.com/blog-entry-207.html"])
+
+    def test_generic_page_crawler_accepts_same_host_pages_but_not_images(self) -> None:
+        html = """
+        <a href="https://artist.example.test/gallery">gallery</a>
+        <a href="https://artist.example.test/gallery?page=2">paged</a>
+        <a href="https://cdn.artist.example.test/hero.png">image</a>
+        <a href="https://other.example.test/page">other</a>
+        """
+
+        entries = extract_entry_urls(html, "https://artist.example.test/", page_host="artist.example.test", generic_pages=True)
+
+        self.assertEqual(entries, ["https://artist.example.test/gallery", "https://artist.example.test/gallery?page=2"])
+        self.assertTrue(is_same_host_page_url("https://artist.example.test/gallery", page_host="artist.example.test"))
+        self.assertFalse(is_same_host_page_url("https://artist.example.test/hero.png", page_host="artist.example.test"))
 
     def test_candidate_prefers_large_transparent_character_images(self) -> None:
         accepted = decide_candidate(

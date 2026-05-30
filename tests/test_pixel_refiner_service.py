@@ -216,7 +216,7 @@ class PixelRefinerServiceTests(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(Exception, "模型权重文件不存在"):
-                load_model_manifest(model_dir)
+                load_model_manifest(model_dir, expected_id="pixel-refiner-v2")
 
     def test_service_refine_uses_backend_and_returns_output_paths(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -252,7 +252,7 @@ class PixelRefinerServiceTests(unittest.TestCase):
 
             fake_backend = FakeBackend()
             with mock.patch("pixel_refiner_service.server.build_backend", return_value=fake_backend):
-                service = PixelRefinerService(model_dir)
+                service = PixelRefinerService(model_dir, model_id="pixel-refiner-v2")
 
             response = service.refine(
                 {

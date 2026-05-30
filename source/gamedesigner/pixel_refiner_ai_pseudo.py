@@ -45,6 +45,10 @@ def generate_ai_pseudo_pairs(
     workers: int = 4,
     skip_existing: bool = True,
     dry_run: bool = False,
+    min_width: int = 0,
+    min_height: int = 0,
+    max_width: int = 0,
+    max_height: int = 0,
     settings: AppSettings | None = None,
     generator: AiImageGenerator = generate_ai_images,
 ) -> dict[str, Any]:
@@ -61,6 +65,10 @@ def generate_ai_pseudo_pairs(
         skip_existing=skip_existing,
         variants_per_target=variants_per_target,
         existing_counts=existing_counts,
+        min_width=min_width,
+        min_height=min_height,
+        max_width=max_width,
+        max_height=max_height,
     )
     stats: dict[str, Any] = {
         "target_root": str(root),
@@ -72,6 +80,12 @@ def generate_ai_pseudo_pairs(
         "pairs_created": 0,
         "pairs_skipped_existing": 0,
         "dry_run": dry_run,
+        "size_filter": {
+            "min_width": max(0, int(min_width)),
+            "min_height": max(0, int(min_height)),
+            "max_width": max(0, int(max_width)),
+            "max_height": max(0, int(max_height)),
+        },
         "target_paths": [str(path) for path in selected[:50]],
         "errors": [],
     }
@@ -196,6 +210,10 @@ def select_target_paths(
     skip_existing: bool = True,
     variants_per_target: int = 1,
     existing_counts: dict[str, int] | None = None,
+    min_width: int = 0,
+    min_height: int = 0,
+    max_width: int = 0,
+    max_height: int = 0,
 ) -> list[Path]:
     root = Path(target_root)
     paths = sorted(path for path in root.rglob("*.png") if path.is_file())
@@ -206,6 +224,14 @@ def select_target_paths(
         if source_id and inferred_source_id != source_id:
             continue
         if category and inferred_category != category:
+            continue
+        if not _matches_size_filter(
+            path,
+            min_width=min_width,
+            min_height=min_height,
+            max_width=max_width,
+            max_height=max_height,
+        ):
             continue
         target_sha = sha256_file(path)
         existing_count = counts.get(target_sha, 0)
@@ -229,6 +255,29 @@ def count_existing_ai_pseudo_pairs(target_path: str | Path) -> int:
         1
         for record in load_pair_records()
         if record.target_sha256 == target_sha and record.input_kind == AI_PSEUDO_INPUT_KIND
+    )
+
+
+def _matches_size_filter(
+    path: Path,
+    *,
+    min_width: int,
+    min_height: int,
+    max_width: int,
+    max_height: int,
+) -> bool:
+    if min_width <= 0 and min_height <= 0 and max_width <= 0 and max_height <= 0:
+        return True
+    try:
+        with Image.open(path) as loaded:
+            width, height = loaded.size
+    except Exception:
+        return False
+    return (
+        (min_width <= 0 or width >= min_width)
+        and (min_height <= 0 or height >= min_height)
+        and (max_width <= 0 or width <= max_width)
+        and (max_height <= 0 or height <= max_height)
     )
 
 

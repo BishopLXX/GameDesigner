@@ -20,8 +20,17 @@ from gamedesigner.pixel_refiner_dataset import (
     load_pair_records,
     load_source_records,
     summarize_dataset,
+    targets_dir,
 )
 from gamedesigner.pixel_refiner_pair_generation import build_pairs_from_targets, generate_training_inputs_from_target
+from gamedesigner.pixel_refiner_character_crops import CharacterCropConfig, extract_character_crops
+from gamedesigner.pixel_refiner_patch_expansion import PatchExpansionConfig, expand_target_patches
+from gamedesigner.pixel_refiner_authorized_import import (
+    AuthorizedImportConfig,
+    AuthorizedSiteCrawlConfig,
+    crawl_authorized_site,
+    import_authorized_targets,
+)
 
 
 class PixelRefinerDatasetTests(unittest.TestCase):
@@ -92,6 +101,8 @@ class PixelRefinerDatasetTests(unittest.TestCase):
                 self.assertEqual(len(load_pair_records()), 1)
                 summary = summarize_dataset()
                 self.assertEqual(summary["pairs"], 1)
+                self.assertEqual(summary["software_candidate"], 1)
+                self.assertEqual(summary["input_kinds"]["software_candidate"], 1)
                 self.assertGreaterEqual(summary["targets"], 1)
                 self.assertGreaterEqual(summary["inputs"], 1)
 
@@ -189,6 +200,131 @@ class PixelRefinerDatasetTests(unittest.TestCase):
                 self.assertEqual(second["pairs_created"], 0)
                 self.assertEqual(summary["pairs"], 5)
                 self.assertEqual(summary["generated_inputs"], 5)
+
+    def test_import_authorized_targets_classifies_and_builds_pairs(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            with self._isolated_app_env(folder):
+                source_dir = Path(folder) / "authorized"
+                source_dir.mkdir()
+                tall = source_dir / "portrait.png"
+                wide = source_dir / "run.png"
+                small = source_dir / "tiny.png"
+                Image.new("RGBA", (128, 256), (90, 60, 180, 255)).save(tall)
+                Image.new("RGBA", (256, 96), (120, 80, 200, 255)).save(wide)
+                Image.new("RGBA", (16, 16), (120, 80, 200, 255)).save(small)
+
+                stats = import_authorized_targets(
+                    AuthorizedImportConfig(
+                        input_dir=source_dir,
+                        source_id="authorized_artist",
+                        title="Authorized Artist Pack",
+                        author="Artist",
+                        url="local://authorized",
+                        rights_basis="Local folder provided by rights holder for training.",
+                        build_pairs=True,
+                    )
+                )
+
+                self.assertEqual(stats["targets_imported"], 2)
+                self.assertEqual(stats["rejected"], 1)
+                self.assertEqual(stats["build_pairs"]["inputs_generated"], 10)
+                self.assertGreater(stats["build_pairs"]["pairs_created"], 0)
+                self.assertTrue((targets_dir() / "authorized_artist" / "character_portrait").exists())
+                self.assertTrue((targets_dir() / "authorized_artist" / "side_scroller_action_character").exists())
+                summary = summarize_dataset()
+                self.assertEqual(summary["targets"], 2)
+                self.assertEqual(summary["pairs"], stats["build_pairs"]["pairs_created"])
+
+    def test_expand_target_patches_builds_overlapping_patch_pairs(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            with self._isolated_app_env(folder):
+                source_root = targets_dir() / "demo_source"
+                target_path = source_root / "character_portrait" / "hero.png"
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                image = Image.new("RGBA", (128, 128), (0, 0, 0, 0))
+                for x in range(16, 112):
+                    for y in range(16, 112):
+                        image.putpixel((x, y), (x % 255, y % 255, 180, 255))
+                image.save(target_path)
+
+                stats = expand_target_patches(
+                    PatchExpansionConfig(
+                        source_root=source_root,
+                        output_source_id="demo_source_patch64",
+                        patch_size=64,
+                        overlap=32,
+                        max_patches=4,
+                        max_patches_per_image=4,
+                        build_pairs=True,
+                    )
+                )
+
+                self.assertEqual(stats["patches_created"], 4)
+                self.assertEqual(stats["build_pairs"]["targets_matched"], 4)
+                self.assertEqual(stats["build_pairs"]["inputs_generated"], 20)
+                self.assertGreaterEqual(stats["build_pairs"]["pairs_created"], 16)
+                self.assertEqual(summarize_dataset()["pairs"], stats["build_pairs"]["pairs_created"])
+                self.assertTrue((targets_dir() / "demo_source_patch64" / "character_portrait").exists())
+
+    def test_extract_character_crops_splits_sprite_sheet_components(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            with self._isolated_app_env(folder):
+                source_root = targets_dir() / "demo_source"
+                target_path = source_root / "character_sprite" / "sheet.png"
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                image = Image.new("RGBA", (220, 96), (0, 0, 0, 0))
+                for offset, color in ((18, (220, 80, 100, 255)), (124, (80, 180, 220, 255))):
+                    for x in range(offset, offset + 52):
+                        for y in range(18, 78):
+                            image.putpixel((x, y), color)
+                image.save(target_path)
+
+                stats = extract_character_crops(
+                    CharacterCropConfig(
+                        source_root=source_root,
+                        output_source_id="demo_source_single_crops",
+                        min_width=40,
+                        min_height=40,
+                        min_area=500,
+                        max_crops=10,
+                        build_pairs=True,
+                    )
+                )
+
+                self.assertEqual(stats["crops_created"], 2)
+                self.assertEqual(stats["build_pairs"]["targets_matched"], 2)
+                self.assertEqual(stats["build_pairs"]["inputs_generated"], 10)
+                self.assertGreaterEqual(stats["build_pairs"]["pairs_created"], 2)
+                self.assertTrue((targets_dir() / "demo_source_single_crops" / "character_sprite").exists())
+
+    def test_crawl_authorized_site_dry_run_discovers_public_images(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            with self._isolated_app_env(folder):
+                with mock.patch(
+                    "gamedesigner.pixel_refiner_authorized_import.crawl_site",
+                    return_value={
+                        "image_pages": {
+                            "https://cdn.example.test/hero.png": {"https://artist.example.test/gallery"},
+                            "https://cdn.example.test/run.gif": {"https://artist.example.test/gallery"},
+                        },
+                        "page_records": [{"url": "https://artist.example.test/gallery", "status": "ok"}],
+                    },
+                ) as crawl:
+                    stats = crawl_authorized_site(
+                        AuthorizedSiteCrawlConfig(
+                            start_urls=("https://artist.example.test/gallery",),
+                            source_id="artist_site",
+                            rights_basis="Owned platform authorized for training.",
+                            dry_run=True,
+                        )
+                    )
+
+                self.assertTrue(stats["ok"])
+                self.assertEqual(stats["page_host"], "artist.example.test")
+                self.assertEqual(stats["pages"], 1)
+                self.assertEqual(stats["discovered_images"], 2)
+                self.assertIn("https://cdn.example.test/hero.png", stats["first_images"])
+                crawl.assert_called_once()
 
 
 if __name__ == "__main__":

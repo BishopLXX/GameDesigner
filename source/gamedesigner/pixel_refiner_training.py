@@ -19,6 +19,7 @@ MODEL_ID = "pixel-refiner-v1"
 V2_MODEL_ID = "pixel-refiner-v2"
 V3_MODEL_ID = "pixel-refiner-v3"
 V4_MODEL_ID = "pixel-refiner-v4"
+V41_MODEL_ID = "pixel-refiner-v4.1-real-failures"
 MODEL_VERSION = "0.1.0"
 MODEL_FILENAME = "pixel_refiner_v1.onnx"
 V2_MODEL_FILENAME = "pixel_refiner_v2.onnx"
@@ -33,6 +34,8 @@ INPUT_KIND_SAMPLE_WEIGHTS = {
     "lost_detail": 1.0,
     "dirty_outline": 1.0,
 }
+V41_SOFTWARE_CANDIDATE_WEIGHT = 32.0
+V41_AI_PSEUDO_WEIGHT = 16.0
 CATEGORY_SAMPLE_WEIGHTS = {
     "character_portrait": 2.0,
     "character_sprite": 1.5,
@@ -68,6 +71,8 @@ class PixelRefinerTrainConfig:
     block_consistency_weight: float = 0.0
     edge_loss_weight: float = 0.25
     anti_blur_weight: float = 0.0
+    software_candidate_weight: float = INPUT_KIND_SAMPLE_WEIGHTS["software_candidate"]
+    ai_pseudo_weight: float = INPUT_KIND_SAMPLE_WEIGHTS["ai_pseudo"]
     grad_clip: float = 1.0
     event_log_path: Path | None = None
 
@@ -114,6 +119,10 @@ def train_pixel_refiner(config: PixelRefinerTrainConfig) -> dict[str, Any]:
             "patch_size": config.patch_size,
             "model_input_size": _model_input_patch_size(config),
             "internal_scale": config.internal_scale,
+            "sample_weights": {
+                "input_kind": _input_kind_sample_weights(config),
+                "category": CATEGORY_SAMPLE_WEIGHTS,
+            },
         },
         config,
     )
@@ -126,6 +135,8 @@ def train_pixel_refiner(config: PixelRefinerTrainConfig) -> dict[str, Any]:
             length=max(1, config.steps_per_epoch * config.batch_size),
             seed=config.seed + epoch,
             weighted=True,
+            input_kind_weights=_input_kind_sample_weights(config),
+            category_weights=CATEGORY_SAMPLE_WEIGHTS,
         )
         train_loader = DataLoader(
             train_dataset,
@@ -220,6 +231,8 @@ class PairPatchDataset:
         length: int,
         seed: int,
         weighted: bool,
+        input_kind_weights: dict[str, float] | None = None,
+        category_weights: dict[str, float] | None = None,
     ) -> None:
         self.records = list(records)
         self.patch_size = int(patch_size)
@@ -227,7 +240,9 @@ class PairPatchDataset:
         self.length = int(length)
         self.seed = int(seed)
         self.weighted = bool(weighted)
-        self.weights = [_sample_weight(record) for record in self.records]
+        self.input_kind_weights = dict(input_kind_weights or INPUT_KIND_SAMPLE_WEIGHTS)
+        self.category_weights = dict(category_weights or CATEGORY_SAMPLE_WEIGHTS)
+        self.weights = [_sample_weight(record, self.input_kind_weights, self.category_weights) for record in self.records]
 
     def __len__(self) -> int:
         return self.length
@@ -327,7 +342,7 @@ def write_model_manifest(
         "anti_blur_weight": max(0.0, float(config.anti_blur_weight)),
         "grad_clip": max(0.0, float(config.grad_clip)),
         "sample_weights": {
-            "input_kind": INPUT_KIND_SAMPLE_WEIGHTS,
+            "input_kind": _input_kind_sample_weights(config),
             "category": CATEGORY_SAMPLE_WEIGHTS,
         },
         "last_val_loss": training_log[-1]["val_loss"] if training_log else None,
@@ -353,9 +368,22 @@ def _training_records(config: PixelRefinerTrainConfig) -> list[PixelRefinerPairR
     return records
 
 
-def _sample_weight(record: PixelRefinerPairRecord) -> float:
-    input_weight = INPUT_KIND_SAMPLE_WEIGHTS.get(record.input_kind, 1.0)
-    category_weight = CATEGORY_SAMPLE_WEIGHTS.get(record.category, 1.0)
+def _input_kind_sample_weights(config: PixelRefinerTrainConfig) -> dict[str, float]:
+    weights = dict(INPUT_KIND_SAMPLE_WEIGHTS)
+    weights["software_candidate"] = max(0.0, float(config.software_candidate_weight))
+    weights["ai_pseudo"] = max(0.0, float(config.ai_pseudo_weight))
+    return weights
+
+
+def _sample_weight(
+    record: PixelRefinerPairRecord,
+    input_kind_weights: dict[str, float] | None = None,
+    category_weights: dict[str, float] | None = None,
+) -> float:
+    input_weights = input_kind_weights or INPUT_KIND_SAMPLE_WEIGHTS
+    category_weight_map = category_weights or CATEGORY_SAMPLE_WEIGHTS
+    input_weight = input_weights.get(record.input_kind, 1.0)
+    category_weight = category_weight_map.get(record.category, 1.0)
     return float(input_weight * category_weight)
 
 
@@ -498,7 +526,7 @@ def build_training_model(config: PixelRefinerTrainConfig) -> Any:
 
 
 def _is_v2(config: PixelRefinerTrainConfig) -> bool:
-    return config.model_id in {V2_MODEL_ID, V3_MODEL_ID, V4_MODEL_ID} or config.architecture in {
+    return config.model_id in {V2_MODEL_ID, V3_MODEL_ID, V4_MODEL_ID} or config.model_id.startswith("pixel-refiner-v4") or config.architecture in {
         "unet-naf-v2",
         "v2",
         "pixel-tile-v3",
@@ -513,7 +541,7 @@ def _is_v3(config: PixelRefinerTrainConfig) -> bool:
 
 
 def _is_v4(config: PixelRefinerTrainConfig) -> bool:
-    return config.model_id == V4_MODEL_ID or config.architecture in {"pixel-hard-v4", "v4"}
+    return config.model_id.startswith("pixel-refiner-v4") or config.architecture in {"pixel-hard-v4", "v4"}
 
 
 def _uses_tiled_inference(config: PixelRefinerTrainConfig) -> bool:
@@ -523,6 +551,8 @@ def _uses_tiled_inference(config: PixelRefinerTrainConfig) -> bool:
 def _model_filename(model_id: str) -> str:
     if model_id == V4_MODEL_ID:
         return V4_MODEL_FILENAME
+    if model_id.startswith("pixel-refiner-v4"):
+        return f"{_safe_model_file_stem(model_id)}.onnx"
     if model_id == V3_MODEL_ID:
         return V3_MODEL_FILENAME
     return V2_MODEL_FILENAME if model_id == V2_MODEL_ID else MODEL_FILENAME
@@ -533,6 +563,11 @@ def _safe_model_file_stem(model_id: str) -> str:
 
 
 def _manifest_notes(config: PixelRefinerTrainConfig) -> str:
+    if config.model_id == V41_MODEL_ID:
+        return (
+            "Pixel Refiner v4.1 real-failures: v4 hard-pixel tile refiner tuned to over-sample real "
+            "GameDesigner software_candidate and ai_pseudo failure pairs before synthetic degradation pairs."
+        )
     if _is_v4(config):
         return (
             "Pixel Refiner v4 gold: NAF/U-Net tile refiner trained on high-quality character pixel art, "
@@ -586,10 +621,12 @@ def _config_to_json(config: PixelRefinerTrainConfig) -> dict[str, Any]:
         "block_consistency_weight": config.block_consistency_weight,
         "edge_loss_weight": config.edge_loss_weight,
         "anti_blur_weight": config.anti_blur_weight,
+        "software_candidate_weight": config.software_candidate_weight,
+        "ai_pseudo_weight": config.ai_pseudo_weight,
         "grad_clip": config.grad_clip,
         "event_log_path": str(config.event_log_path) if config.event_log_path else "",
         "sample_weights": {
-            "input_kind": INPUT_KIND_SAMPLE_WEIGHTS,
+            "input_kind": _input_kind_sample_weights(config),
             "category": CATEGORY_SAMPLE_WEIGHTS,
         },
     }

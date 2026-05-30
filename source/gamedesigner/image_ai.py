@@ -6,9 +6,11 @@ import json
 import math
 import mimetypes
 import os
+import re
 import shutil
 import subprocess
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -42,6 +44,7 @@ from .pixel_refiner import (
     PixelRefinerRequest,
     normalize_pixel_refiner_service_url,
     refine_pixel_art_with_service,
+    resolve_pixel_refiner_service_model,
 )
 from .storage import AppSettings, project_bundle_dir
 
@@ -62,6 +65,8 @@ AI_IMAGE_QUALITY_PRESETS = ["auto", "low", "medium", "high"]
 AI_IMAGE_BACKGROUND_PRESETS = ["auto", "transparent", "opaque"]
 AI_IMAGE_OUTPUT_FORMAT_PRESETS = ["png", "webp", "jpeg"]
 AI_IMAGE_PROVIDERS = {"openai", "compatible"}
+AI_IMAGE_POST_MAX_ATTEMPTS = 3
+AI_IMAGE_TRANSIENT_HTTP_CODES = {408, 409, 429, 500, 502, 503, 504}
 PIXEL_ART_OUTLINE_LUMA_MAX = 72
 PIXEL_ART_OUTLINE_CELL_COVERAGE_THRESHOLD = 0.18
 PIXEL_ART_ACCENT_CELL_COVERAGE_THRESHOLD = 0.18
@@ -181,7 +186,7 @@ def build_ai_image_request(
         background=requested_background,
         count=_coerce_count(getattr(settings, "ai_image_count", 1)),
         output_format=output_format,
-        timeout=180,
+        timeout=300 if model == "gpt-image-2" else 180,
     )
 
 
@@ -329,6 +334,12 @@ def generate_pixel_refiner_candidates(
         raise AiImageError(f"源图不存在：{source}")
     folder = _ai_image_cache_folder(project_path, cache_key, pixel_mode=True, pixel_output_size=pixel_output_size)
     folder.mkdir(parents=True, exist_ok=True)
+    normalized_service_url = normalize_pixel_refiner_service_url(service_url)
+    resolved_model_id, resolved_model_dir = resolve_pixel_refiner_service_model(
+        normalized_service_url,
+        requested_model_id=model_id,
+        requested_model_dir=model_dir,
+    )
     request = PixelRefinerRequest(
         input_path=source,
         output_dir=folder,
@@ -336,11 +347,11 @@ def generate_pixel_refiner_candidates(
         palette_limit=pixel_art_palette_limit(*target_size),
         strength=strength,
         return_candidates=candidates,
-        model_dir=Path(model_dir) if model_dir else None,
-        model_id=model_id,
+        model_dir=resolved_model_dir,
+        model_id=resolved_model_id,
     )
     try:
-        result = refine_pixel_art_with_service(request, service_url=normalize_pixel_refiner_service_url(service_url))
+        result = refine_pixel_art_with_service(request, service_url=normalized_service_url)
     except PixelRefinerError as exc:
         raise AiImageError(str(exc)) from exc
     refined: list[PixelDownscaleCandidate] = []
@@ -465,24 +476,43 @@ def _normalized_compatible_base_url(base_url: str) -> str:
 
 
 def _post(url: str, api_key: str, data: bytes, content_type: str, *, timeout: int = 180) -> bytes:
-    request = urllib.request.Request(
-        url,
-        data=data,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": content_type,
-            "User-Agent": "GameDesigner/AI-Image",
-        },
-        method="POST",
+    attempts = AI_IMAGE_POST_MAX_ATTEMPTS
+    last_error: BaseException | None = None
+    last_message = ""
+    attempts_used = 0
+    for attempt in range(1, attempts + 1):
+        attempts_used = attempt
+        request = urllib.request.Request(
+            url,
+            data=data,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": content_type,
+                "User-Agent": "GameDesigner/AI-Image",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=max(1, int(timeout))) as response:
+                return response.read()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            last_error = exc
+            last_message = _format_api_error(exc.code, detail)
+            if exc.code not in AI_IMAGE_TRANSIENT_HTTP_CODES or attempt >= attempts:
+                break
+        except urllib.error.URLError as exc:
+            last_error = exc
+            last_message = f"生图服务连接失败：{exc.reason}"
+            if attempt >= attempts:
+                break
+        _sleep_before_image_retry(attempt)
+    retry_note = (
+        f"\n已自动重试 {attempts_used} 次仍失败。建议稍后重试，或临时切换到 gpt-image-1.5 / chatgpt-image-latest。"
+        if attempts_used > 1
+        else ""
     )
-    try:
-        with urllib.request.urlopen(request, timeout=max(1, int(timeout))) as response:
-            return response.read()
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise AiImageError(_format_api_error(exc.code, detail)) from exc
-    except urllib.error.URLError as exc:
-        raise AiImageError(f"生图服务连接失败：{exc.reason}") from exc
+    raise AiImageError((last_message or "生图 API 请求失败。") + retry_note) from last_error
 
 
 def _format_api_error(code: int, detail: str) -> str:
@@ -497,7 +527,20 @@ def _format_api_error(code: int, detail: str) -> str:
             message = str(error.get("message") or "")
         elif isinstance(error, str):
             message = error
-    return f"生图 API 请求失败（HTTP {code}）：{message or detail[:500] or '没有错误详情'}"
+    return f"生图 API 请求失败（HTTP {code}）：{message or _plain_error_detail(detail) or '没有错误详情'}"
+
+
+def _plain_error_detail(detail: str) -> str:
+    text = str(detail or "")
+    text = re.sub(r"(?is)<script.*?</script>|<style.*?</style>", " ", text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:500]
+
+
+def _sleep_before_image_retry(attempt: int) -> None:
+    delay = min(8.0, 1.5 * (2 ** max(0, attempt - 1)))
+    time.sleep(delay)
 
 
 def _parse_images_response(raw: bytes, output_format: str) -> list[AiGeneratedImage]:

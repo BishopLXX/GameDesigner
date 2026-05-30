@@ -545,6 +545,51 @@ class AppEditingTests(unittest.TestCase):
             self.assertEqual(panel._current_image_path, refined_path)
             panel.deleteLater()
 
+    def test_ai_image_panel_adds_real_failure_training_pair_with_prompt_and_note(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "PixelFailurePairPanel.gdc"
+            settings = AppSettings(workspace_dir=folder, export_dir=str(Path(folder) / "exports"))
+            candidate_path = Path(folder) / "bad_candidate.png"
+            target_path = Path(folder) / "true_pixel.png"
+            candidate = QImage(32, 48, QImage.Format_ARGB32)
+            candidate.fill(0xFF7848CC)
+            candidate.save(str(candidate_path), "PNG")
+            target = QImage(32, 48, QImage.Format_ARGB32)
+            target.fill(0xFF224488)
+            target.save(str(target_path), "PNG")
+            context_provider = lambda: ("ctx", Path(folder), project_path)
+            panel = AiImagePanel(None, settings, context_provider)
+            panel.bind_canvas("像素生图", "out", "pixel-canvas", True)
+            panel._active_prompt = "生成横板像素角色"
+            panel.cached_images = [CachedAiImage(candidate_path, 32, 48)]
+            panel._add_output_item(panel.cached_images[0])
+            item = panel.output_list.currentItem()
+            fake_record = mock.Mock(
+                input_kind="software_candidate",
+                category="character_portrait",
+                width=32,
+                height=48,
+                target_path=target_path,
+            )
+            fake_result = mock.Mock(created=True, record=fake_record)
+
+            with (
+                mock.patch("gamedesigner.ui.ai_image_panel.QFileDialog.getOpenFileName", return_value=(str(target_path), "PNG")),
+                mock.patch("gamedesigner.ui.ai_image_panel.QInputDialog.getText", return_value=("线条糊，颜色脏", True)),
+                mock.patch("gamedesigner.ui.ai_image_panel.ingest_software_candidate_pair", return_value=fake_result) as ingest,
+                mock.patch.object(QMessageBox, "information"),
+            ):
+                panel._add_pixel_refiner_training_pair(item)
+
+            ingest.assert_called_once()
+            self.assertEqual(ingest.call_args.args[:2], (candidate_path, target_path))
+            self.assertEqual(ingest.call_args.kwargs["category"], "character_portrait")
+            self.assertEqual(ingest.call_args.kwargs["prompt"], "生成横板像素角色")
+            self.assertIn("cache_key=pixel-canvas", ingest.call_args.kwargs["notes"])
+            self.assertIn("failure_note=线条糊，颜色脏", ingest.call_args.kwargs["notes"])
+            self.assertIn("priority=real_software_failure", ingest.call_args.kwargs["notes"])
+            panel.deleteLater()
+
     def test_ai_image_panel_redraws_selected_pixel_candidate_as_reference(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             project_path = Path(folder) / "PixelRedrawPanel.gdc"

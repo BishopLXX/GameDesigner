@@ -40,6 +40,10 @@ py -3.13 -m PyInstaller ^
   --hidden-import gamedesigner.pixel_refiner_dataset_eval ^
   --hidden-import gamedesigner.pixel_refiner_eval_suite ^
   --hidden-import gamedesigner.pixel_refiner_pair_generation ^
+  --hidden-import gamedesigner.pixel_refiner_character_crops ^
+  --hidden-import gamedesigner.pixel_refiner_patch_expansion ^
+  --hidden-import gamedesigner.pixel_refiner_authorized_import ^
+  --hidden-import gamedesigner.pixel_site_downloader ^
   --hidden-import gamedesigner.pixel_refiner_ai_pseudo ^
   --distpath release ^
   --workpath build_pixel_refiner_console ^

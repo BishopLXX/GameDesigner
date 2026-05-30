@@ -224,6 +224,7 @@ def crawl_site(
     timeout: int,
     retries: int,
     delay: float,
+    generic_pages: bool = False,
 ) -> dict[str, Any]:
     queue = [normalize_page_url(url) for url in start_urls]
     seen: set[str] = set()
@@ -264,7 +265,7 @@ def crawl_site(
         ):
             image_pages.setdefault(image_url, set()).add(page_url)
 
-        for next_url in extract_entry_urls(html, page_url, page_host=page_host):
+        for next_url in extract_entry_urls(html, page_url, page_host=page_host, generic_pages=generic_pages):
             if next_url not in seen and next_url not in queue:
                 queue.append(next_url)
         if delay:
@@ -291,10 +292,14 @@ def extract_image_urls(
     return sorted(results)
 
 
-def extract_entry_urls(html: str, base_url: str, *, page_host: str = DEFAULT_PAGE_HOST) -> list[str]:
+def extract_entry_urls(html: str, base_url: str, *, page_host: str = DEFAULT_PAGE_HOST, generic_pages: bool = False) -> list[str]:
     results: set[str] = set()
     for raw in extract_attr_urls(html):
         resolved = normalize_page_url(raw, base_url)
+        if generic_pages:
+            if is_same_host_page_url(resolved, page_host=page_host):
+                results.add(resolved)
+            continue
         if is_entry_url(resolved, page_host=page_host):
             results.add(resolved)
     return sorted(results)
@@ -328,6 +333,17 @@ def normalize_url(value: str, base_url: str) -> str:
 def is_entry_url(url: str, *, page_host: str = DEFAULT_PAGE_HOST) -> bool:
     parsed = urllib.parse.urlparse(url)
     return parsed.netloc == page_host and re.fullmatch(r"/blog-entry-\d+\.html", parsed.path or "") is not None
+
+
+def is_same_host_page_url(url: str, *, page_host: str) -> bool:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in {"http", "https"} or parsed.netloc != page_host:
+        return False
+    path = urllib.parse.unquote(parsed.path or "/")
+    suffix = Path(path).suffix.lower()
+    if suffix in IMAGE_EXTENSIONS:
+        return False
+    return True
 
 
 def is_image_asset_url(

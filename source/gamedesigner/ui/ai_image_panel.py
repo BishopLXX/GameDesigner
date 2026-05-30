@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -133,7 +134,7 @@ class AiImageSettingsDialog(QDialog):
         self.pixel_refiner_url_edit.setPlaceholderText("例如 http://127.0.0.1:8765")
 
         self.pixel_refiner_model_dir_edit = QLineEdit(getattr(settings, "pixel_refiner_model_dir", ""))
-        self.pixel_refiner_model_dir_edit.setPlaceholderText(r"例如 D:\GameDesignerData\pixel_refiner\models\pixel-refiner-v2")
+        self.pixel_refiner_model_dir_edit.setPlaceholderText(r"例如 D:\GameDesignerData\pixel_refiner\models\pixel-refiner-v4")
         self.pixel_refiner_model_dir_button = QPushButton("选择")
         self.pixel_refiner_model_dir_button.clicked.connect(self._choose_pixel_refiner_model_dir)
         pixel_refiner_dir_row = QHBoxLayout()
@@ -901,7 +902,7 @@ class AiImagePanel(QWidget):
         refiner_action = menu.addAction("AI 修正像素画")
         candidate_action = menu.addAction("生成粗像素候选")
         redraw_action = menu.addAction("作为参考重绘像素稿")
-        training_pair_action = menu.addAction("加入 Pixel Refiner 训练对...")
+        training_pair_action = menu.addAction("加入真实失败训练对...")
         menu.addSeparator()
         delete_action = menu.addAction("删除缓存图")
         pixel_ready = self._bound_pixel_mode and item is not None
@@ -1039,12 +1040,29 @@ class AiImagePanel(QWidget):
             return
         target_path = Path(target_path_text)
         category = self._pixel_refiner_feedback_category(input_path)
+        failure_note, accepted = QInputDialog.getText(
+            self,
+            "真实失败样本",
+            "失败说明（可选，例如：线条糊、灰边、颜色脏、细节丢失）：",
+        )
+        if not accepted:
+            return
+        notes = "\n".join(
+            part
+            for part in (
+                f"cache_key={self._cache_key()}",
+                f"failure_note={failure_note.strip()}" if failure_note.strip() else "",
+                "priority=real_software_failure",
+            )
+            if part
+        )
         try:
             result = ingest_software_candidate_pair(
                 input_path,
                 target_path,
                 category=category,
-                notes=f"cache_key={self._cache_key()}",
+                prompt=self._active_prompt,
+                notes=notes,
             )
         except Exception as exc:
             QMessageBox.information(
@@ -1056,12 +1074,12 @@ class AiImagePanel(QWidget):
         status = "已加入" if result.created else "已存在，未重复加入"
         pair_folder = result.record.target_path.parent
         self._append_system(
-            f"{status} Pixel Refiner 训练对：{result.record.input_kind} / {result.record.category} / {result.record.width}x{result.record.height}。"
+            f"{status} 真实失败训练对：{result.record.input_kind} / {result.record.category} / {result.record.width}x{result.record.height}。"
         )
         QMessageBox.information(
             self,
             "Pixel Refiner 训练对",
-            f"{status}。\n\nPair：{pair_folder}\n数据集：{dataset_dir()}",
+            f"{status}。\n\n这条会以 software_candidate 高权重参与 V4.1 训练。\n\nPair：{pair_folder}\n数据集：{dataset_dir()}",
         )
 
     def _pixel_refiner_feedback_category(self, path: Path) -> str:

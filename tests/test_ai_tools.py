@@ -4,6 +4,7 @@ import os
 import shutil
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -22,6 +23,7 @@ from gamedesigner.image_ai import (
     pixel_source_path_for_candidate,
     _encode_multipart,
     _multipart_body,
+    _post,
 )
 from gamedesigner.pixel_refiner import (
     DEFAULT_PIXEL_REFINER_CANDIDATES,
@@ -33,6 +35,7 @@ from gamedesigner.pixel_refiner import (
     PixelRefinerResult,
     normalize_pixel_refiner_service_url,
     refine_pixel_art_with_service,
+    resolve_pixel_refiner_service_model,
 )
 from gamedesigner.image_rendering import is_pixel_art_image_path
 from gamedesigner.ai_tools import (
@@ -126,6 +129,7 @@ class AiToolsTests(unittest.TestCase):
         request = build_ai_image_request(settings, "pixel character")
 
         self.assertEqual(request.size, "816x816")
+        self.assertEqual(request.timeout, 300)
 
     def test_ai_image_request_keeps_custom_size_for_compatible_provider(self) -> None:
         settings = AppSettings(
@@ -195,6 +199,69 @@ class AiToolsTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"OPENAI_API_KEY": ""}):
             with self.assertRaises(AiImageError):
                 build_ai_image_request(settings, "asset")
+
+    def test_ai_image_post_retries_transient_gateway_timeout(self) -> None:
+        class FakeResponse:
+            def __enter__(self):  # noqa: ANN204
+                return self
+
+            def __exit__(self, _exc_type, _exc, _tb) -> None:  # noqa: ANN001
+                return None
+
+            def read(self) -> bytes:
+                return b'{"ok": true}'
+
+        timeout = urllib.error.HTTPError(
+            "https://api.example.test/v1/images/generations",
+            504,
+            "Gateway Timeout",
+            hdrs=None,
+            fp=BytesIO(b"<HTML><H1>504 Gateway Timeout ERROR</H1><P>The request could not be satisfied.</P></HTML>"),
+        )
+        with (
+            mock.patch("gamedesigner.image_ai.urllib.request.urlopen", side_effect=[timeout, FakeResponse()]) as urlopen,
+            mock.patch("gamedesigner.image_ai.time.sleep") as sleep,
+        ):
+            raw = _post(
+                "https://api.example.test/v1/images/generations",
+                "secret",
+                b"{}",
+                "application/json",
+                timeout=5,
+            )
+
+        self.assertEqual(raw, b'{"ok": true}')
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_called_once()
+
+    def test_ai_image_post_cleans_html_error_after_retries(self) -> None:
+        def gateway_timeout() -> urllib.error.HTTPError:
+            return urllib.error.HTTPError(
+                "https://api.example.test/v1/images/generations",
+                504,
+                "Gateway Timeout",
+                hdrs=None,
+                fp=BytesIO(b"<HTML><BODY><H1>504 Gateway Timeout ERROR</H1><H2>The request could not be satisfied.</H2></BODY></HTML>"),
+            )
+
+        with (
+            mock.patch("gamedesigner.image_ai.urllib.request.urlopen", side_effect=[gateway_timeout(), gateway_timeout(), gateway_timeout()]),
+            mock.patch("gamedesigner.image_ai.time.sleep"),
+        ):
+            with self.assertRaises(AiImageError) as raised:
+                _post(
+                    "https://api.example.test/v1/images/generations",
+                    "secret",
+                    b"{}",
+                    "application/json",
+                    timeout=5,
+                )
+
+        message = str(raised.exception)
+        self.assertIn("HTTP 504", message)
+        self.assertIn("504 Gateway Timeout ERROR", message)
+        self.assertIn("已自动重试 3 次仍失败", message)
+        self.assertNotIn("<HTML>", message)
 
     def test_app_settings_roundtrip_ai_image_settings(self) -> None:
         settings = AppSettings(
@@ -382,6 +449,24 @@ class AiToolsTests(unittest.TestCase):
             self.assertEqual(result.outputs[0].label, "Refined A")
             self.assertTrue(result.checks["transparent_png"])
 
+    def test_pixel_refiner_service_model_resolution_prefers_running_service_for_builtin_ids(self) -> None:
+        with mock.patch(
+            "gamedesigner.pixel_refiner.check_pixel_refiner_service",
+            return_value={
+                "ok": True,
+                "model": "pixel-refiner-v4",
+                "model_dir": "D:/GameDesignerData/pixel_refiner/models/pixel-refiner-v4",
+            },
+        ):
+            model_id, model_dir = resolve_pixel_refiner_service_model(
+                "http://127.0.0.1:8765",
+                requested_model_id="pixel-refiner-v2",
+                requested_model_dir="D:/GameDesignerData/pixel_refiner/models/pixel-refiner-v2",
+            )
+
+        self.assertEqual(model_id, "pixel-refiner-v4")
+        self.assertEqual(Path(model_dir), Path("D:/GameDesignerData/pixel_refiner/models/pixel-refiner-v4"))
+
     def test_pixel_refiner_candidates_finalize_service_pngs_in_pixel_cache(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             project_path = Path(folder) / "PixelRefinerProject.gdc"
@@ -397,6 +482,8 @@ class AiToolsTests(unittest.TestCase):
                 self.assertEqual(request.input_path, source_path)
                 self.assertEqual(request.target_size, "8x8")
                 self.assertEqual(request.return_candidates, 2)
+                self.assertEqual(request.model_id, "pixel-refiner-v4")
+                self.assertEqual(request.model_dir, Path("D:/GameDesignerData/pixel_refiner/models/pixel-refiner-v4"))
                 output_path = request.output_dir / "service_output.png"
                 Image.new("RGBA", (12, 12), (12, 34, 56, 180)).save(output_path)
                 return PixelRefinerResult(
@@ -404,12 +491,19 @@ class AiToolsTests(unittest.TestCase):
                     model="pixel-refiner-test",
                 )
 
-            with mock.patch("gamedesigner.image_ai.refine_pixel_art_with_service", side_effect=fake_refine):
+            with (
+                mock.patch(
+                    "gamedesigner.image_ai.resolve_pixel_refiner_service_model",
+                    return_value=("pixel-refiner-v4", Path("D:/GameDesignerData/pixel_refiner/models/pixel-refiner-v4")),
+                ),
+                mock.patch("gamedesigner.image_ai.refine_pixel_art_with_service", side_effect=fake_refine),
+            ):
                 candidates = generate_pixel_refiner_candidates(
                     project_path,
                     source_path,
                     cache_key="canvas-a",
                     pixel_output_size="8x8",
+                    model_id="pixel-refiner-v2",
                     candidates=2,
                 )
 

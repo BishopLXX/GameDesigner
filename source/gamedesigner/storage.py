@@ -14,6 +14,7 @@ from .pixel_refiner import (
     DEFAULT_PIXEL_REFINER_CANDIDATES,
     DEFAULT_PIXEL_REFINER_MODEL_ID,
     DEFAULT_PIXEL_REFINER_STRENGTH,
+    KNOWN_PIXEL_REFINER_MODEL_IDS,
     default_pixel_refiner_model_dir,
     normalize_pixel_refiner_service_url,
 )
@@ -249,11 +250,14 @@ def _normalize_pixel_refiner_settings(settings: AppSettings) -> None:
         raw_model_id = DEFAULT_PIXEL_REFINER_MODEL_ID
 
     legacy_dir = _is_legacy_pixel_refiner_model_dir(raw_model_dir)
+    stale_builtin_model = raw_model_id in KNOWN_PIXEL_REFINER_MODEL_IDS - {DEFAULT_PIXEL_REFINER_MODEL_ID}
+    if stale_builtin_model and (not raw_model_dir or legacy_dir or Path(raw_model_dir).name in KNOWN_PIXEL_REFINER_MODEL_IDS):
+        raw_model_id = DEFAULT_PIXEL_REFINER_MODEL_ID
     if legacy_dir and raw_model_id == "pixel-refiner-v1":
         raw_model_id = DEFAULT_PIXEL_REFINER_MODEL_ID
     settings.pixel_refiner_model_id = raw_model_id
 
-    if not raw_model_dir or legacy_dir:
+    if not raw_model_dir or legacy_dir or (stale_builtin_model and Path(raw_model_dir).name in KNOWN_PIXEL_REFINER_MODEL_IDS):
         settings.pixel_refiner_model_dir = str(pixel_refiner_model_dir(raw_model_id))
 
 

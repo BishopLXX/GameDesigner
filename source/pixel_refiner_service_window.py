@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import io
 import json
+import re
 import sys
 import tempfile
 import urllib.error
@@ -37,13 +38,15 @@ from PySide6.QtWidgets import (
 
 from gamedesigner.paths import game_designer_data_root, pixel_refiner_model_dir, pixel_refiner_runs_root
 from gamedesigner.pixel_refiner_dataset import dataset_dir
-from pixel_refiner_service.manifest import DEFAULT_MODEL_ID
+from pixel_refiner_service.manifest import DEFAULT_MODEL_ID as SERVICE_DEFAULT_MODEL_ID
 
 
+V1_MODEL_ID = "pixel-refiner-v1"
 V2_MODEL_ID = "pixel-refiner-v2"
 V3_MODEL_ID = "pixel-refiner-v3"
 V4_MODEL_ID = "pixel-refiner-v4"
-DEFAULT_CONSOLE_MODEL_ID = V4_MODEL_ID
+V41_MODEL_ID = "pixel-refiner-v4.1-real-failures"
+DEFAULT_CONSOLE_MODEL_ID = SERVICE_DEFAULT_MODEL_ID
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SOURCE_DIR = Path(__file__).resolve().parent
 SERVICE_MAIN = SOURCE_DIR / "pixel_refiner_service_main.py"
@@ -57,6 +60,14 @@ RUN_REFINE_TEST_ARG = "--run-refine-test"
 RUN_OUTPUT_FILE_ARG = "--run-output-file"
 IMAGE_FILE_FILTER = "图片 (*.png *.jpg *.jpeg *.webp *.bmp);;所有文件 (*.*)"
 IMAGE_FILE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+TRAINING_MONITOR_FILENAMES = ("train_events.jsonl", "orchestrator.log")
+LEGACY_MODEL_BOUND_RUN_NAMES = {
+    "20260530_v4_gold_small",
+    "20260530_v41_real_failures",
+    "20260530_v3_tile",
+    "20260530_v2_refiner",
+    "20260530_v1_baseline",
+}
 
 
 def _is_supported_image_path(path: Path) -> bool:
@@ -160,8 +171,16 @@ def default_test_output_dir() -> Path:
     return pixel_refiner_runs_root() / "test_outputs"
 
 
-def default_training_event_log() -> Path:
-    return pixel_refiner_runs_root() / "20260530_v4_gold_small" / "train_events.jsonl"
+def default_training_event_log(_model_id: str = DEFAULT_CONSOLE_MODEL_ID) -> Path:
+    latest = _latest_training_monitor_path()
+    if latest is not None:
+        return latest
+    return pixel_refiner_runs_root() / "current_run" / "train_events.jsonl"
+
+
+def new_training_event_log(model_id: str, *, mode: str = "train") -> Path:
+    run_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{_safe_stem(model_id)}_{_safe_stem(mode)}"
+    return pixel_refiner_runs_root() / run_name / "train_events.jsonl"
 
 
 def default_training_python() -> Path:
@@ -195,7 +214,9 @@ class PixelRefinerServiceWindow(QMainWindow):
         self._test_output_file: Path | None = None
         self._test_stdout_parts: list[str] = []
         self._test_stderr_parts: list[str] = []
+        self._test_mode = "single"
         self._last_training_monitor_count = 0
+        self._last_training_monitor_path = ""
         self.attached_external = False
 
         self._build_widgets(model_dir=model_dir, host=host, port=port)
@@ -226,18 +247,24 @@ class PixelRefinerServiceWindow(QMainWindow):
         self.port_spin.setValue(port)
         self.model_dir_edit = QLineEdit(str(model_dir))
         self.model_id_combo = QComboBox()
+        self.model_id_combo.addItem("Pixel Refiner V4.1（真实失败样本强化）", V41_MODEL_ID)
         self.model_id_combo.addItem("Pixel Refiner V4（Gold + 硬像素输出层）", V4_MODEL_ID)
         self.model_id_combo.addItem("Pixel Refiner V3（重叠 Tile + 2x 像素级）", V3_MODEL_ID)
         self.model_id_combo.addItem("Pixel Refiner V2（U-Net/NAF + 像素约束）", V2_MODEL_ID)
-        self.model_id_combo.addItem("Pixel Refiner V1（基础 CNN）", DEFAULT_MODEL_ID)
-        if model_dir.name == V4_MODEL_ID:
+        self.model_id_combo.addItem("Pixel Refiner V1（基础 CNN）", V1_MODEL_ID)
+        default_index = self.model_id_combo.findData(DEFAULT_CONSOLE_MODEL_ID)
+        if default_index >= 0:
+            self.model_id_combo.setCurrentIndex(default_index)
+        if model_dir.name == V41_MODEL_ID:
             self.model_id_combo.setCurrentIndex(0)
-        elif model_dir.name == V3_MODEL_ID:
+        elif model_dir.name == V4_MODEL_ID:
             self.model_id_combo.setCurrentIndex(1)
-        elif model_dir.name == V2_MODEL_ID:
+        elif model_dir.name == V3_MODEL_ID:
             self.model_id_combo.setCurrentIndex(2)
-        elif model_dir.name == DEFAULT_MODEL_ID:
+        elif model_dir.name == V2_MODEL_ID:
             self.model_id_combo.setCurrentIndex(3)
+        elif model_dir.name == V1_MODEL_ID:
+            self.model_id_combo.setCurrentIndex(4)
 
         self.status_label = QLabel("未连接")
         self.model_label = QLabel("-")
@@ -310,6 +337,7 @@ class PixelRefinerServiceWindow(QMainWindow):
         self.test_alpha_combo = QComboBox()
         self.test_alpha_combo.addItem("保留透明通道", "preserve")
         self.test_run_button = QPushButton("测试生成")
+        self.fixed_eval_button = QPushButton("固定评测对比")
         self.open_test_output_button = QPushButton("打开当前输出")
         self.test_input_preview = ImagePreviewLabel("输入预览", accepts_image_drops=True)
         self.test_output_preview = ImagePreviewLabel("输出预览", clickable=True)
@@ -335,14 +363,15 @@ class PixelRefinerServiceWindow(QMainWindow):
             lambda: self.open_folder(Path(self.test_output_dir_edit.text().strip() or str(default_test_output_dir())))
         )
         self.test_run_button.clicked.connect(lambda: self.start_test_refine())
+        self.fixed_eval_button.clicked.connect(lambda: self.start_fixed_eval())
         self.open_test_output_button.clicked.connect(self.open_test_output)
 
         self.train_python_edit = QLineEdit(str(default_training_python()))
         self.choose_train_python_button = QPushButton("选择")
         self.train_output_dir_edit = QLineEdit(str(model_dir))
         self.choose_train_output_button = QPushButton("选择")
-        self.train_event_log_edit = QLineEdit(str(default_training_event_log()))
-        self.monitor_train_button = QPushButton("监控当前训练")
+        self.train_event_log_edit = QLineEdit(str(default_training_event_log(self.current_model_id())))
+        self.monitor_train_button = QPushButton("自动监控最新")
         self.open_train_run_button = QPushButton("打开 run")
         self.training_progress_label = QLabel("未监控")
         self.training_progress_bar = QProgressBar()
@@ -370,6 +399,16 @@ class PixelRefinerServiceWindow(QMainWindow):
         self.device_combo.addItem("显卡 CUDA（推荐）", "cuda")
         self.device_combo.addItem("自动选择", "auto")
         self.device_combo.addItem("CPU（很慢）", "cpu")
+        self.software_candidate_weight_spin = QDoubleSpinBox()
+        self.software_candidate_weight_spin.setRange(0.0, 128.0)
+        self.software_candidate_weight_spin.setDecimals(1)
+        self.software_candidate_weight_spin.setSingleStep(1.0)
+        self.software_candidate_weight_spin.setValue(16.0)
+        self.ai_pseudo_weight_spin = QDoubleSpinBox()
+        self.ai_pseudo_weight_spin.setRange(0.0, 128.0)
+        self.ai_pseudo_weight_spin.setDecimals(1)
+        self.ai_pseudo_weight_spin.setSingleStep(1.0)
+        self.ai_pseudo_weight_spin.setValue(8.0)
         self.training_param_help_edit = QPlainTextEdit()
         self.training_param_help_edit.setReadOnly(True)
         self.training_param_help_edit.setMaximumHeight(190)
@@ -392,12 +431,13 @@ class PixelRefinerServiceWindow(QMainWindow):
         self.retrain_button.clicked.connect(lambda: self.start_training(retrain=True))
         self.stop_training_button.clicked.connect(self.stop_training)
         self.open_train_output_button.clicked.connect(lambda: self.open_folder(Path(self.train_output_dir_edit.text().strip())))
-        self.monitor_train_button.clicked.connect(lambda: self.refresh_training_monitor(force_append=True))
-        self.open_train_run_button.clicked.connect(lambda: self.open_folder(Path(self.train_event_log_edit.text().strip() or str(default_training_event_log())).parent))
+        self.monitor_train_button.clicked.connect(lambda: self.refresh_training_monitor(force_append=True, force_latest=True))
+        self.open_train_run_button.clicked.connect(self.open_current_training_run)
 
         self.help_edit = QPlainTextEdit()
         self.help_edit.setReadOnly(True)
         self.help_edit.setPlainText(HELP_TEXT)
+        self._model_selection_changed()
 
     def _build_layout(self) -> None:
         tabs = QTabWidget(self)
@@ -519,6 +559,7 @@ class PixelRefinerServiceWindow(QMainWindow):
 
         buttons = QHBoxLayout()
         buttons.addWidget(self.test_run_button)
+        buttons.addWidget(self.fixed_eval_button)
         buttons.addWidget(self.open_test_output_button)
         buttons.addStretch(1)
         layout.addLayout(buttons)
@@ -558,14 +599,14 @@ class PixelRefinerServiceWindow(QMainWindow):
         layout.addLayout(output_row)
 
         monitor_row = QHBoxLayout()
-        monitor_row.addWidget(QLabel("训练事件日志"))
+        monitor_row.addWidget(QLabel("监控 run / 日志"))
         monitor_row.addWidget(self.train_event_log_edit, 1)
         monitor_row.addWidget(self.monitor_train_button)
         monitor_row.addWidget(self.open_train_run_button)
         layout.addLayout(monitor_row)
 
         progress_row = QHBoxLayout()
-        progress_row.addWidget(QLabel("当前训练"))
+        progress_row.addWidget(QLabel("当前任务"))
         progress_row.addWidget(self.training_progress_bar, 1)
         progress_row.addWidget(self.training_progress_label, 2)
         layout.addLayout(progress_row)
@@ -579,6 +620,8 @@ class PixelRefinerServiceWindow(QMainWindow):
         form.addRow("验证批次数", self.val_batches_spin)
         form.addRow("样本上限（0=全量）", self.limit_spin)
         form.addRow("训练设备", self.device_combo)
+        form.addRow("真实失败样本权重", self.software_candidate_weight_spin)
+        form.addRow("AI伪输入权重", self.ai_pseudo_weight_spin)
         layout.addLayout(form)
 
         layout.addWidget(QLabel("训练参数说明"))
@@ -760,14 +803,17 @@ class PixelRefinerServiceWindow(QMainWindow):
             if retry_count == 0:
                 self._append_test_log("服务未运行，正在启动/连接服务...")
                 self.test_run_button.setEnabled(False)
+                self.fixed_eval_button.setEnabled(False)
                 self.start_or_attach()
             if retry_count < 12:
                 QTimer.singleShot(1000, lambda: self.start_test_refine(retry_count=retry_count + 1))
                 return
             self.test_run_button.setEnabled(True)
+            self.fixed_eval_button.setEnabled(True)
             QMessageBox.warning(self, "Pixel Refiner", "服务还没有准备好。请确认模型包能正常加载，再点击测试生成。")
             return
         self.test_run_button.setEnabled(True)
+        self.fixed_eval_button.setEnabled(True)
 
         input_path = Path(self.test_input_edit.text().strip())
         if not input_path.is_file():
@@ -806,6 +852,7 @@ class PixelRefinerServiceWindow(QMainWindow):
         ]
         output_file = Path(tempfile.gettempdir()) / f"pixel_refiner_test_{uuid.uuid4().hex}.txt"
         self._test_output_file = output_file
+        self._test_mode = "single"
         frozen_args = [RUN_OUTPUT_FILE_ARG, str(output_file), *args]
         program, process_args = _subprocess_command(
             REFINE_TEST_MAIN,
@@ -823,14 +870,87 @@ class PixelRefinerServiceWindow(QMainWindow):
         self.test_process.setProcessEnvironment(self._process_env())
         self.test_process.setWorkingDirectory(str(PROJECT_ROOT))
         self.test_run_button.setEnabled(False)
+        self.fixed_eval_button.setEnabled(False)
         self.test_process.start(program, process_args)
         if not self.test_process.waitForStarted(3000):
             self.test_run_button.setEnabled(True)
+            self.fixed_eval_button.setEnabled(True)
             self._append_test_log("测试生成进程启动失败。")
+
+    def start_fixed_eval(self, *, retry_count: int = 0) -> None:
+        if self.test_process.state() != QProcess.NotRunning:
+            QMessageBox.information(self, "Pixel Refiner", "测试生成已经在运行。")
+            return
+
+        health = self._get_json("/v1/health", timeout=0.5)
+        if not (isinstance(health, dict) and health.get("ok")):
+            if retry_count == 0:
+                self._append_test_log("服务未运行，正在启动/连接服务...")
+                self.test_run_button.setEnabled(False)
+                self.fixed_eval_button.setEnabled(False)
+                self.start_or_attach()
+            if retry_count < 12:
+                QTimer.singleShot(1000, lambda: self.start_fixed_eval(retry_count=retry_count + 1))
+                return
+            self.test_run_button.setEnabled(True)
+            self.fixed_eval_button.setEnabled(True)
+            QMessageBox.warning(self, "Pixel Refiner", "服务还没有准备好。请确认模型包能正常加载，再点击固定评测。")
+            return
+        self.test_run_button.setEnabled(True)
+        self.fixed_eval_button.setEnabled(True)
+
+        model_id = self.current_model_id()
+        service_url = f"http://{self.host_edit.text().strip() or DEFAULT_HOST}:{self.port_spin.value()}"
+        args = [
+            "run-fixed-eval",
+            "--service-url",
+            service_url,
+            "--model-id",
+            model_id,
+            "--model-dir",
+            self.model_dir_edit.text().strip() or str(pixel_refiner_model_dir(model_id)),
+            "--limit",
+            "32",
+            "--cell-size",
+            "160",
+            "--alpha-mode",
+            str(self.test_alpha_combo.currentData() or "preserve"),
+            "--palette-limit",
+            str(self.test_palette_spin.value()),
+            "--strength",
+            f"{self.test_strength_spin.value():.4f}",
+            "--return-candidates",
+            "1",
+            "--timeout",
+            "300",
+        ]
+        output_file = Path(tempfile.gettempdir()) / f"pixel_refiner_eval_{uuid.uuid4().hex}.txt"
+        self._test_output_file = output_file
+        self._test_mode = "fixed_eval"
+        frozen_args = [RUN_OUTPUT_FILE_ARG, str(output_file), *args]
+        program, process_args = _subprocess_command(TRAINING_MAIN, args, frozen_arg=RUN_TRAINING_CLI_ARG, frozen_args=frozen_args)
+        self._test_stdout_parts.clear()
+        self._test_stderr_parts.clear()
+        self.last_test_output_path = ""
+        self.test_output_preview.setPixmap(QPixmap())
+        self.test_output_preview.setText("评测生成中")
+        self.test_log_edit.clear()
+        self._append_test_log("固定评测启动：" + " ".join([program, *process_args]))
+        self.test_process.setProcessEnvironment(self._process_env())
+        self.test_process.setWorkingDirectory(str(PROJECT_ROOT))
+        self.test_run_button.setEnabled(False)
+        self.fixed_eval_button.setEnabled(False)
+        self.test_process.start(program, process_args)
+        if not self.test_process.waitForStarted(3000):
+            self.test_run_button.setEnabled(True)
+            self.fixed_eval_button.setEnabled(True)
+            self._append_test_log("固定评测进程启动失败。")
 
     def start_smoke_training(self) -> None:
         model_id = self.current_model_id()
         smoke_output = pixel_refiner_model_dir(model_id).with_name(f"{model_id}-smoke")
+        event_log = new_training_event_log(model_id, mode="smoke")
+        self.train_event_log_edit.setText(str(event_log))
         args = [
             "train",
             "--model-id",
@@ -852,23 +972,27 @@ class PixelRefinerServiceWindow(QMainWindow):
             "--device",
             str(self.device_combo.currentData() or "auto"),
             "--features",
-            "96" if model_id == V4_MODEL_ID else ("64" if model_id in {V2_MODEL_ID, V3_MODEL_ID} else "48"),
+            self._features_for_model_id(model_id),
             "--palette-levels",
             "64",
             "--pixel-constraint-weight",
-            "0.12" if model_id == V4_MODEL_ID else "0.08",
+            self._pixel_constraint_weight_for_model_id(model_id),
             "--internal-scale",
-            "2" if model_id in {V3_MODEL_ID, V4_MODEL_ID} else "1",
+            self._internal_scale_for_model_id(model_id),
             "--tile-overlap",
-            "16" if model_id in {V3_MODEL_ID, V4_MODEL_ID} else "0",
+            self._tile_overlap_for_model_id(model_id),
             "--block-consistency-weight",
-            "0.25" if model_id == V4_MODEL_ID else ("0.20" if model_id == V3_MODEL_ID else "0.0"),
+            self._block_consistency_weight_for_model_id(model_id),
             "--edge-loss-weight",
-            "0.55" if model_id == V4_MODEL_ID else "0.25",
+            self._edge_loss_weight_for_model_id(model_id),
             "--anti-blur-weight",
-            "0.12" if model_id == V4_MODEL_ID else "0.0",
+            self._anti_blur_weight_for_model_id(model_id),
+            "--software-candidate-weight",
+            f"{self.software_candidate_weight_spin.value():.1f}",
+            "--ai-pseudo-weight",
+            f"{self.ai_pseudo_weight_spin.value():.1f}",
             "--event-log",
-            str(default_training_event_log()),
+            str(event_log),
             "--val-batches",
             "4",
             "--log-interval",
@@ -885,6 +1009,8 @@ class PixelRefinerServiceWindow(QMainWindow):
             )
             if confirm != QMessageBox.Yes:
                 return
+        event_log = new_training_event_log(self.current_model_id(), mode="retrain" if retrain else "train")
+        self.train_event_log_edit.setText(str(event_log))
         args = [
             "train",
             "--model-id",
@@ -904,23 +1030,27 @@ class PixelRefinerServiceWindow(QMainWindow):
             "--device",
             str(self.device_combo.currentData() or "auto"),
             "--features",
-            "96" if self.current_model_id() == V4_MODEL_ID else ("64" if self.current_model_id() in {V2_MODEL_ID, V3_MODEL_ID} else "48"),
+            self._features_for_model_id(self.current_model_id()),
             "--palette-levels",
             "64",
             "--pixel-constraint-weight",
-            "0.12" if self.current_model_id() == V4_MODEL_ID else "0.08",
+            self._pixel_constraint_weight_for_model_id(self.current_model_id()),
             "--internal-scale",
-            "2" if self.current_model_id() in {V3_MODEL_ID, V4_MODEL_ID} else "1",
+            self._internal_scale_for_model_id(self.current_model_id()),
             "--tile-overlap",
-            "16" if self.current_model_id() in {V3_MODEL_ID, V4_MODEL_ID} else "0",
+            self._tile_overlap_for_model_id(self.current_model_id()),
             "--block-consistency-weight",
-            "0.25" if self.current_model_id() == V4_MODEL_ID else ("0.20" if self.current_model_id() == V3_MODEL_ID else "0.0"),
+            self._block_consistency_weight_for_model_id(self.current_model_id()),
             "--edge-loss-weight",
-            "0.55" if self.current_model_id() == V4_MODEL_ID else "0.25",
+            self._edge_loss_weight_for_model_id(self.current_model_id()),
             "--anti-blur-weight",
-            "0.12" if self.current_model_id() == V4_MODEL_ID else "0.0",
+            self._anti_blur_weight_for_model_id(self.current_model_id()),
+            "--software-candidate-weight",
+            f"{self.software_candidate_weight_spin.value():.1f}",
+            "--ai-pseudo-weight",
+            f"{self.ai_pseudo_weight_spin.value():.1f}",
             "--event-log",
-            self.train_event_log_edit.text().strip() or str(default_training_event_log()),
+            str(event_log),
             "--val-batches",
             str(self.val_batches_spin.value()),
             "--log-interval",
@@ -944,14 +1074,16 @@ class PixelRefinerServiceWindow(QMainWindow):
         if folder:
             self.model_dir_edit.setText(folder)
             self.train_output_dir_edit.setText(folder)
-            if Path(folder).name == V4_MODEL_ID:
+            if Path(folder).name == V41_MODEL_ID:
                 self.model_id_combo.setCurrentIndex(0)
-            elif Path(folder).name == V3_MODEL_ID:
+            elif Path(folder).name == V4_MODEL_ID:
                 self.model_id_combo.setCurrentIndex(1)
-            elif Path(folder).name == V2_MODEL_ID:
+            elif Path(folder).name == V3_MODEL_ID:
                 self.model_id_combo.setCurrentIndex(2)
-            elif Path(folder).name == DEFAULT_MODEL_ID:
+            elif Path(folder).name == V2_MODEL_ID:
                 self.model_id_combo.setCurrentIndex(3)
+            elif Path(folder).name == V1_MODEL_ID:
+                self.model_id_combo.setCurrentIndex(4)
 
     def choose_dataset_dir(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "选择数据集目录", self.dataset_dir_edit.text().strip())
@@ -985,6 +1117,12 @@ class PixelRefinerServiceWindow(QMainWindow):
         if not self.last_test_output_path:
             return
         self.open_path_in_file_browser(Path(self.last_test_output_path))
+
+    def open_current_training_run(self) -> None:
+        text = self.train_event_log_edit.text().strip()
+        path = _resolve_training_monitor_path(Path(text)) if text else None
+        path = path or default_training_event_log()
+        self.open_folder(path.parent if path.suffix else path)
 
     def open_folder(self, path: Path) -> None:
         if not path:
@@ -1034,25 +1172,58 @@ class PixelRefinerServiceWindow(QMainWindow):
         return str(self.model_id_combo.currentData() or DEFAULT_CONSOLE_MODEL_ID)
 
     def current_architecture(self) -> str:
-        if self.current_model_id() == V4_MODEL_ID:
+        if self.current_model_id().startswith("pixel-refiner-v4"):
             return "pixel-hard-v4"
         if self.current_model_id() == V3_MODEL_ID:
             return "pixel-tile-v3"
         return "unet-naf-v2" if self.current_model_id() == V2_MODEL_ID else "cnn-v1"
 
+    def _features_for_model_id(self, model_id: str) -> str:
+        if model_id.startswith("pixel-refiner-v4"):
+            return "96"
+        if model_id in {V2_MODEL_ID, V3_MODEL_ID}:
+            return "64"
+        return "48"
+
+    def _pixel_constraint_weight_for_model_id(self, model_id: str) -> str:
+        return "0.12" if model_id.startswith("pixel-refiner-v4") else "0.08"
+
+    def _internal_scale_for_model_id(self, model_id: str) -> str:
+        return "2" if model_id == V3_MODEL_ID or model_id.startswith("pixel-refiner-v4") else "1"
+
+    def _tile_overlap_for_model_id(self, model_id: str) -> str:
+        return "16" if model_id == V3_MODEL_ID or model_id.startswith("pixel-refiner-v4") else "0"
+
+    def _block_consistency_weight_for_model_id(self, model_id: str) -> str:
+        if model_id.startswith("pixel-refiner-v4"):
+            return "0.25"
+        return "0.20" if model_id == V3_MODEL_ID else "0.0"
+
+    def _edge_loss_weight_for_model_id(self, model_id: str) -> str:
+        return "0.55" if model_id.startswith("pixel-refiner-v4") else "0.25"
+
+    def _anti_blur_weight_for_model_id(self, model_id: str) -> str:
+        return "0.12" if model_id.startswith("pixel-refiner-v4") else "0.0"
+
     def _model_selection_changed(self) -> None:
         model_id = self.current_model_id()
-        known_model_ids = {DEFAULT_MODEL_ID, V2_MODEL_ID, V3_MODEL_ID, V4_MODEL_ID}
+        known_model_ids = {V1_MODEL_ID, V2_MODEL_ID, V3_MODEL_ID, V4_MODEL_ID, V41_MODEL_ID}
         model_dir_text = self.model_dir_edit.text().strip()
         train_dir_text = self.train_output_dir_edit.text().strip()
         if not model_dir_text or Path(model_dir_text).name in known_model_ids:
             self.model_dir_edit.setText(str(pixel_refiner_model_dir(model_id)))
         if not train_dir_text or Path(train_dir_text).name in known_model_ids:
             self.train_output_dir_edit.setText(str(pixel_refiner_model_dir(model_id)))
-        if model_id in {V3_MODEL_ID, V4_MODEL_ID} and self.patch_spin.value() == 256:
+        if (model_id == V3_MODEL_ID or model_id.startswith("pixel-refiner-v4")) and self.patch_spin.value() == 256:
             self.patch_spin.setValue(64)
         elif model_id == V2_MODEL_ID and self.patch_spin.value() == 64:
             self.patch_spin.setValue(256)
+        if model_id == V41_MODEL_ID:
+            self.software_candidate_weight_spin.setValue(32.0)
+            self.ai_pseudo_weight_spin.setValue(16.0)
+        elif model_id.startswith("pixel-refiner-v4"):
+            self.software_candidate_weight_spin.setValue(16.0)
+            self.ai_pseudo_weight_spin.setValue(8.0)
 
     def _run_dataset_command(self, args: list[str]) -> None:
         env = self._process_env()
@@ -1083,26 +1254,37 @@ class PixelRefinerServiceWindow(QMainWindow):
             text = _pretty_json(output.strip())
         self.dataset_summary_edit.setPlainText(text or "没有输出。")
 
-    def refresh_training_monitor(self, *, force_append: bool = False) -> None:
-        path = Path(self.train_event_log_edit.text().strip() or str(default_training_event_log()))
-        events = _read_training_events(path)
-        if not events:
-            self.training_progress_label.setText("未读到训练事件")
-            self.training_progress_bar.setValue(0)
-            if force_append:
-                self._append_training_log(f"没有读到训练事件日志：{path}")
-            return
-        status = _training_status_from_events(events, Path(self.train_output_dir_edit.text().strip() or str(pixel_refiner_model_dir(self.current_model_id()))))
+    def refresh_training_monitor(self, *, force_append: bool = False, force_latest: bool = False) -> None:
+        current_text = self.train_event_log_edit.text().strip()
+        current_path = Path(current_text) if current_text else Path()
+        path = _resolve_training_monitor_path(current_path)
+        latest = _latest_training_monitor_path()
+        if latest is not None and (
+            force_latest or path is None or _should_auto_switch_training_monitor(path, latest)
+        ):
+            path = latest
+        if path is None:
+            path = default_training_event_log()
+
+        path_text = str(path)
+        if self.train_event_log_edit.text().strip() != path_text:
+            self.train_event_log_edit.setText(path_text)
+        if path_text != self._last_training_monitor_path:
+            self._last_training_monitor_path = path_text
+            self._last_training_monitor_count = 0
+
+        model_dir = Path(self.train_output_dir_edit.text().strip() or str(pixel_refiner_model_dir(self.current_model_id())))
+        status = _training_status_from_monitor_path(path, model_dir)
         self.training_progress_label.setText(status["label"])
         self.training_progress_bar.setValue(int(status["progress"] * 1000))
-        if force_append or len(events) > self._last_training_monitor_count:
-            start_index = 0 if force_append or self._last_training_monitor_count <= 0 else self._last_training_monitor_count
+        item_count = int(status.get("count") or 0)
+        if force_append or item_count > self._last_training_monitor_count:
             if force_append:
-                self._append_training_log(f"正在监控训练事件：{path}")
+                self._append_training_log(f"正在监控：{path}")
                 self._append_training_log(status["detail"])
-            for event in events[start_index:][-12:]:
-                self._append_training_log(json.dumps(event, ensure_ascii=False))
-            self._last_training_monitor_count = len(events)
+            for line in status.get("new_lines", [])[self._last_training_monitor_count:][-12:]:
+                self._append_training_log(str(line))
+            self._last_training_monitor_count = item_count
 
     def _own_service_running(self) -> bool:
         return self.service_process.state() != QProcess.NotRunning
@@ -1149,6 +1331,7 @@ class PixelRefinerServiceWindow(QMainWindow):
 
     def _test_finished(self, exit_code: int, _status: QProcess.ExitStatus) -> None:
         self.test_run_button.setEnabled(True)
+        self.fixed_eval_button.setEnabled(True)
         stdout = "".join(self._test_stdout_parts).strip()
         stderr = "".join(self._test_stderr_parts).strip()
         if self._test_output_file is not None and self._test_output_file.is_file():
@@ -1173,6 +1356,17 @@ class PixelRefinerServiceWindow(QMainWindow):
             if isinstance(payload, dict):
                 message = str(payload.get("message") or "")
             self._append_test_log(f"测试生成失败，exit_code={exit_code}{('：' + message) if message else ''}")
+            return
+        if self._test_mode == "fixed_eval":
+            contact_sheet = str(payload.get("contact_sheet") or "")
+            if not contact_sheet:
+                self._append_test_log("固定评测完成，但没有返回 contact sheet。")
+                return
+            self.last_test_output_path = contact_sheet
+            self.last_output_path = contact_sheet
+            self._set_preview_image(self.test_output_preview, contact_sheet)
+            self.refresh_status()
+            self._append_test_log(f"固定评测完成。对比图：{contact_sheet}")
             return
         outputs = payload.get("outputs") if isinstance(payload.get("outputs"), list) else []
         output_paths = [
@@ -1265,6 +1459,100 @@ def _json_from_text(text: str) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _latest_training_monitor_path(runs_root: Path | None = None) -> Path | None:
+    root = runs_root or pixel_refiner_runs_root()
+    if not root.is_dir():
+        return None
+    candidates: list[tuple[float, int, Path]] = []
+    try:
+        run_dirs = [path for path in root.iterdir() if path.is_dir()]
+    except OSError:
+        return None
+    for run_dir in run_dirs:
+        for priority, filename in enumerate(TRAINING_MONITOR_FILENAMES):
+            path = run_dir / filename
+            if not path.is_file():
+                continue
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            candidates.append((mtime, len(TRAINING_MONITOR_FILENAMES) - priority, path))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: (item[0], item[1]))[2]
+
+
+def _resolve_training_monitor_path(path: Path) -> Path | None:
+    if not str(path):
+        return None
+    if path.is_dir():
+        for filename in TRAINING_MONITOR_FILENAMES:
+            candidate = path / filename
+            if candidate.is_file():
+                return candidate
+        return path
+    if path.is_file():
+        return path
+    parent = path.parent
+    if parent and parent.is_dir():
+        for filename in TRAINING_MONITOR_FILENAMES:
+            candidate = parent / filename
+            if candidate.is_file():
+                return candidate
+    return None
+
+
+def _should_auto_switch_training_monitor(current: Path, latest: Path) -> bool:
+    if current == latest:
+        return False
+    if current.parent.name in LEGACY_MODEL_BOUND_RUN_NAMES:
+        return True
+    if not current.is_file():
+        return True
+    try:
+        current_mtime = current.stat().st_mtime
+        latest_mtime = latest.stat().st_mtime
+    except OSError:
+        return False
+    if latest_mtime <= current_mtime + 1.0:
+        return False
+    if current.name == "train_events.jsonl":
+        status = _training_status_from_events(_read_training_events(current), current.parent)
+        return float(status.get("progress") or 0.0) >= 1.0
+    return False
+
+
+def _training_status_from_monitor_path(path: Path, model_dir: Path) -> dict[str, Any]:
+    resolved = _resolve_training_monitor_path(path) or path
+    if resolved.is_dir():
+        return {
+            "label": "未读到训练 run",
+            "progress": 0.0,
+            "detail": f"没有找到可监控日志：{resolved}",
+            "count": 0,
+            "new_lines": [],
+        }
+    if resolved.name == "orchestrator.log":
+        return _orchestrator_status_from_log(resolved)
+    events = _read_training_events(resolved)
+    if events:
+        status = _training_status_from_events(events, model_dir)
+        status["count"] = len(events)
+        status["new_lines"] = [json.dumps(event, ensure_ascii=False) for event in events]
+        return status
+    sibling_orchestrator = resolved.parent / "orchestrator.log"
+    if sibling_orchestrator.is_file():
+        return _orchestrator_status_from_log(sibling_orchestrator)
+    return {
+        "label": "未读到训练事件",
+        "progress": 0.0,
+        "detail": f"没有读到训练事件日志：{resolved}",
+        "count": 0,
+        "new_lines": [],
+    }
+
+
 def _read_training_events(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         return []
@@ -1320,6 +1608,148 @@ def _training_status_from_events(events: list[dict[str, Any]], model_dir: Path) 
         f"{export_state}: {manifest}"
     )
     return {"label": f"{label}  {progress * 100.0:.1f}%  {export_state}", "progress": progress, "detail": detail}
+
+
+def _orchestrator_status_from_log(path: Path) -> dict[str, Any]:
+    lines = _read_text_lines(path)
+    if not lines:
+        return {
+            "label": "run 已创建，等待日志",
+            "progress": 0.0,
+            "detail": f"run 日志为空：{path}",
+            "count": 0,
+            "new_lines": [],
+        }
+    run_dir = path.parent
+    train_events = run_dir / "train_events.jsonl"
+    events = _read_training_events(train_events)
+    if events:
+        model_dir = _model_dir_from_orchestrator_lines(lines) or run_dir
+        status = _training_status_from_events(events, model_dir)
+        status["count"] = len(lines) + len(events)
+        status["new_lines"] = [*lines, *[json.dumps(event, ensure_ascii=False) for event in events]]
+        return status
+
+    desired = _last_int_from_lines(lines, r"Desired ai_pseudo pairs:\s*(\d+)")
+    current = max(
+        _last_int_from_lines(lines, r"Current ai_pseudo pairs:\s*(\d+)"),
+        _last_int_from_lines(lines, r"After batch \d+ ai_pseudo pairs:\s*(\d+)"),
+        _count_ai_pseudo_pairs_from_index(),
+    )
+    generating = _last_match_from_lines(lines, r"Generating batch\s+(\d+),\s+limit=(\d+),\s+current=(\d+)")
+    batch_failed = _last_line_containing(lines, "failed")
+    train_started = any("Starting training:" in line for line in lines)
+    train_exit = _last_match_from_lines(lines, r"Training exited with code\s+(-?\d+)")
+    done = any("Done." in line for line in lines)
+    skipped = any("SkipTraining set" in line for line in lines)
+
+    if train_exit is not None:
+        code = train_exit.group(1)
+        progress = 1.0 if code == "0" else 0.0
+        label = "训练完成" if code == "0" else f"训练失败 exit_code={code}"
+    elif train_started:
+        progress = 1.0 if desired and current >= desired else 0.0
+        label = "训练已启动，等待 train_events.jsonl"
+    elif done:
+        progress = 1.0
+        label = "run 已完成"
+    elif skipped:
+        progress = 1.0
+        label = "数据生成完成，已跳过训练"
+    elif desired > 0:
+        progress = max(0.0, min(1.0, current / desired))
+        if generating is not None:
+            label = f"正在补 GPT 对照组 batch {generating.group(1)}  {current}/{desired}"
+        else:
+            label = f"GPT 对照组 {current}/{desired}"
+    else:
+        progress = 0.0
+        label = "正在准备 run"
+    if batch_failed:
+        label = f"{label}；最近有失败批次"
+
+    detail_lines = [
+        f"run={run_dir}",
+        f"日志={path}",
+        f"ai_pseudo={current}/{desired or '-'}",
+        "最近日志：",
+        *lines[-12:],
+    ]
+    return {
+        "label": label,
+        "progress": progress,
+        "detail": "\n".join(detail_lines),
+        "count": len(lines),
+        "new_lines": lines,
+    }
+
+
+def _read_text_lines(path: Path) -> list[str]:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return []
+    if not data:
+        return []
+    encodings = ["utf-8-sig", "utf-16"]
+    if data.count(b"\x00") > max(2, len(data) // 8):
+        encodings = ["utf-16", "utf-8-sig"]
+    for encoding in encodings:
+        try:
+            return data.decode(encoding).splitlines()
+        except UnicodeError:
+            continue
+    return data.decode("utf-8", errors="replace").splitlines()
+
+
+def _last_int_from_lines(lines: list[str], pattern: str) -> int:
+    match = _last_match_from_lines(lines, pattern)
+    if match is None:
+        return 0
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _last_match_from_lines(lines: list[str], pattern: str) -> re.Match[str] | None:
+    compiled = re.compile(pattern)
+    for line in reversed(lines):
+        match = compiled.search(line)
+        if match is not None:
+            return match
+    return None
+
+
+def _last_line_containing(lines: list[str], needle: str) -> str:
+    needle_lower = needle.lower()
+    for line in reversed(lines):
+        if needle_lower in line.lower():
+            return line
+    return ""
+
+
+def _model_dir_from_orchestrator_lines(lines: list[str]) -> Path | None:
+    for line in reversed(lines):
+        marker = "Model dir:"
+        if marker in line:
+            value = line.split(marker, 1)[1].strip()
+            if value:
+                return Path(value)
+    return None
+
+
+def _count_ai_pseudo_pairs_from_index() -> int:
+    index = dataset_dir() / "index.jsonl"
+    count = 0
+    try:
+        with index.open("r", encoding="utf-8") as file:
+            for line in file:
+                if '"input_kind": "ai_pseudo"' in line or '"input_kind":"ai_pseudo"' in line:
+                    count += 1
+    except OSError:
+        return 0
+    return count
 
 
 def _fit_target_size(width: int, height: int, *, max_edge: int = 1024) -> tuple[int, int]:
@@ -1417,15 +1847,17 @@ def _run_refine_test_from_frozen(raw_args: list[str]) -> int:
 
 
 TRAINING_PARAMETER_HELP = """
-训练轮数：完整扫训练计划几轮。轮数越多越可能学到风格，也越容易过拟合；v2/v3 默认 4。
-每轮步数：每一轮实际训练多少次参数更新。它比“图片数量”更直接决定训练时间；v2/v3 建议 700 到 1200。
-批量大小：每次更新同时喂多少张裁剪 patch。越大越吃显存，梯度越稳；4070 12GB 当前 v2 推荐 4。
-训练裁剪尺寸：从大图里裁出多大的原始像素块。v2 推荐 256；v3 推荐 64，然后内部 2x 放大成 128 送进模型。
+训练轮数：完整扫训练计划几轮。轮数越多越可能学到风格，也越容易过拟合；v4/v4.1 默认 4。
+每轮步数：每一轮实际训练多少次参数更新。它比“图片数量”更直接决定训练时间；v4/v4.1 建议 700 到 1200。
+批量大小：每次更新同时喂多少张裁剪 patch。越大越吃显存，梯度越稳；4070 12GB 当前 v4/v4.1 推荐 4。
+训练裁剪尺寸：从大图里裁出多大的原始像素块。v2 推荐 256；v3/v4/v4.1 推荐 64，然后内部 2x 放大成 128 送进模型。
 验证批次数：每轮结束拿多少批样本检查 loss，不参与训练。
 样本上限：0 表示全量训练；小数值用于快速试参数。
 训练设备：显卡 CUDA 用 NVIDIA GPU；自动选择会优先 CUDA；CPU 只适合排错。
+真实失败样本权重：input_kind=software_candidate 的采样倍数，来自 GameDesigner 右键收集的真实坏图 -> 真像素目标。v4.1 默认 32，是下一轮最关键的训练目标。
+AI伪输入权重：input_kind=ai_pseudo 的采样倍数，来自“真像素反推伪 AI 图”的对照样本。v4.1 默认 16。
 Retrain：会覆盖输出模型包里的 ONNX 权重和 manifest。训练完成后必须重启服务，主程序才会用新模型。
-v3：重叠 tile 训练/推理。服务按 64x64 原像素块、16px 重叠切图，内部 2x 放大给模型学习，再用 2x2 block 缩回原网格，减少整图重绘和像素错位。
+v3/v4/v4.1：重叠 tile 训练/推理。服务按 64x64 原像素块、16px 重叠切图，内部 2x 放大给模型学习，再用 2x2 block 缩回原网格，减少整图重绘和像素错位。
 """.strip()
 
 
@@ -1457,7 +1889,23 @@ licensed_sources.csv：来源记录。
 完整评估：统计尺寸、类别、input_kind、有效 pair 数。
 
 从主程序收集真实失败样本：
-在 GameDesigner 像素图结果列表里，右键一张“不够好但结构对”的候选图，选择“加入 Pixel Refiner 训练对...”，再选择匹配的真像素 PNG。软件会把坏候选保存为 input，把真像素图保存为 target，并写入 input_kind=software_candidate 的 pair。输入图和目标图必须尺寸一致，避免训练学到错误缩放。
+在 GameDesigner 像素图结果列表里，右键一张“不够好但结构对”的候选图，选择“加入真实失败训练对...”，再选择匹配的真像素 PNG。软件会把坏候选保存为 input，把真像素图保存为 target，并写入 input_kind=software_candidate 的 pair。输入图和目标图必须尺寸一致，避免训练学到错误缩放。这个通道是 v4.1 的核心，不再只靠程序退化样本猜失败形态。
+
+导入已授权高质量素材：
+如果你有作者授权包、自己作品、本地购买并允许训练的素材包，使用训练 CLI：
+D:\\GameDesigner\\release\\PixelRefinerConsole.exe --run-training-cli import-authorized-targets "D:\\path\\to\\authorized_pack" --source-id artist_pack --title "Artist Pack" --author "Artist" --rights-basis "Local folder authorized by rights holder for training" --build-pairs --generate-ai-pseudo --ai-pseudo-limit 500
+
+这个命令会批量筛 PNG/JPG/WebP/GIF/BMP，按角色立绘、横板动作角色、角色小图分类，导入 target，再生成程序退化 pair；开启 generate-ai-pseudo 后还会调用当前配置的生图模型生成 input_kind=ai_pseudo 的一对一对照组。
+
+把高质量大图切成重叠训练块：
+D:\\GameDesigner\\release\\PixelRefinerConsole.exe --run-training-cli expand-patches --source-root "D:\\GameDesignerData\\pixel_refiner\\datasets\\gold_pndsndn_v1\\targets\\pndsndn_fc2" --output-source-id pndsndn_fc2_patch64_v1 --title "pndsndn FC2 64px overlapping patches" --author pndsndn --rights-basis "Derived from user-authorized pndsndn_fc2 targets for local Pixel Refiner training" --patch-size 64 --overlap 16 --max-patches 3000 --max-patches-per-image 8 --min-alpha-coverage 0.03 --min-unique-colors 8 --build-pairs
+
+这个命令不会找新网站，只吃已经导入的高质量 target。它把角色立绘/横板角色大图切成 64x64 小块，保留 16px 重叠边缘，优先选择有 alpha 内容、颜色足够丰富、中心内容明确的 patch，再为每个 patch 生成 soft_bilinear、alpha_fringe、palette_drift、lost_detail、dirty_outline 五类程序退化输入。它适合把少量精品素材扩成大量“像素级局部规则”样本，但不能替代真实失败样本和 ai_pseudo 对照组。
+
+抓取你拥有或已授权的平台：
+D:\\GameDesigner\\release\\PixelRefinerConsole.exe --run-training-cli crawl-authorized-site --start-url "https://your-authorized-site.example/gallery" --source-id authorized_site --title "Authorized Site" --author "Artist" --rights-basis "Owned/authorized platform for Pixel Refiner training" --max-pages 500 --build-pairs --generate-ai-pseudo --ai-pseudo-limit 500
+
+这个爬虫只做正常公开 HTTP 抓取：从 start-url 开始，默认只继续爬同一页面域名，下载页面里公开引用的 PNG/JPG/WebP/BMP/GIF。可用 --page-host、--asset-host-contains、--asset-path-contains 收紧范围；不会绕登录、破解私有接口或跳过访问控制。
 
 测试生成页
 
@@ -1465,6 +1913,8 @@ licensed_sources.csv：来源记录。
 D:\\GameDesignerData\\pixel_refiner\\runs\\test_outputs
 
 这里走的就是 GameDesigner 主程序同一条模型服务路径，不是另外写的一套处理逻辑。输出预览默认显示最后一张候选；当候选数量大于 1 时，v2 单输出模型的最后一张通常是“标准”强度结果。
+
+固定评测对比：用当前服务和当前模型跑固定评测集，输出 input | model | target 的 contact sheet。这个图用于比较 v4、v4.1、v5 等不同模型，不靠零散肉眼感觉判断模型有没有进步。右侧输出预览显示 contact sheet，点击可在文件夹中定位文件。
 
 训练页
 
@@ -1481,10 +1931,12 @@ Retrain / 覆盖重训：重新写当前输出模型包的权重和 manifest。�
 验证批次数：每轮结束做多少批验证。
 样本上限：0 表示全量数据；非 0 用于快速实验。
 训练设备：显卡 CUDA / 自动选择 / CPU。
+真实失败样本权重：software_candidate 的采样倍数。v4.1 默认 32，目的是让真实软件失败样本反复进入 batch。
+AI伪输入权重：ai_pseudo 的采样倍数。v4.1 默认 16，优先级低于真实失败样本，但高于程序退化样本。
 
 底层原理
 
-当前 v2/v3/v4 都不是扩散模型，不是从一张纯色图开始一层一层加噪/去噪生成图片。它也不是 Stable Diffusion 那种“从随机噪声里采样出一张图”的流程。
+当前 v2/v3/v4/v4.1 都不是扩散模型，不是从一张纯色图开始一层一层加噪/去噪生成图片。它也不是 Stable Diffusion 那种“从随机噪声里采样出一张图”的流程。
 
 当前模型是监督式 image-to-image 修正：
 input.png -> 模型 -> refined RGB
@@ -1497,7 +1949,7 @@ alpha：透明通道，float32，NCHW，范围 0 到 1。
 模型输出：
 RGB 或 RGBA，float32，范围 0 到 1。服务会按 alpha_mode 保留透明度。
 
-当前 v4 是中型 U-Net/NAFNet 风格修正网络，导出成 ONNX，服务用 ONNX Runtime 跑。它直接看输入图的局部像素和 alpha，通过多尺度特征修正边缘、颜色、透明度和像素块结构；服务输出前还会按 manifest 做 hard pixel output、palette clamp 和 alpha clamp。
+当前 v4/v4.1 是中型 U-Net/NAFNet 风格修正网络，导出成 ONNX，服务用 ONNX Runtime 跑。它直接看输入图的局部像素和 alpha，通过多尺度特征修正边缘、颜色、透明度和像素块结构；服务输出前还会按 manifest 做 hard pixel output、palette clamp 和 alpha clamp。
 
 当前服务还会做一层“保守像素艺术输出层”：
 1. GameDesigner 右键“AI 修正像素画”时，输入就是你当前选中的像素候选图，不再偷偷改用隐藏的原始大图。
@@ -1506,9 +1958,9 @@ RGB 或 RGBA，float32，范围 0 到 1。服务会按 alpha_mode 保留透明�
 4. 调色板优先贴回输入图的颜色体系，再做 alpha clamp，减少全局 median-cut 导致的偏色。
 5. 单输出模型会扩展成多个候选：只清理、保守、强化、标准，方便你直接比较。
 
-v3/v4 的新思路
+v3/v4/v4.1 的新思路
 
-你提出的“小块、重叠、放大后逐像素学习”已经落到 v3/v4 协议里：
+你提出的“小块、重叠、放大后逐像素学习”已经落到 v3/v4/v4.1 协议里：
 1. 训练时从 input/target 对里裁 64x64 原始像素块。
 2. 每块用 Nearest 2x 放大成 128x128，让模型在更大的张量里看每个原始像素的局部关系。
 3. loss 同时看 2x 输出、缩回 1x 后的像素结果、以及每个 2x2 block 内部是否一致。
@@ -1517,7 +1969,12 @@ v3/v4 的新思路
 
 这不是扩散式重绘，而是更接近像素画师“看局部连接、修边、合并色块”的 refiner。它牺牲一些速度，换来更强的像素对齐和局部规则学习。
 
-v4 在 v3 的 tile 训练上继续加三件事：
+patch 扩容和 tile 推理的区别：
+patch 扩容是在数据集阶段把精品大图切成更多 target/pair，让训练更频繁地看到眼睛、发丝、轮廓、手、武器、透明边缘这些局部规则。
+tile 推理是在运行服务时把用户输入图切块送进模型，再拼回整图，保证输出像素网格对齐。
+两者目标不同，但配合起来能让小模型更像“逐块修像素”，而不是整张图平均糊一遍。
+
+v4 在 v3 的 tile 训练上继续加三件事，v4.1 再把真实失败样本权重提上来：
 1. 只用 gold_pndsndn_v1 这种高质量数据作为当前核心训练集。
 2. loss 更重视边缘、局部方差和抗模糊，不再只追平均 RGB。
 3. manifest 开启 hard_pixel_output，服务最后强制 hard alpha、model palette quantize 和小孤立像素清理，避免输出继续软、灰、糊。
@@ -1529,11 +1986,11 @@ v4 在 v3 的 tile 训练上继续加三件事：
 4. 让阴影、亮部、轮廓线、抗锯齿都符合像素画习惯。
 5. 最后做 palette clamp、alpha clamp、nearest cleanup，避免输出软渐变。
 
-所以 v2/v3/v4 不应该只靠普通 RGB loss。需要把像素画技法和限制放进训练目标、后处理和模型结构里。当前 v4 已经加入高质量 gold 数据、重叠 tile、2x block 一致性、抗模糊 loss 和硬像素输出层。
+所以 v2/v3/v4/v4.1 不应该只靠普通 RGB loss。需要把像素画技法和限制放进训练目标、后处理和模型结构里。当前 v4 已经加入高质量 gold 数据、重叠 tile、2x block 一致性、抗模糊 loss 和硬像素输出层；v4.1 的重点是把 software_candidate 真实失败样本变成最高优先级训练目标。
 
 为什么你刚才那张图“不对”
 
-如果输出仍然“不对”，通常不是服务没跑，而是训练 pair 还不够贴近真实软件坏输出。v2 已经比 v1 强很多，但仍需要继续补“软件实际坏输出 -> 真像素目标”的 pair，尤其是 ai_pseudo / software_candidate，而不是只靠程序退化样本。
+如果输出仍然“不对”，通常不是服务没跑，也不一定是模型太小，而是训练目标还没贴到真实失败样本上。下一刀就是 v4.1：继续补“软件实际坏输出 -> 真像素目标”的 pair，尤其是 software_candidate，其次是 ai_pseudo，而不是只靠程序退化样本。
 
 如果输出比输入更灰、更大、更糊，优先检查两件事：第一，主程序是否已经更新到“选中像素图作为输入”的版本；第二，强度是否过高。当前推荐先用 0.45 到 0.65，强化候选只作为比较，不一定是默认最好结果。
 
@@ -1551,7 +2008,7 @@ SwinIR / Restormer / NAFNet 类图像修复模型：更适合“去模糊、去�
 
 1. 用 GameDesigner 多生成一些你觉得“不对但结构对”的候选图。
 2. 把这些图作为 input，和高质量真像素 target 配成 pairs。
-3. 用 Retrain 覆盖训练 pixel-refiner-v4，旧的 v2/v3 只作为对照。
+3. 选择 Pixel Refiner V4.1，用 Retrain 覆盖训练 pixel-refiner-v4.1-real-failures，旧的 v2/v3/v4 只作为对照。
 4. 每轮训练后重启服务，再在主程序里右键“AI 修正像素画”验证。
 """.strip()
 

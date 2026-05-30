@@ -11,6 +11,7 @@ from PIL import Image, ImageDraw, ImageOps
 
 from .paths import pixel_refiner_eval_root
 from .pixel_refiner_dataset import PixelRefinerPairRecord, load_pair_records
+from .pixel_refiner import PixelRefinerRequest, refine_pixel_art_with_service
 
 
 EVAL_MANIFEST_FILE = "fixed_eval_manifest.jsonl"
@@ -196,6 +197,158 @@ def render_fixed_eval_contact_sheet(
     }
 
 
+def run_fixed_eval_model(
+    *,
+    service_url: str = "http://127.0.0.1:8765",
+    model_dir: str | Path | None = None,
+    model_id: str = "pixel-refiner-v4",
+    output_dir: str | Path | None = None,
+    limit: int = DEFAULT_EVAL_LIMIT,
+    cell_size: int = 160,
+    strength: float = 0.45,
+    palette_limit: int = 64,
+    alpha_mode: str = "preserve",
+    return_candidates: int = 1,
+    timeout: int = 300,
+    build_suite_if_empty: bool = True,
+) -> dict[str, Any]:
+    ensure_eval_dirs()
+    items = load_fixed_eval_suite()
+    if not items and build_suite_if_empty:
+        build_fixed_eval_suite(limit=max(1, int(limit or DEFAULT_EVAL_LIMIT)))
+        items = load_fixed_eval_suite()
+    if limit > 0:
+        items = items[: max(1, int(limit))]
+    if not items:
+        return {"ok": False, "error": "fixed eval suite is empty"}
+
+    model_label = _safe_name(model_id or "model")
+    run_root = Path(output_dir).expanduser() if output_dir else eval_runs_dir() / f"{model_label}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    outputs_root = run_root / "outputs"
+    outputs_root.mkdir(parents=True, exist_ok=True)
+
+    results: list[dict[str, Any]] = []
+    output_by_item: dict[str, Path] = {}
+    errors: list[dict[str, str]] = []
+    for item in items:
+        item_output_dir = outputs_root / item.item_id
+        try:
+            result = refine_pixel_art_with_service(
+                PixelRefinerRequest(
+                    input_path=item.input_path,
+                    output_dir=item_output_dir,
+                    target_size=_item_target_size(item),
+                    alpha_mode=alpha_mode,
+                    palette_limit=max(0, int(palette_limit)),
+                    strength=max(0.0, min(1.0, float(strength))),
+                    return_candidates=max(1, min(8, int(return_candidates))),
+                    model_dir=Path(model_dir).expanduser() if model_dir else None,
+                    model_id=str(model_id or "").strip() or "pixel-refiner-v4",
+                ),
+                service_url=service_url,
+                timeout=max(1, int(timeout)),
+            )
+            chosen = result.outputs[-1].path
+            output_by_item[item.item_id] = chosen
+            results.append(
+                {
+                    "item_id": item.item_id,
+                    "ok": True,
+                    "input_path": str(item.input_path),
+                    "output_path": str(chosen),
+                    "reference_path": str(item.reference_path),
+                    "model": result.model,
+                    "checks": result.checks,
+                }
+            )
+        except Exception as exc:
+            error = {
+                "item_id": item.item_id,
+                "ok": False,
+                "input_path": str(item.input_path),
+                "reference_path": str(item.reference_path),
+                "type": type(exc).__name__,
+                "message": str(exc),
+            }
+            results.append(error)
+            errors.append({"item_id": item.item_id, "message": str(exc)})
+
+    manifest_path = run_root / "model_eval_manifest.jsonl"
+    with manifest_path.open("w", encoding="utf-8") as file:
+        for result in results:
+            file.write(json.dumps(result, ensure_ascii=False) + "\n")
+
+    contact_sheet = run_root / "contact_sheet.png"
+    sheet_result = render_model_eval_contact_sheet(
+        items=items,
+        model_outputs=output_by_item,
+        output_path=contact_sheet,
+        model_label=str(model_id or "model"),
+        cell_size=cell_size,
+    )
+    return {
+        "ok": not errors,
+        "model_id": str(model_id or ""),
+        "model_dir": str(model_dir or ""),
+        "run_dir": str(run_root),
+        "manifest": str(manifest_path),
+        "contact_sheet": str(contact_sheet),
+        "items": len(items),
+        "succeeded": len(output_by_item),
+        "failed": len(errors),
+        "errors": errors[:10],
+        "columns": sheet_result.get("columns", []),
+    }
+
+
+def render_model_eval_contact_sheet(
+    *,
+    items: list[EvalSuiteItem],
+    model_outputs: dict[str, Path],
+    output_path: str | Path,
+    model_label: str,
+    cell_size: int = 160,
+) -> dict[str, Any]:
+    if not items:
+        return {"ok": False, "error": "no eval items"}
+
+    cell_size = max(64, min(512, int(cell_size)))
+    label_height = 34
+    padding = 12
+    columns = [
+        ("input", "input_path"),
+        (model_label or "model", "model_output"),
+        ("target", "reference_path"),
+    ]
+    sheet_width = padding + len(columns) * (cell_size + padding)
+    sheet_height = padding + len(items) * (cell_size + label_height + padding)
+    sheet = Image.new("RGB", (sheet_width, sheet_height), (246, 246, 248))
+    draw = ImageDraw.Draw(sheet)
+
+    for row, item in enumerate(items):
+        top = padding + row * (cell_size + label_height + padding)
+        for column, (label, attr) in enumerate(columns):
+            left = padding + column * (cell_size + padding)
+            if attr == "model_output":
+                path = model_outputs.get(item.item_id)
+                thumb = _thumbnail_on_checkerboard(path, cell_size) if path else _failed_thumbnail(cell_size)
+            else:
+                path = getattr(item, attr)
+                thumb = _thumbnail_on_checkerboard(path, cell_size)
+            sheet.paste(thumb, (left, top + label_height))
+            draw.text((left, top), _contact_label(item, label), fill=(30, 30, 34))
+
+    target_path = Path(output_path).expanduser()
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(target_path, format="PNG", optimize=True)
+    return {
+        "ok": True,
+        "path": str(target_path),
+        "items": len(items),
+        "columns": [label for label, _ in columns],
+    }
+
+
 def _select_eval_records(
     records: list[PixelRefinerPairRecord],
     *,
@@ -302,6 +455,33 @@ def _thumbnail_on_checkerboard(path: Path, cell_size: int) -> Image.Image:
     top = (cell_size - image.height) // 2
     canvas.alpha_composite(image, (left, top))
     return canvas.convert("RGB")
+
+
+def _failed_thumbnail(cell_size: int) -> Image.Image:
+    image = Image.new("RGB", (cell_size, cell_size), (248, 240, 240))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((0, 0, cell_size - 1, cell_size - 1), outline=(210, 72, 72), width=2)
+    draw.line((10, 10, cell_size - 10, cell_size - 10), fill=(210, 72, 72), width=2)
+    draw.line((cell_size - 10, 10, 10, cell_size - 10), fill=(210, 72, 72), width=2)
+    draw.text((12, max(12, cell_size // 2 - 8)), "failed", fill=(120, 36, 36))
+    return image
+
+
+def _item_target_size(item: EvalSuiteItem) -> str:
+    if item.width > 0 and item.height > 0:
+        return f"{item.width}x{item.height}"
+    try:
+        with Image.open(item.input_path) as loaded:
+            image = ImageOps.exif_transpose(loaded)
+            return f"{image.width}x{image.height}"
+    except OSError:
+        return "auto"
+
+
+def _contact_label(item: EvalSuiteItem, label: str) -> str:
+    prefix = f"{item.item_id} " if label == "input" else ""
+    text = f"{prefix}{label}"
+    return text[:42]
 
 
 def _checkerboard(width: int, height: int, step: int = 8) -> Image.Image:

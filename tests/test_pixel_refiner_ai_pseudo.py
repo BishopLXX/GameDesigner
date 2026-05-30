@@ -93,6 +93,25 @@ class PixelRefinerAiPseudoTests(unittest.TestCase):
                 self.assertEqual(pairs[0].width, 64)
                 self.assertEqual(pairs[0].height, 80)
 
+    def test_select_target_paths_can_filter_large_scene_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            sprite = root / "demo_source" / "character_sprite" / "hero.png"
+            scene = root / "demo_source" / "character_sprite" / "scene.png"
+            sprite.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("RGBA", (96, 144), (20, 40, 80, 255)).save(sprite)
+            Image.new("RGBA", (512, 384), (20, 40, 80, 255)).save(scene)
+
+            selected = select_target_paths(
+                root,
+                source_id="demo_source",
+                limit=0,
+                max_width=320,
+                max_height=320,
+            )
+
+            self.assertEqual(selected, [sprite])
+
 
 if __name__ == "__main__":
     unittest.main()

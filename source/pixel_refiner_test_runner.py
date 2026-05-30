@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from gamedesigner.pixel_refiner import PixelRefinerRequest, refine_pixel_art_with_service
+from gamedesigner.pixel_refiner import DEFAULT_PIXEL_REFINER_MODEL_ID, PixelRefinerRequest, refine_pixel_art_with_service
 
 
 def run_refine_test(args: argparse.Namespace) -> dict[str, Any]:
@@ -59,7 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--target-size", required=True)
-    parser.add_argument("--model-id", default="pixel-refiner-v2")
+    parser.add_argument("--model-id", default=DEFAULT_PIXEL_REFINER_MODEL_ID)
     parser.add_argument("--model-dir", default="")
     parser.add_argument("--alpha-mode", default="preserve")
     parser.add_argument("--palette-limit", type=int, default=64)

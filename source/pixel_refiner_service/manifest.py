@@ -9,7 +9,7 @@ from .errors import ModelPackageError
 from gamedesigner.paths import pixel_refiner_model_dir
 
 
-DEFAULT_MODEL_ID = "pixel-refiner-v2"
+DEFAULT_MODEL_ID = "pixel-refiner-v4"
 MANIFEST_FILE = "model_manifest.json"
 SUPPORTED_RUNTIMES = {"onnxruntime"}
 
