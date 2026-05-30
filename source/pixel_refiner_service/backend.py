@@ -51,16 +51,10 @@ class OnnxPixelRefinerBackend(PixelRefinerBackend):
         import numpy as np
 
         source_image = _load_rgba(job.input_path, job.target_size)
-        rgb, alpha = _image_to_model_input(source_image)
-        inputs = self._session_inputs(rgb, alpha, job)
-        try:
-            raw_outputs = self.session.run(None, inputs)
-        except Exception as exc:
-            raise BackendUnavailableError("ONNX 像素修正推理失败。") from exc
-        if not raw_outputs:
-            raise BackendUnavailableError("ONNX 模型没有返回输出张量。")
-        tensor = np.asarray(raw_outputs[0])
-        images = _tensor_to_images(tensor, alpha if job.alpha_mode == "preserve" else None)
+        if self.manifest.tiled_inference:
+            images = self._tiled_refine_images(source_image, job)
+        else:
+            images = self._refine_images(source_image, job)
         if not images:
             raise BackendUnavailableError("ONNX 模型输出无法转换为图片。")
         candidate_specs = _candidate_specs(images, job.return_candidates, job.strength)
@@ -72,7 +66,16 @@ class OnnxPixelRefinerBackend(PixelRefinerBackend):
                 strength=variant_strength,
                 alpha_mode=job.alpha_mode,
             )
-            if self.manifest.pixel_art_cleanup:
+            if self.manifest.hard_pixel_output:
+                candidate = _apply_pixel_art_hard_output_layer(
+                    candidate,
+                    palette_limit=job.palette_limit or self.manifest.palette_limit,
+                    alpha_threshold=self.manifest.alpha_threshold,
+                    source_image=source_image,
+                    palette_strategy=self.manifest.palette_strategy,
+                    cluster_cleanup=self.manifest.cluster_cleanup,
+                )
+            elif self.manifest.pixel_art_cleanup:
                 candidate = _apply_pixel_art_cleanup(
                     candidate,
                     palette_limit=job.palette_limit or self.manifest.palette_limit,
@@ -83,6 +86,73 @@ class OnnxPixelRefinerBackend(PixelRefinerBackend):
             candidate.save(path, format="PNG", optimize=True)
             outputs.append(RefineOutput(path=path, label=f"AI 像素修正 {variant_label}"))
         return outputs
+
+    def _refine_images(self, image: Image.Image, job: RefineJob) -> list[Image.Image]:
+        import numpy as np
+
+        rgb, alpha = _image_to_model_input(image)
+        inputs = self._session_inputs(rgb, alpha, job)
+        try:
+            raw_outputs = self.session.run(None, inputs)
+        except Exception as exc:
+            raise BackendUnavailableError("ONNX 像素修正推理失败。") from exc
+        if not raw_outputs:
+            raise BackendUnavailableError("ONNX 模型没有返回输出张量。")
+        tensor = np.asarray(raw_outputs[0])
+        return _tensor_to_images(tensor, alpha if job.alpha_mode == "preserve" else None)
+
+    def _tiled_refine_images(self, source_image: Image.Image, job: RefineJob) -> list[Image.Image]:
+        import numpy as np
+
+        tile_size = max(16, int(self.manifest.tile_size or 64))
+        tile_overlap = max(0, min(tile_size - 1, int(self.manifest.tile_overlap or tile_size // 4)))
+        internal_scale = max(1, min(8, int(self.manifest.internal_scale or 1)))
+        width, height = source_image.size
+        x_positions = _tile_positions(width, tile_size, tile_overlap)
+        y_positions = _tile_positions(height, tile_size, tile_overlap)
+        accum = np.zeros((height, width, 4), dtype=np.float32)
+        weights = np.zeros((height, width, 1), dtype=np.float32)
+        for top in y_positions:
+            for left in x_positions:
+                crop_width = min(tile_size, width - left)
+                crop_height = min(tile_size, height - top)
+                if crop_width <= 0 or crop_height <= 0:
+                    continue
+                tile = Image.new("RGBA", (tile_size, tile_size), (0, 0, 0, 0))
+                crop = source_image.crop((left, top, left + crop_width, top + crop_height))
+                tile.alpha_composite(crop, (0, 0))
+                model_tile = tile
+                if internal_scale > 1:
+                    model_tile = tile.resize(
+                        (tile_size * internal_scale, tile_size * internal_scale),
+                        Image.Resampling.NEAREST,
+                    )
+                refined_tiles = self._refine_images(model_tile, job)
+                if not refined_tiles:
+                    continue
+                refined_tile = refined_tiles[0].convert("RGBA")
+                if internal_scale > 1:
+                    refined_tile = _downscale_pixel_blocks(refined_tile, internal_scale, (tile_size, tile_size))
+                elif refined_tile.size != (tile_size, tile_size):
+                    refined_tile = refined_tile.resize((tile_size, tile_size), Image.Resampling.BOX)
+                refined_crop = refined_tile.crop((0, 0, crop_width, crop_height))
+                tile_array = np.asarray(refined_crop, dtype=np.float32)
+                blend = _tile_blend_weights(
+                    crop_width,
+                    crop_height,
+                    overlap=tile_overlap,
+                    touches_left=left == 0,
+                    touches_top=top == 0,
+                    touches_right=left + crop_width >= width,
+                    touches_bottom=top + crop_height >= height,
+                )
+                accum[top : top + crop_height, left : left + crop_width, :] += tile_array * blend
+                weights[top : top + crop_height, left : left + crop_width, :] += blend
+        weights = np.maximum(weights, 1.0e-6)
+        rgba = np.clip(accum / weights, 0.0, 255.0)
+        if job.alpha_mode == "preserve":
+            rgba[:, :, 3] = np.asarray(source_image.getchannel("A"), dtype=np.float32)
+        return [Image.fromarray(np.rint(rgba).astype(np.uint8), mode="RGBA")]
 
     def _session_inputs(self, rgb, alpha, job: RefineJob) -> dict[str, object]:
         input_names = {item.name for item in self.session.get_inputs()}
@@ -176,6 +246,66 @@ def _tensor_to_images(tensor, preserved_alpha) -> list[Image.Image]:
         rgba = np.concatenate([rgb, alpha], axis=2)
         images.append(Image.fromarray((rgba * 255.0).round().astype(np.uint8), mode="RGBA"))
     return images
+
+
+def _tile_positions(length: int, tile_size: int, overlap: int) -> list[int]:
+    length = max(1, int(length))
+    tile_size = max(1, int(tile_size))
+    overlap = max(0, min(tile_size - 1, int(overlap)))
+    if length <= tile_size:
+        return [0]
+    stride = max(1, tile_size - overlap)
+    last = length - tile_size
+    positions = list(range(0, last + 1, stride))
+    if positions[-1] != last:
+        positions.append(last)
+    return positions
+
+
+def _tile_blend_weights(
+    width: int,
+    height: int,
+    *,
+    overlap: int,
+    touches_left: bool,
+    touches_top: bool,
+    touches_right: bool,
+    touches_bottom: bool,
+):
+    import numpy as np
+
+    width = max(1, int(width))
+    height = max(1, int(height))
+    overlap = max(0, int(overlap))
+    x = np.ones(width, dtype=np.float32)
+    y = np.ones(height, dtype=np.float32)
+    fade_x = min(overlap, width // 2)
+    fade_y = min(overlap, height // 2)
+    if fade_x > 0 and not touches_left:
+        x[:fade_x] = np.linspace(0.05, 1.0, fade_x, dtype=np.float32)
+    if fade_x > 0 and not touches_right:
+        x[-fade_x:] = np.linspace(1.0, 0.05, fade_x, dtype=np.float32)
+    if fade_y > 0 and not touches_top:
+        y[:fade_y] = np.linspace(0.05, 1.0, fade_y, dtype=np.float32)
+    if fade_y > 0 and not touches_bottom:
+        y[-fade_y:] = np.linspace(1.0, 0.05, fade_y, dtype=np.float32)
+    return (y[:, None] * x[None, :])[:, :, None]
+
+
+def _downscale_pixel_blocks(image: Image.Image, scale: int, output_size: tuple[int, int]) -> Image.Image:
+    import numpy as np
+
+    scale = max(1, int(scale))
+    output_width, output_height = output_size
+    if scale <= 1:
+        return image.convert("RGBA").resize(output_size, Image.Resampling.BOX) if image.size != output_size else image.convert("RGBA")
+    expected_size = output_width * scale, output_height * scale
+    rgba = image.convert("RGBA")
+    if rgba.size != expected_size:
+        rgba = rgba.resize(expected_size, Image.Resampling.BOX)
+    array = np.asarray(rgba, dtype=np.float32)
+    array = array.reshape(output_height, scale, output_width, scale, 4).mean(axis=(1, 3))
+    return Image.fromarray(np.rint(np.clip(array, 0.0, 255.0)).astype(np.uint8), mode="RGBA")
 
 
 def _candidate_specs(
@@ -326,6 +456,40 @@ def _apply_pixel_art_cleanup(
     return _quantize_opaque_pixels(rgba, palette_limit=palette_limit, alpha_threshold=alpha_threshold)
 
 
+def _apply_pixel_art_hard_output_layer(
+    image: Image.Image,
+    *,
+    palette_limit: int,
+    alpha_threshold: int,
+    source_image: Image.Image | None = None,
+    palette_strategy: str = "model_quantized",
+    cluster_cleanup: bool = True,
+) -> Image.Image:
+    rgba = image.convert("RGBA")
+    alpha_threshold = max(0, min(255, int(alpha_threshold)))
+    if alpha_threshold > 0:
+        alpha = rgba.getchannel("A").point(lambda value: 255 if value >= alpha_threshold else 0)
+        rgba.putalpha(alpha)
+    palette_limit = max(0, min(256, int(palette_limit or 0)))
+    if palette_limit > 0:
+        strategy = str(palette_strategy or "model_quantized").strip().lower()
+        if strategy == "source":
+            source_palette = _palette_from_source_image(
+                source_image,
+                palette_limit=palette_limit,
+                alpha_threshold=alpha_threshold,
+            )
+            if source_palette:
+                rgba = _snap_to_palette(rgba, source_palette, alpha_threshold=alpha_threshold)
+            else:
+                rgba = _quantize_opaque_pixels(rgba, palette_limit=palette_limit, alpha_threshold=alpha_threshold)
+        else:
+            rgba = _quantize_opaque_pixels(rgba, palette_limit=palette_limit, alpha_threshold=alpha_threshold)
+    if cluster_cleanup:
+        rgba = _remove_single_pixel_alpha_noise(rgba, alpha_threshold=alpha_threshold)
+    return rgba
+
+
 def _palette_from_source_image(
     source_image: Image.Image | None,
     *,
@@ -412,6 +576,59 @@ def _quantized_palette(colors: list[tuple[int, int, int]], limit: int) -> list[t
         dither=Image.Dither.NONE,
     ).convert("RGB")
     return sorted(set(tuple(pixel[:3]) for pixel in _flatten_pixels(quantized)))
+
+
+def _remove_single_pixel_alpha_noise(image: Image.Image, *, alpha_threshold: int) -> Image.Image:
+    import numpy as np
+
+    array = np.asarray(image.convert("RGBA"), dtype=np.uint8).copy()
+    opaque = array[:, :, 3] >= max(1, int(alpha_threshold))
+    if not bool(opaque.any()):
+        return image.convert("RGBA")
+    padded = np.pad(opaque, 1, mode="constant", constant_values=False)
+    neighbors = (
+        padded[:-2, 1:-1].astype(np.uint8)
+        + padded[2:, 1:-1].astype(np.uint8)
+        + padded[1:-1, :-2].astype(np.uint8)
+        + padded[1:-1, 2:].astype(np.uint8)
+        + padded[:-2, :-2].astype(np.uint8)
+        + padded[:-2, 2:].astype(np.uint8)
+        + padded[2:, :-2].astype(np.uint8)
+        + padded[2:, 2:].astype(np.uint8)
+    )
+    isolated_opaque = opaque & (neighbors == 0)
+    isolated_holes = (~opaque) & (neighbors >= 7)
+    if bool(isolated_opaque.any()):
+        array[isolated_opaque] = 0
+    if bool(isolated_holes.any()):
+        filled_rgb = _neighbor_average_rgb(array, isolated_holes)
+        rgb_view = array[:, :, :3]
+        alpha_view = array[:, :, 3]
+        rgb_view[isolated_holes] = filled_rgb
+        alpha_view[isolated_holes] = 255
+    return Image.fromarray(array, mode="RGBA")
+
+
+def _neighbor_average_rgb(array, mask):
+    import numpy as np
+
+    rgb = array[:, :, :3].astype(np.float32)
+    alpha = array[:, :, 3] > 0
+    padded_rgb = np.pad(rgb, ((1, 1), (1, 1), (0, 0)), mode="edge")
+    padded_alpha = np.pad(alpha, 1, mode="constant", constant_values=False)
+    total = np.zeros_like(rgb)
+    count = np.zeros(rgb.shape[:2], dtype=np.float32)
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dx == 0 and dy == 0:
+                continue
+            neighbor_alpha = padded_alpha[1 + dy : 1 + dy + alpha.shape[0], 1 + dx : 1 + dx + alpha.shape[1]]
+            neighbor_rgb = padded_rgb[1 + dy : 1 + dy + alpha.shape[0], 1 + dx : 1 + dx + alpha.shape[1], :]
+            total += neighbor_rgb * neighbor_alpha[:, :, None]
+            count += neighbor_alpha.astype(np.float32)
+    count = np.maximum(count, 1.0)
+    averaged = np.rint(np.clip(total / count[:, :, None], 0.0, 255.0)).astype(np.uint8)
+    return averaged[mask]
 
 
 def _flatten_pixels(image: Image.Image) -> list[tuple[int, ...]]:

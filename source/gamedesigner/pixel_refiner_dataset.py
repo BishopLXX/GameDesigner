@@ -13,10 +13,17 @@ from typing import Any
 from PIL import Image, ImageOps
 
 from .storage import APP_NAME
-from .paths import pixel_refiner_data_root
+from .paths import (
+    DEFAULT_PIXEL_REFINER_DATASET_ID,
+    LEGACY_PIXEL_REFINER_DATASET_ID,
+    legacy_pixel_refiner_data_root,
+    pixel_refiner_data_root,
+)
 
 
-PIXEL_REFINER_DATASET_VERSION = "character_large_v1"
+PIXEL_REFINER_DATASET_VERSION = DEFAULT_PIXEL_REFINER_DATASET_ID
+PIXEL_REFINER_LEGACY_DATASET_VERSION = LEGACY_PIXEL_REFINER_DATASET_ID
+PIXEL_REFINER_LAYOUT_VERSION = "datasets_v2"
 PIXEL_REFINER_DATASET_ROOT_NAME = "pixel_refiner"
 PIXEL_REFINER_SOURCE_CSV = "licensed_sources.csv"
 PIXEL_REFINER_INDEX_FILE = "index.jsonl"
@@ -73,6 +80,10 @@ def global_dataset_root() -> Path:
     return pixel_refiner_data_root(PIXEL_REFINER_DATASET_VERSION)
 
 
+def legacy_dataset_root() -> Path:
+    return legacy_pixel_refiner_data_root(PIXEL_REFINER_LEGACY_DATASET_VERSION)
+
+
 def dataset_dir() -> Path:
     return global_dataset_root()
 
@@ -106,8 +117,61 @@ def index_path() -> Path:
 
 
 def ensure_dataset_dirs() -> None:
+    migrate_legacy_dataset_if_needed()
     for folder in (dataset_dir(), targets_dir(), inputs_dir(), pairs_dir(), eval_dir(), generated_inputs_dir()):
         folder.mkdir(parents=True, exist_ok=True)
+    repair_dataset_index_paths()
+
+
+def migrate_legacy_dataset_if_needed() -> bool:
+    current = global_dataset_root()
+    legacy = legacy_dataset_root()
+    if current.exists() or not legacy.exists():
+        return False
+    current.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(legacy), str(current))
+    repair_dataset_index_paths()
+    return True
+
+
+def repair_dataset_index_paths() -> bool:
+    index = index_path()
+    if not index.is_file():
+        return False
+    legacy_text = str(legacy_dataset_root())
+    current_text = str(global_dataset_root())
+    if legacy_text == current_text:
+        return False
+    try:
+        lines = index.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    changed = False
+    repaired_lines: list[str] = []
+    for line in lines:
+        text = line.strip()
+        if not text:
+            continue
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            repaired_lines.append(line)
+            continue
+        if isinstance(data, dict):
+            for key in ("target_path", "input_path"):
+                value = str(data.get(key) or "")
+                normalized = value.replace("/", "\\")
+                if normalized.lower().startswith(legacy_text.lower()):
+                    suffix = normalized[len(legacy_text) :].lstrip("\\")
+                    data[key] = str(Path(current_text) / suffix)
+                    changed = True
+            repaired_lines.append(json.dumps(data, ensure_ascii=False))
+        else:
+            repaired_lines.append(line)
+    if not changed:
+        return False
+    index.write_text("\n".join(repaired_lines) + "\n", encoding="utf-8")
+    return True
 
 
 def add_source_record(record: PixelRefinerSourceRecord) -> None:
@@ -409,6 +473,8 @@ def summarize_dataset() -> dict[str, Any]:
     categories = sorted({record.category for record in records if record.category})
     return {
         "dataset_dir": str(dataset_dir()),
+        "dataset_id": PIXEL_REFINER_DATASET_VERSION,
+        "layout_version": PIXEL_REFINER_LAYOUT_VERSION,
         "targets": target_count,
         "inputs": input_count,
         "generated_inputs": generated_input_count,

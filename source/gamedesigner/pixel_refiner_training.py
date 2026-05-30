@@ -17,10 +17,15 @@ from .pixel_refiner_dataset import PixelRefinerPairRecord, dataset_dir, load_pai
 
 MODEL_ID = "pixel-refiner-v1"
 V2_MODEL_ID = "pixel-refiner-v2"
+V3_MODEL_ID = "pixel-refiner-v3"
+V4_MODEL_ID = "pixel-refiner-v4"
 MODEL_VERSION = "0.1.0"
 MODEL_FILENAME = "pixel_refiner_v1.onnx"
 V2_MODEL_FILENAME = "pixel_refiner_v2.onnx"
+V3_MODEL_FILENAME = "pixel_refiner_v3.onnx"
+V4_MODEL_FILENAME = "pixel_refiner_v4.onnx"
 INPUT_KIND_SAMPLE_WEIGHTS = {
+    "software_candidate": 16.0,
     "ai_pseudo": 8.0,
     "soft_bilinear": 1.0,
     "alpha_fringe": 1.0,
@@ -58,6 +63,13 @@ class PixelRefinerTrainConfig:
     palette_levels: int = 64
     alpha_threshold: int = 128
     pixel_constraint_weight: float = 0.08
+    internal_scale: int = 1
+    tile_overlap: int = 0
+    block_consistency_weight: float = 0.0
+    edge_loss_weight: float = 0.25
+    anti_blur_weight: float = 0.0
+    grad_clip: float = 1.0
+    event_log_path: Path | None = None
 
 
 def train_pixel_refiner(config: PixelRefinerTrainConfig) -> dict[str, Any]:
@@ -87,30 +99,30 @@ def train_pixel_refiner(config: PixelRefinerTrainConfig) -> dict[str, Any]:
 
     training_log: list[dict[str, Any]] = []
     total_steps = 0
-    print(
-        json.dumps(
-            {
-                "event": "train_start",
-                "records": len(records),
-                "train_records": len(train_records),
-                "val_records": len(val_records),
-                "device": str(device),
-                "model_id": config.model_id,
-                "architecture": config.architecture,
-                "epochs": config.epochs,
-                "steps_per_epoch": config.steps_per_epoch,
-                "batch_size": config.batch_size,
-                "patch_size": config.patch_size,
-            },
-            ensure_ascii=False,
-        ),
-        flush=True,
+    _emit_training_event(
+        {
+            "event": "train_start",
+            "records": len(records),
+            "train_records": len(train_records),
+            "val_records": len(val_records),
+            "device": str(device),
+            "model_id": config.model_id,
+            "architecture": config.architecture,
+            "epochs": config.epochs,
+            "steps_per_epoch": config.steps_per_epoch,
+            "batch_size": config.batch_size,
+            "patch_size": config.patch_size,
+            "model_input_size": _model_input_patch_size(config),
+            "internal_scale": config.internal_scale,
+        },
+        config,
     )
 
     for epoch in range(1, config.epochs + 1):
         train_dataset = PairPatchDataset(
             train_records,
             patch_size=config.patch_size,
+            internal_scale=config.internal_scale,
             length=max(1, config.steps_per_epoch * config.batch_size),
             seed=config.seed + epoch,
             weighted=True,
@@ -135,17 +147,26 @@ def train_pixel_refiner(config: PixelRefinerTrainConfig) -> dict[str, Any]:
             with torch.cuda.amp.autocast(enabled=use_amp):
                 refined = model(image, alpha)
                 loss = _refiner_loss(refined, target, target_alpha, torch, config=config)
+            if not bool(torch.isfinite(loss).all().detach().cpu()):
+                event = {"event": "train_abort", "reason": "non_finite_loss", "epoch": epoch, "step": step}
+                _emit_training_event(event, config)
+                raise RuntimeError(f"Non-finite training loss at epoch {epoch} step {step}.")
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            if config.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(config.grad_clip))
             scaler.step(optimizer)
             scaler.update()
             running += float(loss.detach().cpu())
             if step == 1 or step % max(1, config.log_interval) == 0:
                 avg = running / step
                 event = {"event": "train_step", "epoch": epoch, "step": step, "loss": round(avg, 6)}
-                print(json.dumps(event, ensure_ascii=False), flush=True)
+                _emit_training_event(event, config)
         val_loss = _validate(model, val_records, config, device, torch)
+        if not math.isfinite(float(val_loss)):
+            event = {"event": "train_abort", "reason": "non_finite_val_loss", "epoch": epoch}
+            _emit_training_event(event, config)
+            raise RuntimeError(f"Non-finite validation loss at epoch {epoch}.")
         epoch_event = {
             "event": "epoch_end",
             "epoch": epoch,
@@ -153,7 +174,7 @@ def train_pixel_refiner(config: PixelRefinerTrainConfig) -> dict[str, Any]:
             "val_loss": round(val_loss, 6),
         }
         training_log.append(epoch_event)
-        print(json.dumps(epoch_event, ensure_ascii=False), flush=True)
+        _emit_training_event(epoch_event, config)
         checkpoint_path = checkpoints_dir / f"{_safe_model_file_stem(config.model_id)}_epoch_{epoch:03d}.pt"
         torch.save(
             {
@@ -166,7 +187,7 @@ def train_pixel_refiner(config: PixelRefinerTrainConfig) -> dict[str, Any]:
         )
 
     weights_path = config.output_dir / "weights" / _model_filename(config.model_id)
-    export_onnx(model, weights_path, patch_size=config.patch_size, torch=torch)
+    export_onnx(model, weights_path, patch_size=_model_input_patch_size(config), torch=torch)
     manifest_path = write_model_manifest(
         config.output_dir,
         weights_path=weights_path,
@@ -195,12 +216,14 @@ class PairPatchDataset:
         records: Sequence[PixelRefinerPairRecord],
         *,
         patch_size: int,
+        internal_scale: int = 1,
         length: int,
         seed: int,
         weighted: bool,
     ) -> None:
         self.records = list(records)
         self.patch_size = int(patch_size)
+        self.internal_scale = max(1, int(internal_scale))
         self.length = int(length)
         self.seed = int(seed)
         self.weighted = bool(weighted)
@@ -223,6 +246,10 @@ class PairPatchDataset:
         if rng.random() < 0.5:
             input_patch = ImageOps.mirror(input_patch)
             target_patch = ImageOps.mirror(target_patch)
+        if self.internal_scale > 1:
+            scaled_size = self.patch_size * self.internal_scale
+            input_patch = input_patch.resize((scaled_size, scaled_size), Image.Resampling.NEAREST)
+            target_patch = target_patch.resize((scaled_size, scaled_size), Image.Resampling.NEAREST)
         input_array = _rgba_array(input_patch)
         target_array = _rgba_array(target_patch)
         return {
@@ -275,17 +302,30 @@ def write_model_manifest(
         "weights": str(relative_weights).replace("\\", "/"),
         "target_sizes": [],
         "alpha_modes": ["preserve"],
-        "recommended_vram_mb": 4096 if _is_v2(config) else 1024,
+        "recommended_vram_mb": 8192 if _is_v4(config) else (6144 if _is_v3(config) else (4096 if _is_v2(config) else 1024)),
         "trained_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
         "dataset_dir": str(dataset_dir()),
         "training_pairs": records,
         "architecture": config.architecture,
         "patch_size": config.patch_size,
+        "model_input_size": _model_input_patch_size(config),
         "features": config.features,
         "pixel_art_cleanup": _is_v2(config),
+        "hard_pixel_output": _is_v4(config),
+        "output_layer_version": "v4-hard-pixel" if _is_v4(config) else ("v2-cleanup" if _is_v2(config) else ""),
+        "palette_strategy": "model_quantized" if _is_v4(config) else "source",
+        "cluster_cleanup": _is_v4(config),
         "palette_limit": config.palette_levels if _is_v2(config) else 0,
         "alpha_threshold": config.alpha_threshold if _is_v2(config) else 128,
         "pixel_constraint_weight": config.pixel_constraint_weight if _is_v2(config) else 0.0,
+        "internal_scale": max(1, int(config.internal_scale)),
+        "tiled_inference": _uses_tiled_inference(config),
+        "tile_size": config.patch_size if _uses_tiled_inference(config) else 0,
+        "tile_overlap": max(0, int(config.tile_overlap)) if _uses_tiled_inference(config) else 0,
+        "block_consistency_weight": max(0.0, float(config.block_consistency_weight)),
+        "edge_loss_weight": max(0.0, float(config.edge_loss_weight)),
+        "anti_blur_weight": max(0.0, float(config.anti_blur_weight)),
+        "grad_clip": max(0.0, float(config.grad_clip)),
         "sample_weights": {
             "input_kind": INPUT_KIND_SAMPLE_WEIGHTS,
             "category": CATEGORY_SAMPLE_WEIGHTS,
@@ -327,6 +367,7 @@ def _validate(model: Any, records: Sequence[PixelRefinerPairRecord], config: Pix
     dataset = PairPatchDataset(
         records,
         patch_size=config.patch_size,
+        internal_scale=config.internal_scale,
         length=max(1, config.val_batches * config.batch_size),
         seed=config.seed + 9001,
         weighted=False,
@@ -358,12 +399,23 @@ def _refiner_loss(refined: Any, target: Any, target_alpha: Any, torch: Any, *, c
     wx = weight[:, :, :, 1:].expand_as(dx_refined)
     wy = weight[:, :, 1:, :].expand_as(dy_refined)
     edge = F.smooth_l1_loss(dx_refined * wx, dx_target * wx) + F.smooth_l1_loss(dy_refined * wy, dy_target * wy)
-    loss = pixel + 0.25 * edge
+    loss = pixel + float(config.edge_loss_weight) * edge
     if _is_v2(config):
         quantized = _ste_quantize(refined, max(2, int(config.palette_levels)))
         palette = F.smooth_l1_loss(refined * weight, quantized * weight)
         background = F.smooth_l1_loss(refined * (1.0 - target_alpha), target * (1.0 - target_alpha))
         loss = loss + float(config.pixel_constraint_weight) * palette + 0.1 * background
+    if _is_v4(config) and config.anti_blur_weight > 0:
+        loss = loss + float(config.anti_blur_weight) * _local_variance_loss(refined, target, target_alpha, torch)
+    if max(1, int(config.internal_scale)) > 1:
+        scale = max(1, int(config.internal_scale))
+        down_refined = F.avg_pool2d(refined, kernel_size=scale, stride=scale)
+        down_target = F.avg_pool2d(target, kernel_size=scale, stride=scale)
+        down_alpha = F.avg_pool2d(target_alpha, kernel_size=scale, stride=scale)
+        down_weight = 0.15 + 0.85 * down_alpha
+        downsampled = F.smooth_l1_loss(down_refined * down_weight, down_target * down_weight)
+        block = _block_consistency_loss(refined, target_alpha, scale, torch)
+        loss = loss + 0.5 * downsampled + float(config.block_consistency_weight) * block
     return loss
 
 
@@ -446,10 +498,33 @@ def build_training_model(config: PixelRefinerTrainConfig) -> Any:
 
 
 def _is_v2(config: PixelRefinerTrainConfig) -> bool:
-    return config.model_id == V2_MODEL_ID or config.architecture in {"unet-naf-v2", "v2"}
+    return config.model_id in {V2_MODEL_ID, V3_MODEL_ID, V4_MODEL_ID} or config.architecture in {
+        "unet-naf-v2",
+        "v2",
+        "pixel-tile-v3",
+        "v3",
+        "pixel-hard-v4",
+        "v4",
+    }
+
+
+def _is_v3(config: PixelRefinerTrainConfig) -> bool:
+    return config.model_id == V3_MODEL_ID or config.architecture in {"pixel-tile-v3", "v3"}
+
+
+def _is_v4(config: PixelRefinerTrainConfig) -> bool:
+    return config.model_id == V4_MODEL_ID or config.architecture in {"pixel-hard-v4", "v4"}
+
+
+def _uses_tiled_inference(config: PixelRefinerTrainConfig) -> bool:
+    return _is_v3(config) or _is_v4(config)
 
 
 def _model_filename(model_id: str) -> str:
+    if model_id == V4_MODEL_ID:
+        return V4_MODEL_FILENAME
+    if model_id == V3_MODEL_ID:
+        return V3_MODEL_FILENAME
     return V2_MODEL_FILENAME if model_id == V2_MODEL_ID else MODEL_FILENAME
 
 
@@ -458,6 +533,17 @@ def _safe_model_file_stem(model_id: str) -> str:
 
 
 def _manifest_notes(config: PixelRefinerTrainConfig) -> str:
+    if _is_v4(config):
+        return (
+            "Pixel Refiner v4 gold: NAF/U-Net tile refiner trained on high-quality character pixel art, "
+            "with 2x internal patch learning, stronger edge/anti-blur losses, tiled inference, and a hard "
+            "service-side pixel-art output layer that clamps alpha, quantizes model colors, and removes tiny clusters."
+        )
+    if _is_v3(config):
+        return (
+            "Pixel-tile v3 refiner: trains on overlapped original-grid patches, optionally upscales each patch "
+            "inside the model, enforces block consistency, and uses tiled service inference for pixel-aligned output."
+        )
     if _is_v2(config):
         return (
             "Medium U-Net/NAFNet-style v2 pixel refiner with differentiable palette constraint output "
@@ -495,11 +581,61 @@ def _config_to_json(config: PixelRefinerTrainConfig) -> dict[str, Any]:
         "palette_levels": config.palette_levels,
         "alpha_threshold": config.alpha_threshold,
         "pixel_constraint_weight": config.pixel_constraint_weight,
+        "internal_scale": config.internal_scale,
+        "tile_overlap": config.tile_overlap,
+        "block_consistency_weight": config.block_consistency_weight,
+        "edge_loss_weight": config.edge_loss_weight,
+        "anti_blur_weight": config.anti_blur_weight,
+        "grad_clip": config.grad_clip,
+        "event_log_path": str(config.event_log_path) if config.event_log_path else "",
         "sample_weights": {
             "input_kind": INPUT_KIND_SAMPLE_WEIGHTS,
             "category": CATEGORY_SAMPLE_WEIGHTS,
         },
     }
+
+
+def _emit_training_event(event: dict[str, Any], config: PixelRefinerTrainConfig) -> None:
+    text = json.dumps(event, ensure_ascii=False)
+    print(text, flush=True)
+    if config.event_log_path is None:
+        return
+    config.event_log_path.parent.mkdir(parents=True, exist_ok=True)
+    with config.event_log_path.open("a", encoding="utf-8") as file:
+        file.write(text + "\n")
+
+
+def _model_input_patch_size(config: PixelRefinerTrainConfig) -> int:
+    return max(16, int(config.patch_size)) * max(1, int(config.internal_scale))
+
+
+def _block_consistency_loss(tensor: Any, alpha: Any, scale: int, torch: Any) -> Any:
+    scale = max(1, int(scale))
+    if scale <= 1:
+        return tensor.new_tensor(0.0)
+    height = (tensor.shape[-2] // scale) * scale
+    width = (tensor.shape[-1] // scale) * scale
+    if height <= 0 or width <= 0:
+        return tensor.new_tensor(0.0)
+    cropped = tensor[:, :, :height, :width]
+    cropped_alpha = alpha[:, :, :height, :width]
+    block = cropped.reshape(cropped.shape[0], cropped.shape[1], height // scale, scale, width // scale, scale)
+    block_mean = block.mean(dim=(3, 5), keepdim=True)
+    alpha_block = cropped_alpha.reshape(cropped_alpha.shape[0], 1, height // scale, scale, width // scale, scale)
+    weight = 0.15 + 0.85 * alpha_block
+    return ((block - block_mean) ** 2 * weight).mean()
+
+
+def _local_variance_loss(refined: Any, target: Any, alpha: Any, torch: Any) -> Any:
+    import torch.nn.functional as F
+
+    def variance(tensor: Any) -> Any:
+        mean = F.avg_pool2d(tensor, kernel_size=3, stride=1, padding=1)
+        mean_sq = F.avg_pool2d(tensor * tensor, kernel_size=3, stride=1, padding=1)
+        return torch.clamp(mean_sq - mean * mean, min=0.0)
+
+    weight = 0.15 + 0.85 * alpha
+    return F.smooth_l1_loss(variance(refined) * weight, variance(target) * weight)
 
 
 def _import_torch() -> Any:

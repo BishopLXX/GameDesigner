@@ -175,6 +175,17 @@ Import an external/generated input:
 py -3.13 .\source\pixel_refiner_training_main.py import-input D:\assets\candidate.png --source-id kenney_pixel_platformer --category sprite --input-kind software_candidate
 ```
 
+Import a real GameDesigner failure pair in one step:
+
+```powershell
+py -3.13 .\source\pixel_refiner_training_main.py import-software-pair `
+  --input D:\assets\bad_candidate.png `
+  --target D:\assets\true_pixel.png `
+  --category character_portrait
+```
+
+This is the preferred way to add “software output -> true pixel art” examples. The two PNGs must be the same size.
+
 Pair input and target:
 
 ```powershell
@@ -232,6 +243,47 @@ pixel-refiner-v2/
 ```
 
 The v2 trainer uses a medium U-Net/NAFNet-style architecture, patch size 256, palette/alpha loss terms, and manifest-driven palette/alpha cleanup in the service package.
+
+## Train v3
+
+V3 is the pixel-tile route for the problem where the image is readable at small size but the enlarged pixel logic is still weak.
+
+Recommended v3 run:
+
+```powershell
+$env:PYTHONPATH=".\source"
+$trainPy = "D:\GameDesignerData\venvs\pixel-refiner-train\Scripts\python.exe"
+& $trainPy .\source\pixel_refiner_training_main.py train `
+  --model-id pixel-refiner-v3 `
+  --architecture pixel-tile-v3 `
+  --output-dir "D:\GameDesignerData\pixel_refiner\models\pixel-refiner-v3" `
+  --epochs 4 `
+  --steps-per-epoch 900 `
+  --batch-size 4 `
+  --patch-size 64 `
+  --internal-scale 2 `
+  --tile-overlap 16 `
+  --block-consistency-weight 0.20 `
+  --features 64 `
+  --device cuda
+```
+
+V3 differs from v2 in three places:
+
+- Training samples 64x64 original-grid patches and nearest-upscales them to 128x128 before the model sees them.
+- Loss includes direct 2x supervision, downscaled 1x supervision, and 2x2 block consistency.
+- The service reads the manifest and performs tiled inference with overlap, then downscales each tile back to the original pixel grid before merging.
+
+The exported package layout is:
+
+```text
+pixel-refiner-v3/
+├─ model_manifest.json
+├─ training_config.json
+├─ checkpoints/
+└─ weights/
+   └─ pixel_refiner_v3.onnx
+```
 
 After export, run a service-level smoke test:
 

@@ -34,8 +34,11 @@ py -3.13 -m PyInstaller ^
   --hidden-import pixel_refiner_service.server ^
   --hidden-import pixel_refiner_service.backend ^
   --hidden-import pixel_refiner_training_main ^
+  --hidden-import pixel_refiner_test_runner ^
+  --hidden-import gamedesigner.pixel_refiner ^
   --hidden-import gamedesigner.pixel_refiner_dataset ^
   --hidden-import gamedesigner.pixel_refiner_dataset_eval ^
+  --hidden-import gamedesigner.pixel_refiner_eval_suite ^
   --hidden-import gamedesigner.pixel_refiner_pair_generation ^
   --hidden-import gamedesigner.pixel_refiner_ai_pseudo ^
   --distpath release ^

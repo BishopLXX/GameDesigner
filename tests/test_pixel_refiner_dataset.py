@@ -162,7 +162,8 @@ class PixelRefinerDatasetTests(unittest.TestCase):
                     Path(folder)
                     / "GameDesignerData"
                     / "pixel_refiner"
-                    / "character_large_v1"
+                    / "datasets"
+                    / "gold_pndsndn_v1"
                     / "targets"
                     / "demo_source"
                     / "character_portrait"

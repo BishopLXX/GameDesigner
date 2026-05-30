@@ -20,6 +20,7 @@ from gamedesigner.pixel_refiner_dataset import (
     targets_dir,
 )
 from gamedesigner.pixel_refiner_dataset_eval import evaluate_dataset
+from gamedesigner.pixel_refiner_eval_suite import build_fixed_eval_suite, render_fixed_eval_contact_sheet
 from gamedesigner.pixel_refiner_pair_generation import build_pairs_from_targets, generate_training_inputs_from_target
 
 
@@ -120,6 +121,18 @@ def main(argv: list[str] | None = None) -> int:
     subparsers.add_parser("list-sources", help="List source records")
     subparsers.add_parser("list-pairs", help="List pair records")
 
+    eval_suite = subparsers.add_parser("build-eval-suite", help="Build a fixed Pixel Refiner visual eval suite")
+    eval_suite.add_argument("--limit", type=int, default=32)
+    eval_suite.add_argument("--source-id", default="")
+    eval_suite.add_argument("--category", default="")
+    eval_suite.add_argument("--input-kind", default="")
+    eval_suite.add_argument("--keep-existing", action="store_true")
+
+    contact_sheet = subparsers.add_parser("contact-sheet", help="Render the fixed eval suite contact sheet")
+    contact_sheet.add_argument("--output", default="")
+    contact_sheet.add_argument("--limit", type=int, default=0)
+    contact_sheet.add_argument("--cell-size", type=int, default=160)
+
     train_parser = subparsers.add_parser("train", help="Train Pixel Refiner and export an ONNX model package")
     train_parser.add_argument("--output-dir", default="")
     train_parser.add_argument("--model-id", default="pixel-refiner-v2")
@@ -141,6 +154,13 @@ def main(argv: list[str] | None = None) -> int:
     train_parser.add_argument("--palette-levels", type=int, default=64)
     train_parser.add_argument("--alpha-threshold", type=int, default=128)
     train_parser.add_argument("--pixel-constraint-weight", type=float, default=0.08)
+    train_parser.add_argument("--internal-scale", type=int, default=0)
+    train_parser.add_argument("--tile-overlap", type=int, default=16)
+    train_parser.add_argument("--block-consistency-weight", type=float, default=0.20)
+    train_parser.add_argument("--edge-loss-weight", type=float, default=-1.0)
+    train_parser.add_argument("--anti-blur-weight", type=float, default=-1.0)
+    train_parser.add_argument("--grad-clip", type=float, default=1.0)
+    train_parser.add_argument("--event-log", default="")
     train_parser.add_argument("--no-amp", action="store_true")
 
     smoke_parser = subparsers.add_parser("smoke-model", help="Run a local service smoke test against an exported model package")
@@ -288,14 +308,59 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps([record.__dict__ for record in load_pair_records()], ensure_ascii=False, indent=2, default=str))
         return 0
 
+    if args.command == "build-eval-suite":
+        print(
+            json.dumps(
+                build_fixed_eval_suite(
+                    limit=max(1, int(args.limit)),
+                    source_id=str(args.source_id or "").strip(),
+                    category=str(args.category or "").strip(),
+                    input_kind=str(args.input_kind or "").strip(),
+                    rebuild=not bool(args.keep_existing),
+                ),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+
+    if args.command == "contact-sheet":
+        print(
+            json.dumps(
+                render_fixed_eval_contact_sheet(
+                    output_path=args.output or None,
+                    limit=max(0, int(args.limit)),
+                    cell_size=max(64, int(args.cell_size)),
+                ),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+
     if args.command == "train":
         from gamedesigner.paths import pixel_refiner_model_dir
-        from gamedesigner.pixel_refiner_training import MODEL_ID, V2_MODEL_ID, PixelRefinerTrainConfig, train_pixel_refiner
+        from gamedesigner.pixel_refiner_training import MODEL_ID, V2_MODEL_ID, V3_MODEL_ID, V4_MODEL_ID, PixelRefinerTrainConfig, train_pixel_refiner
 
         model_id = str(args.model_id or MODEL_ID).strip() or MODEL_ID
         architecture = str(args.architecture or "").strip()
         if not architecture:
-            architecture = "unet-naf-v2" if model_id == V2_MODEL_ID else "cnn-v1"
+            if model_id == V4_MODEL_ID:
+                architecture = "pixel-hard-v4"
+            elif model_id == V3_MODEL_ID:
+                architecture = "pixel-tile-v3"
+            else:
+                architecture = "unet-naf-v2" if model_id == V2_MODEL_ID else "cnn-v1"
+        patch_size = int(args.patch_size)
+        if patch_size <= 0:
+            patch_size = 64 if model_id in {V3_MODEL_ID, V4_MODEL_ID} else 128
+        default_features = 96 if model_id == V4_MODEL_ID else (64 if model_id in {V2_MODEL_ID, V3_MODEL_ID} else 48)
+        edge_loss_weight = float(args.edge_loss_weight)
+        if edge_loss_weight < 0:
+            edge_loss_weight = 0.55 if model_id == V4_MODEL_ID else 0.25
+        anti_blur_weight = float(args.anti_blur_weight)
+        if anti_blur_weight < 0:
+            anti_blur_weight = 0.12 if model_id == V4_MODEL_ID else 0.0
 
         config = PixelRefinerTrainConfig(
             output_dir=Path(args.output_dir).expanduser() if args.output_dir else pixel_refiner_model_dir(model_id),
@@ -304,9 +369,9 @@ def main(argv: list[str] | None = None) -> int:
             epochs=max(1, int(args.epochs)),
             steps_per_epoch=max(1, int(args.steps_per_epoch)),
             batch_size=max(1, int(args.batch_size)),
-            patch_size=max(16, int(args.patch_size)),
+            patch_size=max(16, patch_size),
             learning_rate=float(args.learning_rate),
-            features=max(8, int(args.features)) if int(args.features) > 0 else (64 if model_id == V2_MODEL_ID else 48),
+            features=max(8, int(args.features)) if int(args.features) > 0 else default_features,
             seed=int(args.seed),
             device=str(args.device or "auto"),
             num_workers=max(0, int(args.workers)),
@@ -319,6 +384,13 @@ def main(argv: list[str] | None = None) -> int:
             palette_levels=max(2, int(args.palette_levels)),
             alpha_threshold=max(0, min(255, int(args.alpha_threshold))),
             pixel_constraint_weight=max(0.0, float(args.pixel_constraint_weight)),
+            internal_scale=max(1, int(args.internal_scale) if int(args.internal_scale) > 0 else (2 if model_id in {V3_MODEL_ID, V4_MODEL_ID} else 1)),
+            tile_overlap=max(0, int(args.tile_overlap)),
+            block_consistency_weight=max(0.0, float(args.block_consistency_weight)),
+            edge_loss_weight=max(0.0, edge_loss_weight),
+            anti_blur_weight=max(0.0, anti_blur_weight),
+            grad_clip=max(0.0, float(args.grad_clip)),
+            event_log_path=Path(args.event_log).expanduser() if str(args.event_log or "").strip() else None,
         )
         print(json.dumps(train_pixel_refiner(config), ensure_ascii=False, indent=2))
         return 0

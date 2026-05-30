@@ -151,6 +151,33 @@ The v2 service also applies a conservative pixel-art output layer after ONNX inf
 - Palette cleanup prefers the selected input image's color system before falling back to opaque-pixel quantization.
 - Alpha is clamped after blending so transparent PNG output stays hard-edged.
 
+## Pixel-Tile V3
+
+`pixel-refiner-v3` is the tiled pixel-level route. It is designed for the case where a whole-image refiner keeps the character readable but does not learn enough pixel connection logic.
+
+Training configuration:
+
+```powershell
+py -3.13 .\source\pixel_refiner_training_main.py train `
+  --model-id pixel-refiner-v3 `
+  --architecture pixel-tile-v3 `
+  --output-dir "D:\GameDesignerData\pixel_refiner\models\pixel-refiner-v3" `
+  --patch-size 64 `
+  --internal-scale 2 `
+  --tile-overlap 16 `
+  --block-consistency-weight 0.20
+```
+
+V3 semantics:
+
+- `patch_size=64` means 64x64 original pixel-grid patches are sampled from each pair.
+- `internal_scale=2` upsamples each 64x64 patch to 128x128 with nearest-neighbor before it enters the ONNX model.
+- The training loss supervises the 2x output, the result downscaled back to 1x, and the consistency of each 2x2 block.
+- The exported manifest enables `tiled_inference`, records `tile_size`, `tile_overlap`, and `internal_scale`.
+- During inference the service splits the full input into overlapping tiles, runs ONNX per tile, downscales each tile back to the original grid, then feather-merges the overlaps.
+
+This keeps large images manageable while forcing the model to learn local pixel decisions, edge continuity, and block-aligned output.
+
 ## Safety Rule
 
 This service intentionally has no procedural fallback image generation path. If dependencies or weights are missing, it fails instead of producing a fake final asset.

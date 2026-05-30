@@ -15,6 +15,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
+from .pixel_refiner_dataset import dataset_dir
+
 try:
     from PIL import Image, ImageOps, ImageSequence
 except Exception:  # pragma: no cover - Pillow is a project dependency, but keep the downloader usable.
@@ -23,7 +25,7 @@ except Exception:  # pragma: no cover - Pillow is a project dependency, but keep
     ImageSequence = None
 
 
-DEFAULT_PIXEL_SITE_ROOT = Path("D:/GameDesignerData/pixel_refiner/character_large_v1")
+DEFAULT_PIXEL_SITE_ROOT = dataset_dir()
 DEFAULT_START_URLS = (
     "http://pndsndn.blog79.fc2.com/?all",
     "http://pndsndn.blog79.fc2.com/",

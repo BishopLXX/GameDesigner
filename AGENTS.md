@@ -47,7 +47,7 @@
 
 - Pixel Refiner is a separate local service, model package, dataset pipeline, and control console. Do not fold its training or service controls into the main canvas UI unless the user explicitly asks.
 - The visible control app is `source/pixel_refiner_service_window.py`. Start it from source with `start_pixel_refiner_service_window.bat`; build a standalone GUI with `build_pixel_refiner_console.bat`.
-- Keep the console organized around the existing tabs: `service`, `dataset`, `training/retrain`, and `help`. The Help tab should stay current whenever service behavior, dataset layout, training commands, or model limitations change.
+- Keep the console organized around the existing tabs: `service`, `dataset`, `test generation`, `training/retrain`, and `help`. The Help tab should stay current whenever service behavior, dataset layout, training commands, or model limitations change.
 - Default service URL is `http://127.0.0.1:8765`. The service exposes `GET /v1/health`, `GET /v1/stats`, and `POST /v1/pixel/refine`.
 - Default dataset root is `D:\GameDesignerData\pixel_refiner\character_large_v1`. Important subfolders are `targets`, `generated_inputs`, `pairs`, `raw`, `manifests`, and `eval`.
 - Default model package root is `D:\GameDesignerData\pixel_refiner\models\pixel-refiner-v2`. The runtime package must contain `model_manifest.json` and `weights/pixel_refiner_v2.onnx` plus any ONNX external data file. Keep old `D:\GameDesignerData\models\...` paths as legacy-only and migrate them into `D:\GameDesignerData\pixel_refiner\models\...`.

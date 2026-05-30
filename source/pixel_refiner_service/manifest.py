@@ -27,6 +27,14 @@ class ModelManifest:
     pixel_art_cleanup: bool = False
     palette_limit: int = 0
     alpha_threshold: int = 128
+    tiled_inference: bool = False
+    tile_size: int = 0
+    tile_overlap: int = 0
+    internal_scale: int = 1
+    hard_pixel_output: bool = False
+    output_layer_version: str = ""
+    palette_strategy: str = "source"
+    cluster_cleanup: bool = False
 
 
 def default_model_dir() -> Path:
@@ -77,6 +85,14 @@ def load_model_manifest(model_dir: str | Path | None = None, *, expected_id: str
         pixel_art_cleanup=_coerce_bool(raw.get("pixel_art_cleanup")),
         palette_limit=_coerce_int(raw.get("palette_limit"), 0),
         alpha_threshold=_coerce_int(raw.get("alpha_threshold"), 128),
+        tiled_inference=_coerce_bool(raw.get("tiled_inference")),
+        tile_size=_coerce_int(raw.get("tile_size"), 0),
+        tile_overlap=_coerce_int(raw.get("tile_overlap"), 0),
+        internal_scale=max(1, _coerce_int(raw.get("internal_scale"), 1)),
+        hard_pixel_output=_coerce_bool(raw.get("hard_pixel_output")),
+        output_layer_version=str(raw.get("output_layer_version") or "").strip(),
+        palette_strategy=str(raw.get("palette_strategy") or "source").strip() or "source",
+        cluster_cleanup=_coerce_bool(raw.get("cluster_cleanup")),
     )
 
 

@@ -14,10 +14,11 @@ Build a standalone GUI executable:
 .\build_pixel_refiner_console.bat
 ```
 
-The console has four tabs:
+The console has five tabs:
 
 - `服务`: run, connect, stop, and inspect the local service.
 - `数据集`: open the dataset folders and view summary/evaluation output.
+- `测试生成`: choose one local image, send it to the current Pixel Refiner service, save the generated PNG outputs, and preview the result.
 - `训练 / Retrain`: run smoke training, full training, or overwrite-retrain the current model package.
 - `Help`: explains usage, dataset folders, request flow, model inputs/outputs, and current v2 limitations.
 
@@ -39,6 +40,12 @@ Default model package:
 D:\GameDesignerData\pixel_refiner\models\pixel-refiner-v2
 ```
 
+Default test output folder:
+
+```text
+D:\GameDesignerData\pixel_refiner\test_outputs
+```
+
 Default training Python:
 
 ```text
@@ -46,6 +53,19 @@ D:\GameDesignerData\venvs\pixel-refiner-train\Scripts\python.exe
 ```
 
 Important: after training or retraining, restart the service so it reloads the newly exported ONNX weights.
+
+## Test Generation Tab
+
+Use `测试生成` when you want to test the model package without opening the main GameDesigner app:
+
+- `输入图片`: the PNG/JPG/WebP/BMP to refine.
+- `输出目录`: a base folder. Each run creates a timestamped subfolder so `refined_1.png` is not overwritten.
+- `目标尺寸`: the service-side target canvas size, auto-filled from the selected image and clamped to the service limit of 1024 pixels per edge.
+- `修正强度`: the same post-model strength blend used by the GameDesigner image panel.
+- `候选数量`: how many service candidates to request. With the current single-output v2 model, the last candidate is usually the standard-strength result.
+- `调色板上限`: palette cleanup limit passed to the service.
+
+This tab calls the same `POST /v1/pixel/refine` endpoint as GameDesigner, so it is a real service test rather than a separate preview-only path.
 
 ## Training Tab Parameters
 
