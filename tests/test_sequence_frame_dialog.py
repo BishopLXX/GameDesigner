@@ -5,10 +5,11 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QSize
+from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QSize
 from PySide6.QtGui import QColor, QImage, QPainter
 from PySide6.QtWidgets import QApplication
 
+from gamedesigner.image_ai import AiGeneratedImage
 from gamedesigner.image_rendering import is_pixel_art_image_path
 from gamedesigner.storage import AppSettings
 from gamedesigner.ui.sequence_frame_dialog import (
@@ -16,14 +17,17 @@ from gamedesigner.ui.sequence_frame_dialog import (
     align_frame_content,
     bordered_sheet_size,
     build_api_generation_template,
+    build_animation_frame_generation_prompt,
     build_bordered_generation_template_spritesheet,
     build_generation_template_spritesheet,
     build_animation_generation_prompt,
     build_horizontal_spritesheet,
+    build_sequence_frame_generation_jobs,
     clear_connected_corner_background,
     crop_returned_api_canvas,
     extract_bordered_template_frames,
     four_multiple_size,
+    generate_sequence_frames_with_ai,
     image_has_transparency,
     fit_image_to_frame,
     save_spritesheet,
@@ -136,6 +140,29 @@ class SequenceFrameDialogTests(unittest.TestCase):
         self.assertIn("anchor point", prompt)
         self.assertIn("1-pixel pure black grid", prompt)
 
+    def test_animation_frame_prompt_uses_single_frame_constraints(self) -> None:
+        prompt = build_animation_frame_generation_prompt(
+            "向右走路，手臂摆动",
+            frame_index=2,
+            frame_count=6,
+            final_frame_width=128,
+            final_frame_height=132,
+            active_frame_width=816,
+            active_frame_height=816,
+            api_canvas_width=816,
+            api_canvas_height=816,
+            pixel_mode=True,
+        )
+
+        self.assertIn("single animation-frame edit canvas", prompt)
+        self.assertIn("Frame 2 of 6", prompt)
+        self.assertIn("128x132", prompt)
+        self.assertIn("816x816", prompt)
+        self.assertIn("向右走路", prompt)
+        self.assertIn("Do not create a grid", prompt)
+        self.assertIn("Do not create a grid, border, contact sheet, multi-pose sheet", prompt)
+        self.assertNotIn("1-pixel pure black grid", prompt)
+
     def test_bordered_template_uses_four_multiple_inner_cells_and_one_pixel_grid(self) -> None:
         source = self._solid_image(625, 401, "#3366CC")
 
@@ -213,6 +240,83 @@ class SequenceFrameDialogTests(unittest.TestCase):
         self.assertEqual(restored.width(), sheet.width())
         self.assertEqual(restored.height(), sheet.height())
         self.assertEqual(restored.pixelColor(0, 0).name().upper(), "#123456")
+
+    def test_api_generation_template_can_scale_single_frame_to_model_canvas(self) -> None:
+        settings = AppSettings(ai_image_provider="compatible", ai_image_model="gpt-image-2")
+        frame = self._solid_image(128, 128, "#4455AA")
+
+        template = build_api_generation_template(frame, settings, scale_up_to_canvas=True)
+        restored = crop_returned_api_canvas(template.image, template.sheet_rect, template.api_size)
+        exact = fit_image_to_frame(restored, QSize(128, 128), pixel_mode=True)
+
+        self.assertGreater(template.api_size.width(), frame.width())
+        self.assertGreater(template.sheet_rect.width(), frame.width())
+        self.assertEqual(restored.size(), template.sheet_rect.size())
+        self.assertEqual(exact.size(), frame.size())
+        self.assertEqual(exact.pixelColor(0, 0).name().upper(), "#4455AA")
+
+    def test_sequence_frame_jobs_use_source_alpha_not_api_padding(self) -> None:
+        settings = AppSettings(ai_image_provider="compatible", ai_image_model="gpt-image-2")
+        source = self._solid_image(128, 64, "#334455")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = build_sequence_frame_generation_jobs(
+                settings,
+                "眨眼",
+                [source],
+                2,
+                QSize(128, 64),
+                temp_dir=Path(tmp),
+            )
+
+        self.assertEqual(len(jobs), 2)
+        self.assertFalse(jobs[0].source_has_transparency)
+        self.assertTrue(image_has_transparency(jobs[0].template.image))
+        self.assertGreater(jobs[0].template.sheet_rect.width(), source.width())
+
+    def test_generate_sequence_frames_with_fake_generator_returns_exact_frames(self) -> None:
+        settings = AppSettings(
+            ai_image_provider="compatible",
+            ai_image_model="gpt-image-2",
+            ai_image_api_key="test-key",
+            ai_image_base_url="http://example.test/v1",
+        )
+        source = self._solid_image(32, 32, "#224466")
+        colors = ["#CC0000", "#00AA00", "#0000CC"]
+        calls = []
+
+        def fake_generator(request):
+            calls.append(request)
+            width, height = [int(part) for part in request.size.split("x", 1)]
+            image = self._solid_image(width, height, colors[len(calls) - 1])
+            return [AiGeneratedImage(self._png_bytes(image), "png")]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = build_sequence_frame_generation_jobs(
+                settings,
+                "向右跳跃",
+                [source],
+                3,
+                QSize(32, 32),
+                pixel_mode=True,
+                temp_dir=Path(tmp),
+            )
+            frames = generate_sequence_frames_with_ai(
+                settings,
+                jobs,
+                frame_size=QSize(32, 32),
+                pixel_mode=True,
+                image_generator=fake_generator,
+            )
+
+        sheet = build_horizontal_spritesheet(frames, frame_size=QSize(32, 32), pixel_mode=True)
+        self.assertEqual(len(frames), 3)
+        self.assertEqual(sheet.size(), QSize(96, 32))
+        self.assertEqual(sheet.pixelColor(0, 0).name().upper(), "#CC0000")
+        self.assertEqual(sheet.pixelColor(32, 0).name().upper(), "#00AA00")
+        self.assertEqual(sheet.pixelColor(64, 0).name().upper(), "#0000CC")
+        self.assertEqual([call.prompt for call in calls], [job.prompt for job in jobs])
+        self.assertIn("Frame 3 of 3", calls[2].prompt)
 
     def test_gpt_image_2_sequence_request_does_not_send_transparent_background(self) -> None:
         settings = AppSettings(
@@ -308,6 +412,14 @@ class SequenceFrameDialogTests(unittest.TestCase):
         image = QImage(width, height, QImage.Format_ARGB32_Premultiplied)
         image.fill(QColor(color))
         return image
+
+    def _png_bytes(self, image: QImage) -> bytes:
+        data = QByteArray()
+        buffer = QBuffer(data)
+        buffer.open(QIODevice.WriteOnly)
+        image.save(buffer, "PNG")
+        buffer.close()
+        return bytes(data)
 
     def _opaque_center_x(self, image: QImage) -> int:
         xs = [

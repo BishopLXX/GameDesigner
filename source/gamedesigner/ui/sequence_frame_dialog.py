@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import tempfile
 import uuid
 from pathlib import Path
+from typing import Callable
 
 from PySide6.QtCore import QRect, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QIcon, QImage, QImageWriter, QPainter, QPixmap
@@ -48,6 +49,15 @@ class GenerationTemplate:
     api_size: QSize
     sheet_size: QSize
     content_frame_size: QSize
+
+
+@dataclass(frozen=True)
+class FrameGenerationJob:
+    index: int
+    prompt: str
+    template_path: Path
+    template: GenerationTemplate
+    source_has_transparency: bool
 
 
 def fit_image_to_frame(image: QImage, frame_size: QSize, *, pixel_mode: bool = False) -> QImage:
@@ -253,6 +263,7 @@ def build_api_generation_template(
     *,
     content_frame_size: QSize | None = None,
     pixel_mode: bool = False,
+    scale_up_to_canvas: bool = False,
 ) -> GenerationTemplate:
     if sheet.isNull():
         return GenerationTemplate(QImage(), QRect(), QSize(), QSize(), QSize())
@@ -265,7 +276,7 @@ def build_api_generation_template(
     canvas = QImage(api_size, QImage.Format_ARGB32_Premultiplied)
     canvas.fill(Qt.transparent)
     draw = source
-    if source.width() > api_size.width() or source.height() > api_size.height():
+    if scale_up_to_canvas or source.width() > api_size.width() or source.height() > api_size.height():
         draw = source.scaled(
             api_size.width(),
             api_size.height(),
@@ -529,6 +540,154 @@ def build_animation_generation_prompt(
     )
 
 
+def build_animation_frame_generation_prompt(
+    user_prompt: str,
+    *,
+    frame_index: int,
+    frame_count: int,
+    final_frame_width: int,
+    final_frame_height: int,
+    active_frame_width: int,
+    active_frame_height: int,
+    api_canvas_width: int,
+    api_canvas_height: int,
+    pixel_mode: bool = False,
+) -> str:
+    index = max(1, int(frame_index))
+    count = max(1, int(frame_count))
+    phase = round((index - 1) * 100 / count) if count > 1 else 0
+    style_rules = (
+        "Pixel-art rules: use crisp square pixel clusters, hard edges, limited palette, nearest-neighbor readability, "
+        "no blur, no painterly gradients, no anti-aliased outlines, no subpixel soft shading, and keep all details aligned to the pixel grid."
+        if pixel_mode
+        else "Game-art rules: keep the same subject identity, stable camera, readable silhouette, consistent lighting, and coherent motion."
+    )
+    first_frame_rule = (
+        "This is frame 1, so keep it closest to the supplied reference pose while preparing the motion cycle."
+        if index == 1
+        else "Change the pose/expression/secondary motion only as needed for this phase; do not redesign the subject."
+    )
+    return (
+        "The attached image is a single animation-frame edit canvas, not a sprite sheet. "
+        f"Return exactly one frame image for Frame {index} of {count}, phase {phase}% of the animation cycle. "
+        f"Keep the full output canvas exactly {api_canvas_width}x{api_canvas_height}. "
+        f"The active frame region is centered inside that canvas and is exactly {active_frame_width}x{active_frame_height}; "
+        f"draw only inside this active region. The app will crop that active region and downsample it to the final frame size {final_frame_width}x{final_frame_height}. "
+        "Do not create a grid, border, contact sheet, multi-pose sheet, extra cells, text labels, margins, or separators. "
+        "Keep the main subject's anchor point centered and stable, with feet/base/contact point matching the reference when present. "
+        "Preserve transparent background outside the artwork when present. "
+        f"{first_frame_rule} Animation request: {user_prompt.strip()}. "
+        f"{style_rules}"
+    )
+
+
+def build_sequence_frame_generation_jobs(
+    settings: AppSettings,
+    user_prompt: str,
+    source_frames: list[QImage],
+    frame_count: int,
+    frame_size: QSize,
+    *,
+    pixel_mode: bool = False,
+    temp_dir: Path | None = None,
+) -> list[FrameGenerationJob]:
+    valid_frames = [frame for frame in source_frames if not frame.isNull()]
+    if not valid_frames:
+        raise AiImageError("请先导入或拖入一张参考图片。")
+    count = max(1, int(frame_count))
+    output_size = QSize(max(1, frame_size.width()), max(1, frame_size.height()))
+    target_dir = temp_dir or (Path(tempfile.gettempdir()) / "gamedesigner_sequence_frames")
+    target_dir.mkdir(parents=True, exist_ok=True)
+    batch_id = uuid.uuid4().hex[:8]
+    jobs: list[FrameGenerationJob] = []
+    for index in range(count):
+        source = valid_frames[index] if index < len(valid_frames) else valid_frames[-1]
+        normalized = fit_image_to_frame(source, output_size, pixel_mode=pixel_mode)
+        source_has_transparency = image_has_transparency(normalized)
+        template = build_api_generation_template(
+            normalized,
+            settings,
+            content_frame_size=output_size,
+            pixel_mode=pixel_mode,
+            scale_up_to_canvas=True,
+        )
+        if template.image.isNull():
+            raise AiImageError("无法生成逐帧 AI 参考模板。")
+        path = target_dir / f"sequence_frame_{batch_id}_{index + 1:02d}.png"
+        if not save_spritesheet(template.image, path, pixel_mode=pixel_mode):
+            raise AiImageError("无法保存逐帧 AI 参考模板。")
+        prompt = build_animation_frame_generation_prompt(
+            user_prompt,
+            frame_index=index + 1,
+            frame_count=count,
+            final_frame_width=output_size.width(),
+            final_frame_height=output_size.height(),
+            active_frame_width=template.sheet_rect.width(),
+            active_frame_height=template.sheet_rect.height(),
+            api_canvas_width=template.api_size.width(),
+            api_canvas_height=template.api_size.height(),
+            pixel_mode=pixel_mode,
+        )
+        jobs.append(
+            FrameGenerationJob(
+                index=index,
+                prompt=prompt,
+                template_path=path,
+                template=template,
+                source_has_transparency=source_has_transparency,
+            )
+        )
+    return jobs
+
+
+def generate_sequence_frames_with_ai(
+    settings: AppSettings,
+    jobs: list[FrameGenerationJob],
+    *,
+    frame_size: QSize,
+    pixel_mode: bool = False,
+    progress: Callable[[str], None] | None = None,
+    image_generator: Callable = generate_ai_images,
+) -> list[QImage]:
+    if not jobs:
+        raise AiImageError("没有可生成的序列帧任务。")
+    output_size = QSize(max(1, frame_size.width()), max(1, frame_size.height()))
+    frames: list[QImage] = []
+    total = len(jobs)
+    for position, job in enumerate(jobs, start=1):
+        request_settings = copy.copy(settings)
+        request_settings.ai_image_count = 1
+        request_settings.ai_image_output_format = "png"
+        request_settings.ai_image_size = (
+            f"{max(1, job.template.api_size.width())}x{max(1, job.template.api_size.height())}"
+        )
+        request_settings.ai_image_background = sequence_request_background(
+            request_settings,
+            job.source_has_transparency,
+        )
+        if progress is not None:
+            progress(f"第 {position}/{total} 帧 prompt：\n{job.prompt}")
+            if job.source_has_transparency and request_settings.ai_image_background != "transparent":
+                progress("当前模型不支持透明背景参数，已改用自动背景；返回后会清理边角背景。")
+        request = build_ai_image_request(request_settings, job.prompt, [job.template_path])
+        if progress is not None:
+            progress(f"正在调用 {request.model} 生成第 {position}/{total} 帧...")
+        images = image_generator(request)
+        if not images:
+            raise AiImageError(f"生图服务没有返回第 {position} 帧。")
+        returned = QImage.fromData(images[0].data)
+        if returned.isNull():
+            raise AiImageError(f"生图服务返回的第 {position} 帧无法读取。")
+        active = crop_returned_api_canvas(returned, job.template.sheet_rect, job.template.api_size)
+        frame = scale_image_to_exact_frame(active, output_size, pixel_mode=pixel_mode)
+        if job.source_has_transparency:
+            frame = clear_connected_corner_background(frame)
+        frames.append(frame)
+    if any(job.source_has_transparency for job in jobs):
+        frames = align_frame_content(frames, output_size, pixel_mode=pixel_mode)
+    return frames
+
+
 class SequenceFrameGenerationThread(QThread):
     succeeded = Signal(object)
     failed = Signal(str)
@@ -537,66 +696,30 @@ class SequenceFrameGenerationThread(QThread):
     def __init__(
         self,
         settings: AppSettings,
-        prompt: str,
-        template_path: Path,
+        jobs: list[FrameGenerationJob],
         *,
-        frame_count: int,
         frame_size: QSize,
-        content_frame_size: QSize,
-        sheet_rect: QRect,
-        api_size: QSize,
-        template_has_transparency: bool = False,
         pixel_mode: bool = False,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.settings = copy.copy(settings)
-        self.settings.ai_image_count = 1
-        self.settings.ai_image_output_format = "png"
-        self.settings.ai_image_size = f"{max(1, api_size.width())}x{max(1, api_size.height())}"
-        self.settings.ai_image_background = sequence_request_background(self.settings, template_has_transparency)
-        self.prompt = prompt
-        self.template_path = template_path
-        self.frame_count = max(1, int(frame_count))
+        self.jobs = list(jobs)
         self.frame_size = QSize(max(1, frame_size.width()), max(1, frame_size.height()))
-        self.sheet_rect = QRect(sheet_rect)
-        self.api_size = QSize(max(1, api_size.width()), max(1, api_size.height()))
-        self.content_frame_size = QSize(max(1, content_frame_size.width()), max(1, content_frame_size.height()))
-        self.template_has_transparency = bool(template_has_transparency)
-        self.transparent_background_fallback = bool(
-            template_has_transparency and self.settings.ai_image_background != "transparent"
-        )
         self.pixel_mode = bool(pixel_mode)
 
     def run(self) -> None:  # type: ignore[override]
         try:
-            self.progress.emit("正在构建 AI 生图请求...")
-            if self.transparent_background_fallback:
-                self.progress.emit("当前模型不支持透明背景参数，已改用自动背景；返回后会清理边角背景。")
-            request = build_ai_image_request(
+            self.progress.emit("正在构建逐帧 AI 生图请求...")
+            frames = generate_sequence_frames_with_ai(
                 self.settings,
-                self.prompt,
-                [self.template_path],
-            )
-            self.progress.emit(f"正在调用 {request.model} 编辑固定格序列帧模板...")
-            images = generate_ai_images(request)
-            if not images:
-                raise AiImageError("生图服务没有返回序列帧图片。")
-            self.progress.emit("已收到 AI 图片，正在按固定帧格切割...")
-            sheet = QImage.fromData(images[0].data)
-            if sheet.isNull():
-                raise AiImageError("生图服务返回的序列帧图片无法读取。")
-            sheet = crop_returned_api_canvas(sheet, self.sheet_rect, self.api_size)
-            frames = extract_bordered_template_frames(
-                sheet,
-                self.frame_count,
-                self.content_frame_size,
-                self.frame_size,
+                self.jobs,
+                frame_size=self.frame_size,
                 pixel_mode=self.pixel_mode,
-                cleanup_background=self.template_has_transparency,
+                progress=self.progress.emit,
             )
             if not frames:
-                raise AiImageError("无法从 AI 返回图片中切出序列帧。")
+                raise AiImageError("AI 没有返回可用的序列帧。")
         except Exception as exc:
             self.failed.emit(str(exc))
             return
@@ -993,44 +1116,28 @@ class SequenceFrameDialog(QDialog):
             QMessageBox.information(self, "AI生成帧", "请先填写动画描述。")
             self.prompt_edit.setFocus(Qt.OtherFocusReason)
             return
-        template_path, template = self._generation_template_path()
-        if template_path is None:
-            QMessageBox.warning(self, "AI生成帧", "无法生成固定格模板。")
+        try:
+            jobs = self._generation_frame_jobs(user_prompt)
+        except AiImageError as exc:
+            QMessageBox.warning(self, "AI生成帧", str(exc) or "无法生成逐帧参考模板。")
             return
-        template_has_transparency = image_has_transparency(template.image)
-        prompt = build_animation_generation_prompt(
-            user_prompt,
-            frame_count=self.frame_count_spin.value(),
-            frame_width=template.content_frame_size.width(),
-            frame_height=template.content_frame_size.height(),
-            sheet_width=template.sheet_size.width(),
-            sheet_height=template.sheet_size.height(),
-            api_canvas_width=template.api_size.width(),
-            api_canvas_height=template.api_size.height(),
-            pixel_mode=self.pixel_mode,
-        )
+        if not jobs:
+            QMessageBox.warning(self, "AI生成帧", "无法生成逐帧参考模板。")
+            return
         self._append_log(f"动画描述：{user_prompt}")
-        self._append_log(f"发送给 AI 的 prompt：\n{prompt}")
+        self._append_log("生成策略：逐帧单图编辑；AI 只生成当前帧，横向序列帧由本地算法等宽拼接。")
         self._append_log(
-            f"模板图片：{template_path}\n"
             f"最终帧尺寸：{self.width_spin.value()}x{self.height_spin.value()}；"
-            f"模板内格尺寸：{template.content_frame_size.width()}x{template.content_frame_size.height()}；"
-            f"带黑框模板区域：{template.sheet_size.width()}x{template.sheet_size.height()}；"
-            f"提交 API 外框：{template.api_size.width()}x{template.api_size.height()}"
+            f"生成帧数：{len(jobs)}；"
+            f"每帧会独立提交参考图、裁回目标尺寸，再本地拼成横向图。"
         )
         self.ai_generate_button.setEnabled(False)
         self.ai_generate_button.setText("AI生成中...")
-        self.status_label.setText("正在调用 AI 生成横向序列帧图...")
+        self.status_label.setText("正在调用 AI 逐帧生成序列帧...")
         thread = SequenceFrameGenerationThread(
             self.settings,
-            prompt,
-            template_path,
-            frame_count=self.frame_count_spin.value(),
+            jobs,
             frame_size=self._frame_size(),
-            content_frame_size=template.content_frame_size,
-            sheet_rect=template.sheet_rect,
-            api_size=template.api_size,
-            template_has_transparency=template_has_transparency,
             pixel_mode=self.pixel_mode,
             parent=self,
         )
@@ -1238,6 +1345,24 @@ class SequenceFrameDialog(QDialog):
         else:
             self.log_edit.appendPlainText(f"\n{text}")
         self.log_edit.verticalScrollBar().setValue(self.log_edit.verticalScrollBar().maximum())
+
+    def _generation_frame_jobs(self, user_prompt: str) -> list[FrameGenerationJob]:
+        if self.base_image.isNull():
+            return []
+        if self.settings is None:
+            raise AiImageError("当前没有可用的 AI 生图设置。")
+        frame_count = self.frame_count_spin.value()
+        frames = self.source_frames if self.source_frames else [self.base_image.copy() for _ in range(frame_count)]
+        temp_dir = Path(tempfile.gettempdir()) / "gamedesigner_sequence_frames"
+        return build_sequence_frame_generation_jobs(
+            self.settings,
+            user_prompt,
+            frames,
+            frame_count,
+            self._frame_size(),
+            pixel_mode=self.pixel_mode,
+            temp_dir=temp_dir,
+        )
 
     def _generation_template_path(self) -> tuple[Path | None, GenerationTemplate]:
         if self.base_image.isNull():
