@@ -47,6 +47,7 @@ class GenerationTemplate:
     sheet_rect: QRect
     api_size: QSize
     sheet_size: QSize
+    content_frame_size: QSize
 
 
 def fit_image_to_frame(image: QImage, frame_size: QSize, *, pixel_mode: bool = False) -> QImage:
@@ -70,6 +71,24 @@ def fit_image_to_frame(image: QImage, frame_size: QSize, *, pixel_mode: bool = F
     painter.drawImage((width - scaled.width()) // 2, (height - scaled.height()) // 2, scaled)
     painter.end()
     return output
+
+
+def scale_image_to_exact_frame(image: QImage, frame_size: QSize, *, pixel_mode: bool = False) -> QImage:
+    width = max(1, int(frame_size.width()))
+    height = max(1, int(frame_size.height()))
+    output = QImage(width, height, QImage.Format_ARGB32_Premultiplied)
+    output.fill(Qt.transparent)
+    if image.isNull():
+        return output
+    source = image.convertToFormat(QImage.Format_ARGB32_Premultiplied)
+    if source.width() == width and source.height() == height:
+        return source.copy()
+    return source.scaled(
+        width,
+        height,
+        Qt.IgnoreAspectRatio,
+        Qt.FastTransformation if pixel_mode else Qt.SmoothTransformation,
+    )
 
 
 def build_horizontal_spritesheet(
@@ -149,19 +168,100 @@ def build_generation_template_spritesheet(
     return build_horizontal_spritesheet(template_frames, pixel_mode=pixel_mode, frame_size=frame_size)
 
 
+def four_multiple_size(size: QSize) -> QSize:
+    return QSize(_ceil_to_multiple(max(1, size.width()), 4), _ceil_to_multiple(max(1, size.height()), 4))
+
+
+def bordered_sheet_size(frame_count: int, content_frame_size: QSize, *, grid: int = 1) -> QSize:
+    count = max(1, int(frame_count))
+    content_width = max(1, int(content_frame_size.width()))
+    content_height = max(1, int(content_frame_size.height()))
+    grid_size = max(1, int(grid))
+    return QSize(count * content_width + (count + 1) * grid_size, content_height + grid_size * 2)
+
+
+def build_bordered_generation_template_spritesheet(
+    frames: list[QImage],
+    frame_count: int,
+    frame_size: QSize,
+    *,
+    pixel_mode: bool = False,
+    grid: int = 1,
+) -> tuple[QImage, QSize]:
+    valid_frames = [frame for frame in frames if not frame.isNull()]
+    if not valid_frames:
+        return QImage(), QSize()
+    count = max(1, int(frame_count))
+    grid_size = max(1, int(grid))
+    content_size = four_multiple_size(frame_size)
+    sheet_size = bordered_sheet_size(count, content_size, grid=grid_size)
+    output = QImage(sheet_size, QImage.Format_ARGB32_Premultiplied)
+    output.fill(Qt.transparent)
+    painter = QPainter(output)
+    painter.fillRect(0, 0, sheet_size.width(), grid_size, QColor("#000000"))
+    painter.fillRect(0, sheet_size.height() - grid_size, sheet_size.width(), grid_size, QColor("#000000"))
+    for index in range(count + 1):
+        x = index * (content_size.width() + grid_size)
+        painter.fillRect(x, 0, grid_size, sheet_size.height(), QColor("#000000"))
+    painter.setRenderHint(QPainter.SmoothPixmapTransform, not pixel_mode)
+    for index in range(count):
+        source = valid_frames[index] if index < len(valid_frames) else valid_frames[-1]
+        normalized = scale_image_to_exact_frame(source, content_size, pixel_mode=pixel_mode)
+        x = grid_size + index * (content_size.width() + grid_size)
+        painter.drawImage(x, grid_size, normalized)
+    painter.end()
+    return output, content_size
+
+
+def extract_bordered_template_frames(
+    sheet: QImage,
+    frame_count: int,
+    content_frame_size: QSize,
+    output_frame_size: QSize,
+    *,
+    pixel_mode: bool = False,
+    cleanup_background: bool = False,
+    grid: int = 1,
+) -> list[QImage]:
+    if sheet.isNull():
+        return []
+    count = max(1, int(frame_count))
+    grid_size = max(1, int(grid))
+    content_size = QSize(max(1, content_frame_size.width()), max(1, content_frame_size.height()))
+    expected_size = bordered_sheet_size(count, content_size, grid=grid_size)
+    source = sheet.convertToFormat(QImage.Format_ARGB32_Premultiplied)
+    if source.size() != expected_size:
+        source = source.scaled(
+            expected_size,
+            Qt.IgnoreAspectRatio,
+            Qt.FastTransformation if pixel_mode else Qt.SmoothTransformation,
+        )
+    frames: list[QImage] = []
+    for index in range(count):
+        x = grid_size + index * (content_size.width() + grid_size)
+        crop = source.copy(x, grid_size, content_size.width(), content_size.height())
+        frame = scale_image_to_exact_frame(crop, output_frame_size, pixel_mode=pixel_mode)
+        if cleanup_background:
+            frame = clear_connected_corner_background(frame)
+        frames.append(frame)
+    return frames
+
+
 def build_api_generation_template(
     sheet: QImage,
     settings: AppSettings | None,
     *,
+    content_frame_size: QSize | None = None,
     pixel_mode: bool = False,
 ) -> GenerationTemplate:
     if sheet.isNull():
-        return GenerationTemplate(QImage(), QRect(), QSize(), QSize())
+        return GenerationTemplate(QImage(), QRect(), QSize(), QSize(), QSize())
     source = sheet.convertToFormat(QImage.Format_ARGB32_Premultiplied)
     sheet_size = QSize(source.width(), source.height())
+    template_content_size = content_frame_size or sheet_size
     api_size = sequence_api_canvas_size(sheet_size, settings)
     if api_size.width() <= 0 or api_size.height() <= 0:
-        return GenerationTemplate(QImage(), QRect(), QSize(), sheet_size)
+        return GenerationTemplate(QImage(), QRect(), QSize(), sheet_size, template_content_size)
     canvas = QImage(api_size, QImage.Format_ARGB32_Premultiplied)
     canvas.fill(Qt.transparent)
     draw = source
@@ -178,7 +278,7 @@ def build_api_generation_template(
     painter.setRenderHint(QPainter.SmoothPixmapTransform, not pixel_mode)
     painter.drawImage(x, y, draw)
     painter.end()
-    return GenerationTemplate(canvas, QRect(x, y, draw.width(), draw.height()), api_size, sheet_size)
+    return GenerationTemplate(canvas, QRect(x, y, draw.width(), draw.height()), api_size, sheet_size, template_content_size)
 
 
 def sequence_api_canvas_size(sheet_size: QSize, settings: AppSettings | None) -> QSize:
@@ -417,10 +517,11 @@ def build_animation_generation_prompt(
         f"The attached reference image is the exact locked sprite-sheet template to edit in place. "
         f"Keep the full output canvas exactly {api_canvas_width or sheet_width}x{api_canvas_height or sheet_height}. "
         f"The active sprite-sheet region is centered inside the canvas and exactly {sheet_width}x{sheet_height}: "
-        f"exactly {frame_count} equal cells in one horizontal row, "
-        f"each cell exactly {frame_width}x{frame_height}. Do not crop, resize, add margins, add separators, add borders, or change the cell grid. "
+        f"exactly {frame_count} equal cells in one horizontal row. "
+        f"The template uses 1-pixel pure black grid lines around and between cells. Keep those black grid lines perfectly straight, 1 pixel thick, and unchanged. "
+        f"Each drawable inner cell is exactly {frame_width}x{frame_height}. Do not crop, resize, add margins, add separators, add borders, or change the cell grid. "
         f"Keep any padding outside the active sprite-sheet region transparent and unchanged. "
-        f"The anchor point of the main subject is the center of each cell; keep that anchor centered and stable in every frame. "
+        f"Never let artwork cross outside a black-framed cell. The anchor point of the main subject is the center of each inner cell; keep that anchor centered and stable in every frame. "
         f"Preserve transparent background outside the artwork when present; never fill empty areas with black or white blocks. "
         f"Frame 1 should stay closest to the supplied pose. Modify the later repeated cells into animation frames only inside their fixed cells. "
         f"Animation request: {user_prompt.strip()}. "
@@ -441,6 +542,7 @@ class SequenceFrameGenerationThread(QThread):
         *,
         frame_count: int,
         frame_size: QSize,
+        content_frame_size: QSize,
         sheet_rect: QRect,
         api_size: QSize,
         template_has_transparency: bool = False,
@@ -459,6 +561,7 @@ class SequenceFrameGenerationThread(QThread):
         self.frame_size = QSize(max(1, frame_size.width()), max(1, frame_size.height()))
         self.sheet_rect = QRect(sheet_rect)
         self.api_size = QSize(max(1, api_size.width()), max(1, api_size.height()))
+        self.content_frame_size = QSize(max(1, content_frame_size.width()), max(1, content_frame_size.height()))
         self.template_has_transparency = bool(template_has_transparency)
         self.transparent_background_fallback = bool(
             template_has_transparency and self.settings.ai_image_background != "transparent"
@@ -484,12 +587,12 @@ class SequenceFrameGenerationThread(QThread):
             if sheet.isNull():
                 raise AiImageError("生图服务返回的序列帧图片无法读取。")
             sheet = crop_returned_api_canvas(sheet, self.sheet_rect, self.api_size)
-            frames = split_horizontal_spritesheet(
+            frames = extract_bordered_template_frames(
                 sheet,
                 self.frame_count,
+                self.content_frame_size,
                 self.frame_size,
                 pixel_mode=self.pixel_mode,
-                align_content=False,
                 cleanup_background=self.template_has_transparency,
             )
             if not frames:
@@ -898,10 +1001,10 @@ class SequenceFrameDialog(QDialog):
         prompt = build_animation_generation_prompt(
             user_prompt,
             frame_count=self.frame_count_spin.value(),
-            frame_width=self.width_spin.value(),
-            frame_height=self.height_spin.value(),
-            sheet_width=self.width_spin.value() * self.frame_count_spin.value(),
-            sheet_height=self.height_spin.value(),
+            frame_width=template.content_frame_size.width(),
+            frame_height=template.content_frame_size.height(),
+            sheet_width=template.sheet_size.width(),
+            sheet_height=template.sheet_size.height(),
             api_canvas_width=template.api_size.width(),
             api_canvas_height=template.api_size.height(),
             pixel_mode=self.pixel_mode,
@@ -910,7 +1013,9 @@ class SequenceFrameDialog(QDialog):
         self._append_log(f"发送给 AI 的 prompt：\n{prompt}")
         self._append_log(
             f"模板图片：{template_path}\n"
-            f"目标序列帧区域：{template.sheet_size.width()}x{template.sheet_size.height()}；"
+            f"最终帧尺寸：{self.width_spin.value()}x{self.height_spin.value()}；"
+            f"模板内格尺寸：{template.content_frame_size.width()}x{template.content_frame_size.height()}；"
+            f"带黑框模板区域：{template.sheet_size.width()}x{template.sheet_size.height()}；"
             f"提交 API 外框：{template.api_size.width()}x{template.api_size.height()}"
         )
         self.ai_generate_button.setEnabled(False)
@@ -922,6 +1027,7 @@ class SequenceFrameDialog(QDialog):
             template_path,
             frame_count=self.frame_count_spin.value(),
             frame_size=self._frame_size(),
+            content_frame_size=template.content_frame_size,
             sheet_rect=template.sheet_rect,
             api_size=template.api_size,
             template_has_transparency=template_has_transparency,
@@ -1135,14 +1241,24 @@ class SequenceFrameDialog(QDialog):
 
     def _generation_template_path(self) -> tuple[Path | None, GenerationTemplate]:
         if self.base_image.isNull():
-            return None, GenerationTemplate(QImage(), QRect(), QSize(), QSize())
+            return None, GenerationTemplate(QImage(), QRect(), QSize(), QSize(), QSize())
         frame_count = self.frame_count_spin.value()
         frame_size = self._frame_size()
         frames = self.source_frames if self.source_frames else [self.base_image.copy() for _ in range(frame_count)]
-        sheet = build_generation_template_spritesheet(frames, frame_count, frame_size, pixel_mode=self.pixel_mode)
+        sheet, content_frame_size = build_bordered_generation_template_spritesheet(
+            frames,
+            frame_count,
+            frame_size,
+            pixel_mode=self.pixel_mode,
+        )
         if sheet.isNull():
-            return None, GenerationTemplate(QImage(), QRect(), QSize(), QSize())
-        template = build_api_generation_template(sheet, self.settings, pixel_mode=self.pixel_mode)
+            return None, GenerationTemplate(QImage(), QRect(), QSize(), QSize(), QSize())
+        template = build_api_generation_template(
+            sheet,
+            self.settings,
+            content_frame_size=content_frame_size,
+            pixel_mode=self.pixel_mode,
+        )
         if template.image.isNull():
             return None, template
         temp_dir = Path(tempfile.gettempdir()) / "gamedesigner_sequence_frames"

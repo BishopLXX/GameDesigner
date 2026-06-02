@@ -14,12 +14,16 @@ from gamedesigner.storage import AppSettings
 from gamedesigner.ui.sequence_frame_dialog import (
     SequenceFrameDialog,
     align_frame_content,
+    bordered_sheet_size,
     build_api_generation_template,
+    build_bordered_generation_template_spritesheet,
     build_generation_template_spritesheet,
     build_animation_generation_prompt,
     build_horizontal_spritesheet,
     clear_connected_corner_background,
     crop_returned_api_canvas,
+    extract_bordered_template_frames,
+    four_multiple_size,
     image_has_transparency,
     fit_image_to_frame,
     save_spritesheet,
@@ -118,18 +122,59 @@ class SequenceFrameDialogTests(unittest.TestCase):
             "向右走路，手臂摆动",
             frame_count=6,
             frame_width=128,
-            frame_height=128,
-            sheet_width=768,
-            sheet_height=128,
+            frame_height=132,
+            sheet_width=775,
+            sheet_height=134,
             pixel_mode=True,
         )
 
         self.assertIn("exactly 6", prompt)
-        self.assertIn("128x128", prompt)
+        self.assertIn("128x132", prompt)
         self.assertIn("向右走路", prompt)
         self.assertIn("crisp square pixels", prompt)
         self.assertIn("locked sprite-sheet template", prompt)
         self.assertIn("anchor point", prompt)
+        self.assertIn("1-pixel pure black grid", prompt)
+
+    def test_bordered_template_uses_four_multiple_inner_cells_and_one_pixel_grid(self) -> None:
+        source = self._solid_image(625, 401, "#3366CC")
+
+        sheet, content_size = build_bordered_generation_template_spritesheet(
+            [source],
+            4,
+            QSize(625, 401),
+            pixel_mode=True,
+        )
+
+        self.assertEqual(content_size, QSize(628, 404))
+        self.assertEqual(four_multiple_size(QSize(625, 401)), QSize(628, 404))
+        self.assertEqual(bordered_sheet_size(4, content_size), QSize(2517, 406))
+        self.assertEqual(sheet.size(), QSize(2517, 406))
+        self.assertEqual(sheet.pixelColor(0, 0).name().upper(), "#000000")
+        self.assertEqual(sheet.pixelColor(629, 10).name().upper(), "#000000")
+        self.assertEqual(sheet.pixelColor(1, 1).name().upper(), "#3366CC")
+
+    def test_extract_bordered_template_frames_removes_grid_and_restores_output_size(self) -> None:
+        source = self._solid_image(625, 401, "#AA5500")
+        sheet, content_size = build_bordered_generation_template_spritesheet(
+            [source],
+            4,
+            QSize(625, 401),
+            pixel_mode=True,
+        )
+
+        frames = extract_bordered_template_frames(
+            sheet,
+            4,
+            content_size,
+            QSize(625, 401),
+            pixel_mode=True,
+        )
+
+        self.assertEqual(len(frames), 4)
+        self.assertEqual(frames[0].size(), QSize(625, 401))
+        self.assertEqual(frames[0].pixelColor(0, 0).name().upper(), "#AA5500")
+        self.assertNotEqual(frames[0].pixelColor(0, 0).name().upper(), "#000000")
 
     def test_generation_template_spritesheet_repeats_frames_to_fixed_grid(self) -> None:
         red = self._solid_image(4, 4, "#FF0000")
