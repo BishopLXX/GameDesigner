@@ -79,6 +79,7 @@ from .project_history import ProjectHistory, ProjectSnapshot
 from .qt_canvas import NodeGraphView
 from .qt_fonts import configure_fonts
 from .ui.node_preview_panel import NodePreviewPanel
+from .ui.sequence_frame_dialog import SequenceFrameDialog
 from .qt_theme import stylesheet
 from .node_visuals import visual_node_size
 from .storage import (
@@ -89,6 +90,7 @@ from .storage import (
     load_settings,
     save_project,
     save_settings,
+    project_bundle_dir,
 )
 
 
@@ -719,6 +721,12 @@ class GameDesignerApp(QMainWindow):
         self.ai_image_action = QAction("AI 生图助手...", self)
         self.ai_image_action.triggered.connect(self._open_ai_image_assistant)
 
+        self.sequence_frame_action = QAction("序列帧动画...", self)
+        self.sequence_frame_action.triggered.connect(lambda: self._open_sequence_frame_dialog(pixel_mode=False))
+
+        self.pixel_sequence_frame_action = QAction("像素序列帧动画...", self)
+        self.pixel_sequence_frame_action.triggered.connect(lambda: self._open_sequence_frame_dialog(pixel_mode=True))
+
         self.canvas_notes_action = QAction("画布便签...", self)
         self.canvas_notes_action.triggered.connect(self._open_canvas_notes)
 
@@ -784,6 +792,10 @@ class GameDesignerApp(QMainWindow):
         self.ai_menu = QMenu("AI", self)
         self.ai_menu.addAction(self.ai_chat_action)
         self.ai_menu.addAction(self.ai_image_action)
+        self.ai_menu.addSeparator()
+        self.ai_menu.addAction(self.sequence_frame_action)
+        self.ai_menu.addAction(self.pixel_sequence_frame_action)
+        self.ai_menu.addSeparator()
         self.ai_menu.addAction(self.canvas_notes_action)
         self.ai_menu.addAction(self.ai_settings_action)
 
@@ -3144,6 +3156,53 @@ class GameDesignerApp(QMainWindow):
                 self.ai_assistant_panel.bind_canvas("", "")
         self.ai_assistant_panel.show()
         self.ai_assistant_panel.input.setFocus(Qt.OtherFocusReason)
+
+    def _open_sequence_frame_dialog(self, *, pixel_mode: bool = False) -> None:
+        page = self._current_page()
+        if not page or page.is_welcome:
+            QMessageBox.information(self, "序列帧动画", "请先打开一个项目画布。")
+            return
+        initial_path = self._sequence_frame_initial_path(page)
+        output_path = self._sequence_frame_output_path(page, pixel_mode)
+        dialog = SequenceFrameDialog(
+            self,
+            pixel_mode=pixel_mode,
+            initial_path=initial_path,
+            output_path=output_path,
+        )
+        dialog.exec()
+
+    def _sequence_frame_initial_path(self, page: ProjectPage) -> str | None:
+        candidates = []
+        if page.canvas_data.is_image_canvas():
+            output = find_image_output_node(page.canvas_data)
+            if output is not None:
+                candidates.append(output)
+        if len(page.canvas.selected_node_ids) == 1:
+            selected_id = next(iter(page.canvas.selected_node_ids))
+            selected = page.canvas_data.find_node(selected_id)
+            if selected is not None:
+                candidates.append(selected)
+        for node in candidates:
+            for field in node.fields:
+                if field.data_type == "图片" and field.image_path:
+                    image_path = Path(field.image_path)
+                    if image_path.exists():
+                        return str(image_path)
+        return None
+
+    def _sequence_frame_output_path(self, page: ProjectPage, pixel_mode: bool) -> Path | None:
+        if not page.path:
+            return None
+        folder = project_bundle_dir(page.path) / ("pixel_sequence_frames" if pixel_mode else "sequence_frames")
+        folder.mkdir(parents=True, exist_ok=True)
+        base_name = _safe_filename(page.canvas_data.name or ("像素序列帧" if pixel_mode else "序列帧"))
+        path = folder / f"{base_name}.png"
+        index = 2
+        while path.exists():
+            path = folder / f"{base_name}_{index}.png"
+            index += 1
+        return path
 
     def _open_ai_iteration_assistant(self) -> None:
         panel = self._open_ai_assistant_panel()

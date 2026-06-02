@@ -7,7 +7,7 @@ from unittest import mock
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QEvent, QMimeData, QPointF, Qt
-from PySide6.QtGui import QImage, QKeyEvent, QPixmap, QTextCursor
+from PySide6.QtGui import QColor, QImage, QKeyEvent, QPixmap, QTextCursor
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QWidget
 
 from gamedesigner.app import EDGE_LABEL_MAX_LENGTH, GameDesignerApp
@@ -260,6 +260,41 @@ class AppEditingTests(unittest.TestCase):
         self.assertTrue(pixel_canvas.is_pixel_canvas())
         self.assertIn("像素作画画布规则", pixel_canvas.ai_rules)
         window.deleteLater()
+
+    def test_ai_menu_sequence_frame_actions_open_normal_and_pixel_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            project_path = Path(folder) / "SequenceTools.gdc"
+            image_path = Path(folder) / "frame.png"
+            image = QImage(4, 4, QImage.Format_ARGB32_Premultiplied)
+            image.fill(QColor("#3366CC"))
+            image.save(str(image_path), "PNG")
+            window = GameDesignerApp()
+            project = ProjectData(name="序列帧测试")
+            project.ensure_canvas_structure()
+            node = project.root_canvas().add_node(
+                Node(title="图片节点", fields=[NodeField("图", "图片", image_path=str(image_path))])
+            )
+            page = window._add_page(project, project_path, dirty=False, canvas_data=project.root_canvas())
+            window.tabs.setCurrentWidget(page)
+            page.canvas.select_node(node.id)
+            opened: list[tuple[bool, str | None, Path | None]] = []
+
+            class FakeSequenceFrameDialog:
+                def __init__(self, _parent, *, pixel_mode: bool, initial_path: str | None, output_path: Path | None) -> None:
+                    opened.append((pixel_mode, initial_path, output_path))
+
+                def exec(self) -> int:
+                    return 0
+
+            with mock.patch("gamedesigner.app.SequenceFrameDialog", FakeSequenceFrameDialog):
+                window.sequence_frame_action.trigger()
+                window.pixel_sequence_frame_action.trigger()
+
+            self.assertEqual([item[0] for item in opened], [False, True])
+            self.assertEqual([item[1] for item in opened], [str(image_path), str(image_path)])
+            self.assertIn("sequence_frames", opened[0][2].parts if opened[0][2] else [])
+            self.assertIn("pixel_sequence_frames", opened[1][2].parts if opened[1][2] else [])
+            window.deleteLater()
 
     def test_ai_image_generate_button_uses_click_wrapper_without_signal_args(self) -> None:
         settings = AppSettings(ai_image_api_key="secret", ai_image_base_url="https://api.openai.com/v1")
