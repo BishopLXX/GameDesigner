@@ -23,13 +23,16 @@ from gamedesigner.ui.sequence_frame_dialog import (
     build_animation_generation_prompt,
     build_horizontal_spritesheet,
     build_sequence_frame_generation_jobs,
+    clear_edge_background_artifacts,
     clear_connected_corner_background,
     crop_returned_api_canvas,
     extract_bordered_template_frames,
+    foreground_content_rect,
     four_multiple_size,
     generate_sequence_frames_with_ai,
     image_has_transparency,
     fit_image_to_frame,
+    register_frame_alignment,
     save_spritesheet,
     sequence_api_canvas_size,
     sequence_request_background,
@@ -160,6 +163,51 @@ class SequenceFrameDialogTests(unittest.TestCase):
         self.assertEqual(self._opaque_bottom_y(frames[0]), self._opaque_bottom_y(frames[2]))
         self.assertEqual(self._opaque_center_x(frames[0]), self._opaque_center_x(frames[1]))
         self.assertEqual(self._opaque_center_x(frames[0]), self._opaque_center_x(frames[2]))
+
+    def test_register_frame_alignment_corrects_internal_drift_with_same_bounds(self) -> None:
+        reference = self._transparent_image(32, 32)
+        drifted = self._transparent_image(32, 32)
+        painter = QPainter(reference)
+        painter.fillRect(14, 0, 4, 2, QColor("#227733"))
+        painter.fillRect(14, 30, 4, 2, QColor("#227733"))
+        painter.fillRect(8, 10, 16, 8, QColor("#CC2222"))
+        painter.end()
+        painter = QPainter(drifted)
+        painter.fillRect(14, 0, 4, 2, QColor("#227733"))
+        painter.fillRect(14, 30, 4, 2, QColor("#227733"))
+        painter.fillRect(8, 14, 16, 8, QColor("#CC2222"))
+        painter.end()
+
+        frames = register_frame_alignment([reference, drifted], QSize(32, 32), pixel_mode=True)
+
+        self.assertEqual(self._color_center_y(frames[0], "#CC2222"), self._color_center_y(frames[1], "#CC2222"))
+
+    def test_foreground_rect_ignores_edge_checkerboard_and_specks(self) -> None:
+        image = self._transparent_image(30, 20)
+        self._paint_checker_artifacts(image)
+        painter = QPainter(image)
+        painter.fillRect(8, 6, 14, 8, QColor("#27AA33"))
+        painter.fillRect(27, 2, 1, 1, QColor("#FFFFFF"))
+        painter.fillRect(2, 18, 1, 1, QColor("#000000"))
+        painter.end()
+
+        rect = foreground_content_rect(image)
+
+        self.assertIsNotNone(rect)
+        self.assertEqual((rect.x(), rect.y(), rect.width(), rect.height()), (8, 6, 14, 8))
+
+    def test_clear_edge_background_artifacts_removes_baked_checkerboard(self) -> None:
+        image = self._transparent_image(30, 20)
+        self._paint_checker_artifacts(image)
+        painter = QPainter(image)
+        painter.fillRect(8, 6, 14, 8, QColor("#27AA33"))
+        painter.end()
+
+        cleaned = clear_edge_background_artifacts(image)
+
+        self.assertEqual(cleaned.pixelColor(1, 1).alpha(), 0)
+        self.assertEqual(cleaned.pixelColor(4, 12).alpha(), 0)
+        self.assertGreater(cleaned.pixelColor(12, 8).alpha(), 0)
 
     def test_animation_prompt_includes_user_motion_frame_grid_and_pixel_rules(self) -> None:
         prompt = build_animation_generation_prompt(
@@ -458,6 +506,17 @@ class SequenceFrameDialogTests(unittest.TestCase):
         image.fill(QColor(0, 0, 0, 0))
         return image
 
+    def _paint_checker_artifacts(self, image: QImage) -> None:
+        painter = QPainter(image)
+        for y in range(0, 6, 2):
+            for x in range(0, image.width(), 2):
+                color = QColor("#E4E4E4") if (x + y) % 4 == 0 else QColor("#FFFFFF")
+                painter.fillRect(x, y, 2, 2, color)
+        for y in range(0, image.height(), 2):
+            color = QColor("#E4E4E4") if y % 4 == 0 else QColor("#FFFFFF")
+            painter.fillRect(0, y, 5, 2, color)
+        painter.end()
+
     def _png_bytes(self, image: QImage) -> bytes:
         data = QByteArray()
         buffer = QBuffer(data)
@@ -492,6 +551,16 @@ class SequenceFrameDialogTests(unittest.TestCase):
             if image.pixelColor(x, y).alpha() > 0
         ]
         return max(ys) if ys else -1
+
+    def _color_center_y(self, image: QImage, color: str) -> int:
+        target = QColor(color)
+        ys = [
+            y
+            for y in range(image.height())
+            for x in range(image.width())
+            if image.pixelColor(x, y).name().upper() == target.name().upper()
+        ]
+        return round((min(ys) + max(ys)) / 2) if ys else -1
 
 
 if __name__ == "__main__":

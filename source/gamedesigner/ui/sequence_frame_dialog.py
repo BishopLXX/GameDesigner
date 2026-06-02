@@ -370,6 +370,15 @@ def clear_connected_corner_background(
     tolerance: int = 24,
     alpha_threshold: int = 8,
 ) -> QImage:
+    return clear_edge_background_artifacts(image, tolerance=tolerance, alpha_threshold=alpha_threshold)
+
+
+def clear_edge_background_artifacts(
+    image: QImage,
+    *,
+    tolerance: int = 24,
+    alpha_threshold: int = 8,
+) -> QImage:
     if image.isNull():
         return QImage()
     output = image.convertToFormat(QImage.Format_ARGB32_Premultiplied)
@@ -377,41 +386,20 @@ def clear_connected_corner_background(
     height = output.height()
     if width <= 0 or height <= 0:
         return output
-    visited = bytearray(width * height)
-    queue: deque[tuple[int, int, QColor]] = deque()
-    for x, y in ((0, 0), (width - 1, 0), (0, height - 1), (width - 1, height - 1)):
-        queue.append((x, y, output.pixelColor(x, y)))
-    transparent = QColor(0, 0, 0, 0)
-    while queue:
-        x, y, seed = queue.popleft()
-        if x < 0 or y < 0 or x >= width or y >= height:
-            continue
-        offset = y * width + x
-        if visited[offset]:
-            continue
-        visited[offset] = 1
-        color = output.pixelColor(x, y)
-        if not _similar_background_color(color, seed, tolerance, alpha_threshold):
-            continue
-        output.setPixelColor(x, y, transparent)
-        queue.append((x + 1, y, seed))
-        queue.append((x - 1, y, seed))
-        queue.append((x, y + 1, seed))
-        queue.append((x, y - 1, seed))
-    return output
-
-
-def _similar_background_color(color: QColor, seed: QColor, tolerance: int, alpha_threshold: int) -> bool:
-    if color.alpha() <= alpha_threshold:
-        return True
-    if seed.alpha() <= alpha_threshold:
-        return color.alpha() <= alpha_threshold
-    return (
-        abs(color.red() - seed.red()) <= tolerance
-        and abs(color.green() - seed.green()) <= tolerance
-        and abs(color.blue() - seed.blue()) <= tolerance
-        and abs(color.alpha() - seed.alpha()) <= tolerance
+    foreground_mask, _rect = _foreground_mask_and_rect(
+        output,
+        background_tolerance=tolerance,
+        alpha_threshold=alpha_threshold,
     )
+    if foreground_mask is None:
+        return output
+    transparent = QColor(0, 0, 0, 0)
+    for y in range(height):
+        row = y * width
+        for x in range(width):
+            if not foreground_mask[row + x]:
+                output.setPixelColor(x, y, transparent)
+    return output
 
 
 def align_frame_content(frames: list[QImage], frame_size: QSize, *, pixel_mode: bool = False) -> list[QImage]:
@@ -483,42 +471,283 @@ def stabilize_frame_anchors(frames: list[QImage], frame_size: QSize, *, pixel_mo
         painter.drawImage(dx, dy, frame)
         painter.end()
         stabilized.append(output)
-    return stabilized
+    return register_frame_alignment(stabilized, frame_size, pixel_mode=pixel_mode)
+
+
+def register_frame_alignment(frames: list[QImage], frame_size: QSize, *, pixel_mode: bool = False) -> list[QImage]:
+    normalized = [fit_image_to_frame(frame, frame_size, pixel_mode=pixel_mode) for frame in frames if not frame.isNull()]
+    if len(normalized) <= 1:
+        return normalized
+    target_width = max(1, frame_size.width())
+    target_height = max(1, frame_size.height())
+    reference_mask, _rect = _foreground_mask_and_rect(
+        normalized[0].convertToFormat(QImage.Format_ARGB32_Premultiplied)
+    )
+    if reference_mask is None:
+        return normalized
+    aligned = [normalized[0].copy()]
+    for frame in normalized[1:]:
+        frame_mask, _frame_rect = _foreground_mask_and_rect(frame.convertToFormat(QImage.Format_ARGB32_Premultiplied))
+        if frame_mask is None:
+            aligned.append(frame.copy())
+            continue
+        dx, dy = _best_registration_offset(reference_mask, frame_mask, target_width, target_height)
+        if dx == 0 and dy == 0:
+            aligned.append(frame.copy())
+            continue
+        output = QImage(target_width, target_height, QImage.Format_ARGB32_Premultiplied)
+        output.fill(Qt.transparent)
+        painter = QPainter(output)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, not pixel_mode)
+        painter.drawImage(dx, dy, frame)
+        painter.end()
+        aligned.append(output)
+    return aligned
+
+
+def _best_registration_offset(reference_mask: bytearray, frame_mask: bytearray, width: int, height: int) -> tuple[int, int]:
+    min_edge = max(1, min(width, height))
+    max_shift = max(6, min(24, round(min_edge * 0.06)))
+    stride = 1 if min_edge <= 96 else 2 if min_edge <= 192 else 4 if min_edge <= 512 else 6
+    reference_samples = _sample_mask_offsets(reference_mask, width, height, stride)
+    frame_samples = _sample_mask_offsets(frame_mask, width, height, stride)
+    if len(reference_samples) < 8 or len(frame_samples) < 8:
+        return 0, 0
+    zero_score = _registration_score(reference_mask, frame_mask, reference_samples, frame_samples, width, height, 0, 0)
+    best_score = zero_score
+    best_dx = 0
+    best_dy = 0
+    for dy in range(-max_shift, max_shift + 1):
+        for dx in range(-max_shift, max_shift + 1):
+            if dx == 0 and dy == 0:
+                continue
+            score = _registration_score(
+                reference_mask,
+                frame_mask,
+                reference_samples,
+                frame_samples,
+                width,
+                height,
+                dx,
+                dy,
+            )
+            if score > best_score or (
+                score == best_score and abs(dx) + abs(dy) < abs(best_dx) + abs(best_dy)
+            ):
+                best_score = score
+                best_dx = dx
+                best_dy = dy
+    required_gain = max(3, round(min(len(reference_samples), len(frame_samples)) * 0.006))
+    if best_score < zero_score + required_gain:
+        return 0, 0
+    return best_dx, best_dy
+
+
+def _sample_mask_offsets(mask: bytearray, width: int, height: int, stride: int) -> list[int]:
+    samples: list[int] = []
+    step = max(1, int(stride))
+    for y in range(0, height, step):
+        row = y * width
+        for x in range(0, width, step):
+            offset = row + x
+            if mask[offset]:
+                samples.append(offset)
+    return samples
+
+
+def _registration_score(
+    reference_mask: bytearray,
+    frame_mask: bytearray,
+    reference_samples: list[int],
+    frame_samples: list[int],
+    width: int,
+    height: int,
+    dx: int,
+    dy: int,
+) -> int:
+    score = _shifted_overlap(frame_mask, reference_samples, width, height, dx, dy)
+    score += _shifted_overlap(reference_mask, frame_samples, width, height, -dx, -dy)
+    score -= (abs(dx) + abs(dy)) * 2
+    return score
+
+
+def _shifted_overlap(mask: bytearray, samples: list[int], width: int, height: int, dx: int, dy: int) -> int:
+    overlap = 0
+    for offset in samples:
+        x = offset % width
+        y = offset // width
+        target_x = x - dx
+        target_y = y - dy
+        if target_x < 0 or target_y < 0 or target_x >= width or target_y >= height:
+            continue
+        if mask[target_y * width + target_x]:
+            overlap += 1
+    return overlap
 
 
 def foreground_content_rect(image: QImage, *, background_tolerance: int = 18, alpha_threshold: int = 8) -> QRect | None:
     if image.isNull():
         return None
     source = image.convertToFormat(QImage.Format_ARGB32_Premultiplied)
+    _mask, rect = _foreground_mask_and_rect(
+        source,
+        background_tolerance=background_tolerance,
+        alpha_threshold=alpha_threshold,
+    )
+    return rect
+
+
+def _foreground_mask_and_rect(
+    source: QImage,
+    *,
+    background_tolerance: int = 18,
+    alpha_threshold: int = 8,
+) -> tuple[bytearray | None, QRect | None]:
     width = source.width()
     height = source.height()
     if width <= 0 or height <= 0:
-        return None
+        return None, None
     backgrounds = [
         source.pixelColor(0, 0),
         source.pixelColor(width - 1, 0),
         source.pixelColor(0, height - 1),
         source.pixelColor(width - 1, height - 1),
     ]
+    edge_background = _edge_background_mask(
+        source,
+        backgrounds,
+        background_tolerance=background_tolerance,
+        alpha_threshold=alpha_threshold,
+    )
+    candidates = bytearray(width * height)
+    for y in range(height):
+        row = y * width
+        for x in range(width):
+            offset = row + x
+            color = source.pixelColor(x, y)
+            if color.alpha() <= alpha_threshold or edge_background[offset]:
+                continue
+            if _is_background_pixel(color, backgrounds, background_tolerance, alpha_threshold):
+                continue
+            candidates[offset] = 1
+    foreground = bytearray(width * height)
+    visited = bytearray(width * height)
+    components: list[tuple[list[int], tuple[int, int, int, int], int, int]] = []
+    for y in range(height):
+        for x in range(width):
+            start = y * width + x
+            if not candidates[start] or visited[start]:
+                continue
+            stack = [start]
+            visited[start] = 1
+            pixels: list[int] = []
+            min_x = width
+            min_y = height
+            max_x = -1
+            max_y = -1
+            artifact_pixels = 0
+            while stack:
+                offset = stack.pop()
+                pixels.append(offset)
+                px = offset % width
+                py = offset // width
+                min_x = min(min_x, px)
+                min_y = min(min_y, py)
+                max_x = max(max_x, px)
+                max_y = max(max_y, py)
+                if _is_neutral_background_artifact(source.pixelColor(px, py), alpha_threshold):
+                    artifact_pixels += 1
+                for neighbor in (
+                    offset - 1 if px > 0 else -1,
+                    offset + 1 if px < width - 1 else -1,
+                    offset - width if py > 0 else -1,
+                    offset + width if py < height - 1 else -1,
+                ):
+                    if neighbor >= 0 and candidates[neighbor] and not visited[neighbor]:
+                        visited[neighbor] = 1
+                        stack.append(neighbor)
+            components.append((pixels, (min_x, min_y, max_x, max_y), len(pixels), artifact_pixels))
+    if not components:
+        return foreground, None
+    largest_area = max(area for _pixels, _box, area, _artifact in components)
+    area_floor = max(2, min(64, round(width * height * 0.00025), round(largest_area * 0.005)))
     min_x = width
     min_y = height
     max_x = -1
     max_y = -1
-    for y in range(height):
-        for x in range(width):
-            color = source.pixelColor(x, y)
-            if _is_background_pixel(color, backgrounds, background_tolerance, alpha_threshold):
-                continue
-            min_x = min(min_x, x)
-            min_y = min(min_y, y)
-            max_x = max(max_x, x)
-            max_y = max(max_y, y)
+    for pixels, box, area, artifact_pixels in components:
+        if area < area_floor:
+            continue
+        if area > 0 and artifact_pixels / area >= 0.86:
+            continue
+        for offset in pixels:
+            foreground[offset] = 1
+        min_x = min(min_x, box[0])
+        min_y = min(min_y, box[1])
+        max_x = max(max_x, box[2])
+        max_y = max(max_y, box[3])
     if max_x < min_x or max_y < min_y:
-        return None
+        return foreground, None
     rect = QRect(min_x, min_y, max_x - min_x + 1, max_y - min_y + 1)
-    if rect.width() >= width * 0.92 and rect.height() >= height * 0.92:
-        return QRect(0, 0, width, height)
-    return rect
+    return foreground, rect
+
+
+def _edge_background_mask(
+    image: QImage,
+    backgrounds: list[QColor],
+    *,
+    background_tolerance: int,
+    alpha_threshold: int,
+) -> bytearray:
+    width = image.width()
+    height = image.height()
+    visited = bytearray(width * height)
+    background = bytearray(width * height)
+    queue: deque[tuple[int, int]] = deque()
+    for x in range(width):
+        queue.append((x, 0))
+        queue.append((x, height - 1))
+    for y in range(height):
+        queue.append((0, y))
+        queue.append((width - 1, y))
+    while queue:
+        x, y = queue.popleft()
+        if x < 0 or y < 0 or x >= width or y >= height:
+            continue
+        offset = y * width + x
+        if visited[offset]:
+            continue
+        visited[offset] = 1
+        color = image.pixelColor(x, y)
+        if not _is_edge_background_pixel(color, backgrounds, background_tolerance, alpha_threshold):
+            continue
+        background[offset] = 1
+        queue.append((x + 1, y))
+        queue.append((x - 1, y))
+        queue.append((x, y + 1))
+        queue.append((x, y - 1))
+    return background
+
+
+def _is_edge_background_pixel(
+    color: QColor,
+    backgrounds: list[QColor],
+    tolerance: int,
+    alpha_threshold: int,
+) -> bool:
+    if color.alpha() <= alpha_threshold:
+        return True
+    if _is_background_pixel(color, backgrounds, tolerance, alpha_threshold):
+        return True
+    return _is_neutral_background_artifact(color, alpha_threshold)
+
+
+def _is_neutral_background_artifact(color: QColor, alpha_threshold: int) -> bool:
+    if color.alpha() <= alpha_threshold:
+        return True
+    spread = max(color.red(), color.green(), color.blue()) - min(color.red(), color.green(), color.blue())
+    luma = (color.red() * 299 + color.green() * 587 + color.blue() * 114) // 1000
+    return spread <= 18 and (luma <= 40 or luma >= 205)
 
 
 def _is_background_pixel(
