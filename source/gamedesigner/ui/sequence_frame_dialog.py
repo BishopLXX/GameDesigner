@@ -1478,10 +1478,13 @@ class SequenceFrameDialog(QDialog):
         path = self._selected_output_path()
         if path is None:
             return
-        sheet = build_horizontal_spritesheet(self.source_frames, pixel_mode=self.pixel_mode, frame_size=self._frame_size())
+        export_frames = self._normalized_frames_for_export()
+        sheet = build_horizontal_spritesheet(export_frames, pixel_mode=self.pixel_mode, frame_size=self._frame_size())
         if sheet.isNull() or not save_spritesheet(sheet, path, pixel_mode=self.pixel_mode):
             QMessageBox.warning(self, "导出失败", "无法保存横向序列帧图。")
             return
+        self.source_frames = [frame.copy() for frame in export_frames]
+        self._refresh_frames(select_row=self._current_row())
         self.result_path = str(path)
         self.output_path = path
         self.output_path_edit.setText(str(path))
@@ -1566,6 +1569,13 @@ class SequenceFrameDialog(QDialog):
         image = QImage(self._frame_size(), QImage.Format_ARGB32_Premultiplied)
         image.fill(Qt.transparent)
         return image
+
+    def _normalized_frames_for_export(self) -> list[QImage]:
+        size = self._frame_size()
+        frames = [fit_image_to_frame(frame, size, pixel_mode=self.pixel_mode) for frame in self.source_frames]
+        if any(image_has_transparency(frame) for frame in frames):
+            frames = [clear_edge_background_artifacts(frame) for frame in frames]
+        return stabilize_frame_anchors(frames, size, pixel_mode=self.pixel_mode)
 
     def _choose_output_path(self) -> None:
         default_name = "像素序列帧.png" if self.pixel_mode else "序列帧.png"

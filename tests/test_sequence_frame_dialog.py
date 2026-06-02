@@ -477,6 +477,33 @@ class SequenceFrameDialogTests(unittest.TestCase):
             self.assertEqual(dialog.output_path_edit.text(), str(chosen))
             dialog.deleteLater()
 
+    def test_dialog_export_normalizes_loaded_frame_alignment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            output = folder / "aligned.png"
+            reference = self._transparent_image(32, 32)
+            drifted = self._transparent_image(32, 32)
+            painter = QPainter(reference)
+            painter.fillRect(8, 10, 16, 8, QColor("#CC2222"))
+            painter.end()
+            painter = QPainter(drifted)
+            painter.fillRect(8, 14, 16, 8, QColor("#CC2222"))
+            painter.end()
+
+            dialog = SequenceFrameDialog(pixel_mode=True, output_path=output)
+            dialog.source_frames = [reference, drifted]
+            dialog.frame_count_spin.setValue(2)
+            dialog.width_spin.setValue(32)
+            dialog.height_spin.setValue(32)
+            dialog.output_path_edit.setText(str(output))
+            dialog._refresh_frames(select_row=0)
+            dialog._export_spritesheet()
+
+            exported = QImage(str(output))
+            frames = split_horizontal_spritesheet(exported, 2, QSize(32, 32), pixel_mode=True)
+            self.assertEqual(self._color_center_y(frames[0], "#CC2222"), self._color_center_y(frames[1], "#CC2222"))
+            dialog.deleteLater()
+
     def test_dialog_loads_dropped_image_paths_without_file_picker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp)
