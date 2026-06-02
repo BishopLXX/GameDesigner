@@ -4,7 +4,7 @@ import copy
 import tempfile
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QRect, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QIcon, QImage, QImageWriter, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -93,6 +93,7 @@ def split_horizontal_spritesheet(
     frame_size: QSize,
     *,
     pixel_mode: bool = False,
+    align_content: bool = False,
 ) -> list[QImage]:
     if image.isNull():
         return []
@@ -103,8 +104,102 @@ def split_horizontal_spritesheet(
     for index in range(count):
         x = min(source.width() - segment_width, index * segment_width)
         segment = source.copy(x, 0, segment_width, source.height())
-        frames.append(fit_image_to_frame(segment, frame_size, pixel_mode=pixel_mode))
-    return frames
+        frames.append(segment)
+    if align_content:
+        return align_frame_content(frames, frame_size, pixel_mode=pixel_mode)
+    return [fit_image_to_frame(frame, frame_size, pixel_mode=pixel_mode) for frame in frames]
+
+
+def align_frame_content(frames: list[QImage], frame_size: QSize, *, pixel_mode: bool = False) -> list[QImage]:
+    records: list[tuple[QImage, QRect | None]] = [
+        (frame, foreground_content_rect(frame)) for frame in frames if not frame.isNull()
+    ]
+    boxes = [box for _frame, box in records if box is not None and box.width() > 0 and box.height() > 0]
+    if not boxes:
+        return [fit_image_to_frame(frame, frame_size, pixel_mode=pixel_mode) for frame, _box in records]
+    target_width = max(1, frame_size.width())
+    target_height = max(1, frame_size.height())
+    max_content_width = max(1, max(box.width() for box in boxes))
+    max_content_height = max(1, max(box.height() for box in boxes))
+    scale = min(target_width / max_content_width, target_height / max_content_height)
+    aligned: list[QImage] = []
+    for frame, box in records:
+        output = QImage(target_width, target_height, QImage.Format_ARGB32_Premultiplied)
+        output.fill(Qt.transparent)
+        if box is None:
+            aligned.append(output)
+            continue
+        crop = frame.copy(box)
+        scaled_width = max(1, min(target_width, round(crop.width() * scale)))
+        scaled_height = max(1, min(target_height, round(crop.height() * scale)))
+        scaled = crop.scaled(
+            scaled_width,
+            scaled_height,
+            Qt.KeepAspectRatio,
+            Qt.FastTransformation if pixel_mode else Qt.SmoothTransformation,
+        )
+        painter = QPainter(output)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, not pixel_mode)
+        painter.drawImage((target_width - scaled.width()) // 2, (target_height - scaled.height()) // 2, scaled)
+        painter.end()
+        aligned.append(output)
+    return aligned
+
+
+def foreground_content_rect(image: QImage, *, background_tolerance: int = 18, alpha_threshold: int = 8) -> QRect | None:
+    if image.isNull():
+        return None
+    source = image.convertToFormat(QImage.Format_ARGB32_Premultiplied)
+    width = source.width()
+    height = source.height()
+    if width <= 0 or height <= 0:
+        return None
+    backgrounds = [
+        source.pixelColor(0, 0),
+        source.pixelColor(width - 1, 0),
+        source.pixelColor(0, height - 1),
+        source.pixelColor(width - 1, height - 1),
+    ]
+    min_x = width
+    min_y = height
+    max_x = -1
+    max_y = -1
+    for y in range(height):
+        for x in range(width):
+            color = source.pixelColor(x, y)
+            if _is_background_pixel(color, backgrounds, background_tolerance, alpha_threshold):
+                continue
+            min_x = min(min_x, x)
+            min_y = min(min_y, y)
+            max_x = max(max_x, x)
+            max_y = max(max_y, y)
+    if max_x < min_x or max_y < min_y:
+        return None
+    rect = QRect(min_x, min_y, max_x - min_x + 1, max_y - min_y + 1)
+    if rect.width() >= width * 0.92 and rect.height() >= height * 0.92:
+        return QRect(0, 0, width, height)
+    return rect
+
+
+def _is_background_pixel(
+    color: QColor,
+    backgrounds: list[QColor],
+    tolerance: int,
+    alpha_threshold: int,
+) -> bool:
+    if color.alpha() <= alpha_threshold:
+        return True
+    for background in backgrounds:
+        if background.alpha() <= alpha_threshold and color.alpha() <= alpha_threshold:
+            return True
+        if (
+            abs(color.red() - background.red()) <= tolerance
+            and abs(color.green() - background.green()) <= tolerance
+            and abs(color.blue() - background.blue()) <= tolerance
+            and abs(color.alpha() - background.alpha()) <= tolerance
+        ):
+            return True
+    return False
 
 
 def build_animation_generation_prompt(
@@ -133,6 +228,7 @@ def build_animation_generation_prompt(
 class SequenceFrameGenerationThread(QThread):
     succeeded = Signal(object)
     failed = Signal(str)
+    progress = Signal(str)
 
     def __init__(
         self,
@@ -157,14 +253,17 @@ class SequenceFrameGenerationThread(QThread):
 
     def run(self) -> None:  # type: ignore[override]
         try:
+            self.progress.emit("正在构建 AI 生图请求...")
             request = build_ai_image_request(
                 self.settings,
                 self.prompt,
                 [self.reference_path] if self.reference_path and self.reference_path.exists() else [],
             )
+            self.progress.emit(f"正在调用 {request.model} 生成横向序列帧图...")
             images = generate_ai_images(request)
             if not images:
                 raise AiImageError("生图服务没有返回序列帧图片。")
+            self.progress.emit("已收到 AI 图片，正在按帧数切割并对齐主体...")
             sheet = QImage.fromData(images[0].data)
             if sheet.isNull():
                 raise AiImageError("生图服务返回的序列帧图片无法读取。")
@@ -173,6 +272,7 @@ class SequenceFrameGenerationThread(QThread):
                 self.frame_count,
                 self.frame_size,
                 pixel_mode=self.pixel_mode,
+                align_content=True,
             )
             if not frames:
                 raise AiImageError("无法从 AI 返回图片中切出序列帧。")
@@ -359,6 +459,13 @@ class SequenceFrameDialog(QDialog):
         prompt_row.addWidget(self.prompt_edit)
         layout.addLayout(prompt_row)
 
+        self.log_edit = QPlainTextEdit(self)
+        self.log_edit.setReadOnly(True)
+        self.log_edit.setFixedHeight(118)
+        self.log_edit.setPlaceholderText("AI 调用日志会显示在这里")
+        self.log_edit.setAcceptDrops(False)
+        layout.addWidget(self.log_edit)
+
         self.preview = AnimationPreviewWidget(pixel_mode=self.pixel_mode, parent=self)
         self.preview.filesDropped.connect(self._load_dropped_images)
         self.fps_spin.valueChanged.connect(self.preview.set_fps)
@@ -393,6 +500,8 @@ class SequenceFrameDialog(QDialog):
         self._last_dir = source_path.parent
         self.base_image_path = source_path
         self.base_image = image.convertToFormat(QImage.Format_ARGB32_Premultiplied)
+        if hasattr(self, "log_edit"):
+            self._append_log(f"已导入参考图：{source_path}")
         self.width_spin.blockSignals(True)
         self.height_spin.blockSignals(True)
         self.width_spin.setValue(max(1, self.base_image.width()))
@@ -430,7 +539,7 @@ class SequenceFrameDialog(QDialog):
         self.height_spin.valueChanged.connect(self._refresh_frames)
         layout.addWidget(self.height_spin)
 
-        seed_button = QPushButton("开始制作", self)
+        seed_button = QPushButton("铺基准帧", self)
         seed_button.clicked.connect(self._seed_frames)
         layout.addWidget(seed_button)
 
@@ -496,6 +605,7 @@ class SequenceFrameDialog(QDialog):
         self._last_dir = valid_images[0][0].parent
         self.base_image_path = valid_images[0][0]
         self.base_image = valid_images[0][1].copy()
+        self._append_log(f"已拖入参考图：{self.base_image_path}")
         if len(valid_images) == 1:
             self.width_spin.blockSignals(True)
             self.height_spin.blockSignals(True)
@@ -539,8 +649,10 @@ class SequenceFrameDialog(QDialog):
             frame_height=self.height_spin.value(),
             pixel_mode=self.pixel_mode,
         )
+        self._append_log(f"动画描述：{user_prompt}")
+        self._append_log(f"发送给 AI 的 prompt：\n{prompt}")
         self.ai_generate_button.setEnabled(False)
-        self.ai_generate_button.setText("生成中")
+        self.ai_generate_button.setText("AI生成中...")
         self.status_label.setText("正在调用 AI 生成横向序列帧图...")
         thread = SequenceFrameGenerationThread(
             self.settings,
@@ -553,6 +665,7 @@ class SequenceFrameDialog(QDialog):
         )
         thread.succeeded.connect(self._ai_generation_succeeded)
         thread.failed.connect(self._ai_generation_failed)
+        thread.progress.connect(self._append_log)
         thread.finished.connect(self._ai_generation_finished)
         self._generation_thread = thread
         thread.start()
@@ -636,10 +749,12 @@ class SequenceFrameDialog(QDialog):
         self.frame_count_spin.blockSignals(False)
         self._refresh_frames(select_row=0)
         self.status_label.setText("AI 序列帧已生成，可预览或导出横向图。")
+        self._append_log(f"已切出并对齐 {len(self.source_frames)} 帧。")
 
     def _ai_generation_failed(self, message: str) -> None:
         QMessageBox.warning(self, "AI生成帧", message or "AI 生成序列帧失败。")
         self.status_label.setText(message or "AI 生成序列帧失败。")
+        self._append_log(message or "AI 生成序列帧失败。")
 
     def _ai_generation_finished(self) -> None:
         self._generation_thread = None
@@ -702,6 +817,16 @@ class SequenceFrameDialog(QDialog):
         image = QImage(self._frame_size(), QImage.Format_ARGB32_Premultiplied)
         image.fill(Qt.transparent)
         return image
+
+    def _append_log(self, message: str) -> None:
+        text = str(message or "").strip()
+        if not text:
+            return
+        if not self.log_edit.toPlainText().strip():
+            self.log_edit.setPlainText(text)
+        else:
+            self.log_edit.appendPlainText(f"\n{text}")
+        self.log_edit.verticalScrollBar().setValue(self.log_edit.verticalScrollBar().maximum())
 
     def _reference_image_path(self) -> Path | None:
         if self.base_image_path and self.base_image_path.exists():

@@ -6,12 +6,13 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QSize
-from PySide6.QtGui import QColor, QImage
+from PySide6.QtGui import QColor, QImage, QPainter
 from PySide6.QtWidgets import QApplication
 
 from gamedesigner.image_rendering import is_pixel_art_image_path
 from gamedesigner.ui.sequence_frame_dialog import (
     SequenceFrameDialog,
+    align_frame_content,
     build_animation_generation_prompt,
     build_horizontal_spritesheet,
     fit_image_to_frame,
@@ -69,6 +70,41 @@ class SequenceFrameDialogTests(unittest.TestCase):
         self.assertEqual(frames[0].pixelColor(0, 0).name().upper(), "#FF0000")
         self.assertEqual(frames[1].pixelColor(0, 0).name().upper(), "#00FF00")
 
+    def test_split_ai_spritesheet_aligns_foreground_instead_of_preserving_black_offsets(self) -> None:
+        sheet = self._solid_image(20, 10, "#000000")
+        painter = QPainter(sheet)
+        painter.fillRect(1, 4, 4, 2, QColor("#FF0000"))
+        painter.fillRect(15, 4, 4, 2, QColor("#FF0000"))
+        painter.end()
+
+        frames = split_horizontal_spritesheet(
+            sheet,
+            2,
+            QSize(10, 10),
+            pixel_mode=True,
+            align_content=True,
+        )
+
+        self.assertEqual(len(frames), 2)
+        self.assertEqual(self._opaque_center_x(frames[0]), self._opaque_center_x(frames[1]))
+        self.assertEqual(frames[0].pixelColor(0, 0).alpha(), 0)
+        self.assertEqual(frames[1].pixelColor(0, 0).alpha(), 0)
+
+    def test_align_frame_content_uses_shared_scale_for_all_frames(self) -> None:
+        small = self._solid_image(10, 10, "#000000")
+        large = self._solid_image(10, 10, "#000000")
+        painter = QPainter(small)
+        painter.fillRect(4, 4, 2, 2, QColor("#00FF00"))
+        painter.end()
+        painter = QPainter(large)
+        painter.fillRect(3, 3, 4, 4, QColor("#00FF00"))
+        painter.end()
+
+        frames = align_frame_content([small, large], QSize(8, 8), pixel_mode=True)
+
+        self.assertLess(self._opaque_width(frames[0]), self._opaque_width(frames[1]))
+        self.assertEqual(self._opaque_center_x(frames[0]), self._opaque_center_x(frames[1]))
+
     def test_animation_prompt_includes_user_motion_frame_grid_and_pixel_rules(self) -> None:
         prompt = build_animation_generation_prompt(
             "向右走路，手臂摆动",
@@ -118,12 +154,31 @@ class SequenceFrameDialogTests(unittest.TestCase):
             self.assertEqual(dialog.width_spin.value(), 5)
             self.assertEqual(dialog.height_spin.value(), 4)
             self.assertEqual(dialog.base_image_path, first)
+            self.assertIn("已拖入参考图", dialog.log_edit.toPlainText())
             dialog.deleteLater()
 
     def _solid_image(self, width: int, height: int, color: str) -> QImage:
         image = QImage(width, height, QImage.Format_ARGB32_Premultiplied)
         image.fill(QColor(color))
         return image
+
+    def _opaque_center_x(self, image: QImage) -> int:
+        xs = [
+            x
+            for y in range(image.height())
+            for x in range(image.width())
+            if image.pixelColor(x, y).alpha() > 0
+        ]
+        return round((min(xs) + max(xs)) / 2) if xs else -1
+
+    def _opaque_width(self, image: QImage) -> int:
+        xs = [
+            x
+            for y in range(image.height())
+            for x in range(image.width())
+            if image.pixelColor(x, y).alpha() > 0
+        ]
+        return max(xs) - min(xs) + 1 if xs else 0
 
 
 if __name__ == "__main__":
