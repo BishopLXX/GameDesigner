@@ -13,8 +13,11 @@ from gamedesigner.image_rendering import is_pixel_art_image_path
 from gamedesigner.ui.sequence_frame_dialog import (
     SequenceFrameDialog,
     align_frame_content,
+    build_generation_template_spritesheet,
     build_animation_generation_prompt,
     build_horizontal_spritesheet,
+    clear_connected_corner_background,
+    image_has_transparency,
     fit_image_to_frame,
     save_spritesheet,
     split_horizontal_spritesheet,
@@ -111,6 +114,8 @@ class SequenceFrameDialogTests(unittest.TestCase):
             frame_count=6,
             frame_width=128,
             frame_height=128,
+            sheet_width=768,
+            sheet_height=128,
             pixel_mode=True,
         )
 
@@ -118,6 +123,33 @@ class SequenceFrameDialogTests(unittest.TestCase):
         self.assertIn("128x128", prompt)
         self.assertIn("向右走路", prompt)
         self.assertIn("crisp square pixels", prompt)
+        self.assertIn("locked sprite-sheet template", prompt)
+        self.assertIn("anchor point", prompt)
+
+    def test_generation_template_spritesheet_repeats_frames_to_fixed_grid(self) -> None:
+        red = self._solid_image(4, 4, "#FF0000")
+        blue = self._solid_image(4, 4, "#0000FF")
+
+        sheet = build_generation_template_spritesheet([red, blue], 4, QSize(4, 4), pixel_mode=True)
+
+        self.assertEqual(sheet.width(), 16)
+        self.assertEqual(sheet.height(), 4)
+        self.assertEqual(sheet.pixelColor(0, 0).name().upper(), "#FF0000")
+        self.assertEqual(sheet.pixelColor(4, 0).name().upper(), "#0000FF")
+        self.assertEqual(sheet.pixelColor(8, 0).name().upper(), "#0000FF")
+        self.assertEqual(sheet.pixelColor(12, 0).name().upper(), "#0000FF")
+
+    def test_clear_connected_corner_background_keeps_foreground_and_clears_edge_fill(self) -> None:
+        image = self._solid_image(10, 8, "#000000")
+        painter = QPainter(image)
+        painter.fillRect(3, 2, 3, 3, QColor("#00FF00"))
+        painter.end()
+
+        cleaned = clear_connected_corner_background(image)
+
+        self.assertTrue(image_has_transparency(cleaned))
+        self.assertEqual(cleaned.pixelColor(0, 0).alpha(), 0)
+        self.assertGreater(cleaned.pixelColor(4, 3).alpha(), 0)
 
     def test_dialog_exports_seeded_frames_to_configured_output_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -136,6 +168,24 @@ class SequenceFrameDialogTests(unittest.TestCase):
             self.assertEqual(exported.width(), 6)
             self.assertEqual(exported.height(), 2)
             self.assertTrue(is_pixel_art_image_path(str(output)))
+            dialog.deleteLater()
+
+    def test_dialog_uses_output_path_field_when_exporting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            source = folder / "source.png"
+            chosen = folder / "custom" / "frames.png"
+            self._solid_image(3, 2, "#CC3366").save(str(source), "PNG")
+
+            dialog = SequenceFrameDialog(pixel_mode=False, initial_path=source)
+            dialog.frame_count_spin.setValue(2)
+            dialog._seed_frames()
+            dialog.output_path_edit.setText(str(chosen))
+            dialog._export_spritesheet()
+
+            self.assertTrue(chosen.exists())
+            self.assertEqual(Path(dialog.result_path), chosen)
+            self.assertEqual(dialog.output_path_edit.text(), str(chosen))
             dialog.deleteLater()
 
     def test_dialog_loads_dropped_image_paths_without_file_picker(self) -> None:

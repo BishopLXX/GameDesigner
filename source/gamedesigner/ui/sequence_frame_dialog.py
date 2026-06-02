@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import copy
+from collections import deque
 import tempfile
+import uuid
 from pathlib import Path
 
 from PySide6.QtCore import QRect, QSize, Qt, QThread, QTimer, Signal
@@ -16,6 +18,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QLineEdit,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -94,6 +97,7 @@ def split_horizontal_spritesheet(
     *,
     pixel_mode: bool = False,
     align_content: bool = False,
+    cleanup_background: bool = False,
 ) -> list[QImage]:
     if image.isNull():
         return []
@@ -107,7 +111,89 @@ def split_horizontal_spritesheet(
         frames.append(segment)
     if align_content:
         return align_frame_content(frames, frame_size, pixel_mode=pixel_mode)
-    return [fit_image_to_frame(frame, frame_size, pixel_mode=pixel_mode) for frame in frames]
+    normalized_frames = [fit_image_to_frame(frame, frame_size, pixel_mode=pixel_mode) for frame in frames]
+    if cleanup_background:
+        return [clear_connected_corner_background(frame) for frame in normalized_frames]
+    return normalized_frames
+
+
+def build_generation_template_spritesheet(
+    frames: list[QImage],
+    frame_count: int,
+    frame_size: QSize,
+    *,
+    pixel_mode: bool = False,
+) -> QImage:
+    valid_frames = [frame for frame in frames if not frame.isNull()]
+    if not valid_frames:
+        return QImage()
+    count = max(1, int(frame_count))
+    template_frames: list[QImage] = []
+    for index in range(count):
+        source = valid_frames[index] if index < len(valid_frames) else valid_frames[-1]
+        template_frames.append(fit_image_to_frame(source, frame_size, pixel_mode=pixel_mode))
+    return build_horizontal_spritesheet(template_frames, pixel_mode=pixel_mode, frame_size=frame_size)
+
+
+def image_has_transparency(image: QImage) -> bool:
+    if image.isNull():
+        return False
+    source = image.convertToFormat(QImage.Format_ARGB32_Premultiplied)
+    for y in range(source.height()):
+        for x in range(source.width()):
+            if source.pixelColor(x, y).alpha() < 255:
+                return True
+    return False
+
+
+def clear_connected_corner_background(
+    image: QImage,
+    *,
+    tolerance: int = 24,
+    alpha_threshold: int = 8,
+) -> QImage:
+    if image.isNull():
+        return QImage()
+    output = image.convertToFormat(QImage.Format_ARGB32_Premultiplied)
+    width = output.width()
+    height = output.height()
+    if width <= 0 or height <= 0:
+        return output
+    visited = bytearray(width * height)
+    queue: deque[tuple[int, int, QColor]] = deque()
+    for x, y in ((0, 0), (width - 1, 0), (0, height - 1), (width - 1, height - 1)):
+        queue.append((x, y, output.pixelColor(x, y)))
+    transparent = QColor(0, 0, 0, 0)
+    while queue:
+        x, y, seed = queue.popleft()
+        if x < 0 or y < 0 or x >= width or y >= height:
+            continue
+        offset = y * width + x
+        if visited[offset]:
+            continue
+        visited[offset] = 1
+        color = output.pixelColor(x, y)
+        if not _similar_background_color(color, seed, tolerance, alpha_threshold):
+            continue
+        output.setPixelColor(x, y, transparent)
+        queue.append((x + 1, y, seed))
+        queue.append((x - 1, y, seed))
+        queue.append((x, y + 1, seed))
+        queue.append((x, y - 1, seed))
+    return output
+
+
+def _similar_background_color(color: QColor, seed: QColor, tolerance: int, alpha_threshold: int) -> bool:
+    if color.alpha() <= alpha_threshold:
+        return True
+    if seed.alpha() <= alpha_threshold:
+        return color.alpha() <= alpha_threshold
+    return (
+        abs(color.red() - seed.red()) <= tolerance
+        and abs(color.green() - seed.green()) <= tolerance
+        and abs(color.blue() - seed.blue()) <= tolerance
+        and abs(color.alpha() - seed.alpha()) <= tolerance
+    )
 
 
 def align_frame_content(frames: list[QImage], frame_size: QSize, *, pixel_mode: bool = False) -> list[QImage]:
@@ -208,6 +294,8 @@ def build_animation_generation_prompt(
     frame_count: int,
     frame_width: int,
     frame_height: int,
+    sheet_width: int,
+    sheet_height: int,
     pixel_mode: bool = False,
 ) -> str:
     style_rules = (
@@ -217,9 +305,12 @@ def build_animation_generation_prompt(
         else "Use clean game art animation rules: consistent character/object identity, stable camera, readable silhouette, coherent motion."
     )
     return (
-        f"Create one horizontal sprite sheet with exactly {frame_count} equal-sized animation frames in a single row. "
-        f"Each frame cell is {frame_width}x{frame_height}. Keep frame boundaries evenly spaced and do not add text, labels, margins, or UI. "
-        f"The input image is the visual reference for identity, proportions, palette, and style. "
+        f"The attached reference image is the exact locked sprite-sheet template to edit in place. "
+        f"Keep the canvas exactly {sheet_width}x{sheet_height}: exactly {frame_count} equal cells in one horizontal row, "
+        f"each cell exactly {frame_width}x{frame_height}. Do not crop, resize, add margins, add separators, add borders, or change the cell grid. "
+        f"The anchor point of the main subject is the center of each cell; keep that anchor centered and stable in every frame. "
+        f"Preserve transparent background outside the artwork when present; never fill empty areas with black or white blocks. "
+        f"Frame 1 should stay closest to the supplied pose. Modify the later repeated cells into animation frames only inside their fixed cells. "
         f"Animation request: {user_prompt.strip()}. "
         f"{style_rules} Return the sprite sheet only."
     )
@@ -234,10 +325,11 @@ class SequenceFrameGenerationThread(QThread):
         self,
         settings: AppSettings,
         prompt: str,
-        reference_path: Path | None,
+        template_path: Path,
         *,
         frame_count: int,
         frame_size: QSize,
+        template_has_transparency: bool = False,
         pixel_mode: bool = False,
         parent: QWidget | None = None,
     ) -> None:
@@ -245,10 +337,14 @@ class SequenceFrameGenerationThread(QThread):
         self.settings = copy.copy(settings)
         self.settings.ai_image_count = 1
         self.settings.ai_image_output_format = "png"
+        self.settings.ai_image_size = f"{max(1, frame_size.width()) * max(1, int(frame_count))}x{max(1, frame_size.height())}"
+        if template_has_transparency:
+            self.settings.ai_image_background = "transparent"
         self.prompt = prompt
-        self.reference_path = reference_path
+        self.template_path = template_path
         self.frame_count = max(1, int(frame_count))
         self.frame_size = QSize(max(1, frame_size.width()), max(1, frame_size.height()))
+        self.template_has_transparency = bool(template_has_transparency)
         self.pixel_mode = bool(pixel_mode)
 
     def run(self) -> None:  # type: ignore[override]
@@ -257,13 +353,13 @@ class SequenceFrameGenerationThread(QThread):
             request = build_ai_image_request(
                 self.settings,
                 self.prompt,
-                [self.reference_path] if self.reference_path and self.reference_path.exists() else [],
+                [self.template_path],
             )
-            self.progress.emit(f"正在调用 {request.model} 生成横向序列帧图...")
+            self.progress.emit(f"正在调用 {request.model} 编辑固定格序列帧模板...")
             images = generate_ai_images(request)
             if not images:
                 raise AiImageError("生图服务没有返回序列帧图片。")
-            self.progress.emit("已收到 AI 图片，正在按帧数切割并对齐主体...")
+            self.progress.emit("已收到 AI 图片，正在按固定帧格切割...")
             sheet = QImage.fromData(images[0].data)
             if sheet.isNull():
                 raise AiImageError("生图服务返回的序列帧图片无法读取。")
@@ -272,7 +368,8 @@ class SequenceFrameGenerationThread(QThread):
                 self.frame_count,
                 self.frame_size,
                 pixel_mode=self.pixel_mode,
-                align_content=True,
+                align_content=False,
+                cleanup_background=self.template_has_transparency,
             )
             if not frames:
                 raise AiImageError("无法从 AI 返回图片中切出序列帧。")
@@ -466,6 +563,19 @@ class SequenceFrameDialog(QDialog):
         self.log_edit.setAcceptDrops(False)
         layout.addWidget(self.log_edit)
 
+        output_row = QHBoxLayout()
+        output_row.setSpacing(8)
+        output_row.addWidget(QLabel("导出位置", self))
+        self.output_path_edit = QLineEdit(self)
+        self.output_path_edit.setPlaceholderText("选择导出的 PNG 文件路径")
+        if self.output_path is not None:
+            self.output_path_edit.setText(str(self.output_path))
+        output_row.addWidget(self.output_path_edit, 1)
+        choose_output_button = QPushButton("选择", self)
+        choose_output_button.clicked.connect(self._choose_output_path)
+        output_row.addWidget(choose_output_button)
+        layout.addLayout(output_row)
+
         self.preview = AnimationPreviewWidget(pixel_mode=self.pixel_mode, parent=self)
         self.preview.filesDropped.connect(self._load_dropped_images)
         self.fps_spin.valueChanged.connect(self.preview.set_fps)
@@ -523,6 +633,7 @@ class SequenceFrameDialog(QDialog):
         self.frame_count_spin = QSpinBox(self)
         self.frame_count_spin.setRange(1, 48)
         self.frame_count_spin.setValue(6)
+        self.frame_count_spin.valueChanged.connect(self._sync_frame_count)
         layout.addWidget(self.frame_count_spin)
 
         layout.addWidget(QLabel("帧宽", self))
@@ -641,25 +752,32 @@ class SequenceFrameDialog(QDialog):
             QMessageBox.information(self, "AI生成帧", "请先填写动画描述。")
             self.prompt_edit.setFocus(Qt.OtherFocusReason)
             return
-        reference_path = self._reference_image_path()
+        template_path, template_has_transparency = self._generation_template_path()
+        if template_path is None:
+            QMessageBox.warning(self, "AI生成帧", "无法生成固定格模板。")
+            return
         prompt = build_animation_generation_prompt(
             user_prompt,
             frame_count=self.frame_count_spin.value(),
             frame_width=self.width_spin.value(),
             frame_height=self.height_spin.value(),
+            sheet_width=self.width_spin.value() * self.frame_count_spin.value(),
+            sheet_height=self.height_spin.value(),
             pixel_mode=self.pixel_mode,
         )
         self._append_log(f"动画描述：{user_prompt}")
         self._append_log(f"发送给 AI 的 prompt：\n{prompt}")
+        self._append_log(f"模板图片：{template_path}")
         self.ai_generate_button.setEnabled(False)
         self.ai_generate_button.setText("AI生成中...")
         self.status_label.setText("正在调用 AI 生成横向序列帧图...")
         thread = SequenceFrameGenerationThread(
             self.settings,
             prompt,
-            reference_path,
+            template_path,
             frame_count=self.frame_count_spin.value(),
             frame_size=self._frame_size(),
+            template_has_transparency=template_has_transparency,
             pixel_mode=self.pixel_mode,
             parent=self,
         )
@@ -674,6 +792,19 @@ class SequenceFrameDialog(QDialog):
         source = self.base_image if not self.base_image.isNull() else self._blank_frame()
         self.source_frames = [source.copy() for _ in range(self.frame_count_spin.value())]
         self._refresh_frames(select_row=0)
+
+    def _sync_frame_count(self, value: int) -> None:
+        if value <= 0:
+            return
+        if not self.source_frames:
+            self._refresh_frames(select_row=0)
+            return
+        target = max(1, int(value))
+        while len(self.source_frames) < target:
+            self.source_frames.append(self.source_frames[-1].copy())
+        if len(self.source_frames) > target:
+            del self.source_frames[target:]
+        self._refresh_frames(select_row=min(self._current_row(), target - 1))
 
     def _duplicate_frame(self) -> None:
         if not self.source_frames:
@@ -719,23 +850,16 @@ class SequenceFrameDialog(QDialog):
         if not self.frames:
             QMessageBox.information(self, "序列帧动画", "请先导入图片并制作帧。")
             return
-        path = self.output_path
+        path = self._selected_output_path()
         if path is None:
-            default_name = "像素序列帧.png" if self.pixel_mode else "序列帧.png"
-            selected, _ = QFileDialog.getSaveFileName(
-                self,
-                "导出横向序列帧图",
-                str(self._last_dir / default_name),
-                "PNG 图片 (*.png)",
-            )
-            if not selected:
-                return
-            path = Path(selected)
+            return
         sheet = build_horizontal_spritesheet(self.source_frames, pixel_mode=self.pixel_mode, frame_size=self._frame_size())
         if sheet.isNull() or not save_spritesheet(sheet, path, pixel_mode=self.pixel_mode):
             QMessageBox.warning(self, "导出失败", "无法保存横向序列帧图。")
             return
         self.result_path = str(path)
+        self.output_path = path
+        self.output_path_edit.setText(str(path))
         self.status_label.setText(f"已导出：{path}")
 
     def _ai_generation_succeeded(self, frames: object) -> None:
@@ -749,7 +873,7 @@ class SequenceFrameDialog(QDialog):
         self.frame_count_spin.blockSignals(False)
         self._refresh_frames(select_row=0)
         self.status_label.setText("AI 序列帧已生成，可预览或导出横向图。")
-        self._append_log(f"已切出并对齐 {len(self.source_frames)} 帧。")
+        self._append_log(f"已按固定帧格切出 {len(self.source_frames)} 帧。")
 
     def _ai_generation_failed(self, message: str) -> None:
         QMessageBox.warning(self, "AI生成帧", message or "AI 生成序列帧失败。")
@@ -818,6 +942,40 @@ class SequenceFrameDialog(QDialog):
         image.fill(Qt.transparent)
         return image
 
+    def _choose_output_path(self) -> None:
+        default_name = "像素序列帧.png" if self.pixel_mode else "序列帧.png"
+        current = self.output_path_edit.text().strip() or str(self._last_dir / default_name)
+        selected, _ = QFileDialog.getSaveFileName(
+            self,
+            "选择导出位置",
+            current,
+            "PNG 图片 (*.png)",
+        )
+        if selected:
+            self.output_path_edit.setText(selected)
+
+    def _selected_output_path(self) -> Path | None:
+        text = self.output_path_edit.text().strip()
+        if text:
+            path = Path(text)
+            if path.suffix.lower() != ".png":
+                path = path.with_suffix(".png")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            return path
+        default_name = "像素序列帧.png" if self.pixel_mode else "序列帧.png"
+        selected, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出横向序列帧图",
+            str(self._last_dir / default_name),
+            "PNG 图片 (*.png)",
+        )
+        if not selected:
+            return None
+        path = Path(selected)
+        self.output_path_edit.setText(str(path))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
     def _append_log(self, message: str) -> None:
         text = str(message or "").strip()
         if not text:
@@ -828,17 +986,21 @@ class SequenceFrameDialog(QDialog):
             self.log_edit.appendPlainText(f"\n{text}")
         self.log_edit.verticalScrollBar().setValue(self.log_edit.verticalScrollBar().maximum())
 
-    def _reference_image_path(self) -> Path | None:
-        if self.base_image_path and self.base_image_path.exists():
-            return self.base_image_path
+    def _generation_template_path(self) -> tuple[Path | None, bool]:
         if self.base_image.isNull():
-            return None
+            return None, False
+        frame_count = self.frame_count_spin.value()
+        frame_size = self._frame_size()
+        frames = self.source_frames if self.source_frames else [self.base_image.copy() for _ in range(frame_count)]
+        template = build_generation_template_spritesheet(frames, frame_count, frame_size, pixel_mode=self.pixel_mode)
+        if template.isNull():
+            return None, False
         temp_dir = Path(tempfile.gettempdir()) / "gamedesigner_sequence_frames"
         temp_dir.mkdir(parents=True, exist_ok=True)
-        path = temp_dir / "sequence_frame_reference.png"
-        if self.base_image.save(str(path), "PNG"):
-            return path
-        return None
+        path = temp_dir / f"sequence_frame_template_{uuid.uuid4().hex[:8]}.png"
+        if not save_spritesheet(template, path, pixel_mode=self.pixel_mode):
+            return None, False
+        return path, image_has_transparency(template)
 
     def dragEnterEvent(self, event) -> None:  # type: ignore[override]
         if image_paths_from_drop_event(event):
