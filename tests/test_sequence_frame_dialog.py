@@ -10,16 +10,20 @@ from PySide6.QtGui import QColor, QImage, QPainter
 from PySide6.QtWidgets import QApplication
 
 from gamedesigner.image_rendering import is_pixel_art_image_path
+from gamedesigner.storage import AppSettings
 from gamedesigner.ui.sequence_frame_dialog import (
     SequenceFrameDialog,
     align_frame_content,
+    build_api_generation_template,
     build_generation_template_spritesheet,
     build_animation_generation_prompt,
     build_horizontal_spritesheet,
     clear_connected_corner_background,
+    crop_returned_api_canvas,
     image_has_transparency,
     fit_image_to_frame,
     save_spritesheet,
+    sequence_api_canvas_size,
     split_horizontal_spritesheet,
 )
 
@@ -138,6 +142,31 @@ class SequenceFrameDialogTests(unittest.TestCase):
         self.assertEqual(sheet.pixelColor(4, 0).name().upper(), "#0000FF")
         self.assertEqual(sheet.pixelColor(8, 0).name().upper(), "#0000FF")
         self.assertEqual(sheet.pixelColor(12, 0).name().upper(), "#0000FF")
+
+    def test_gpt_image_2_sequence_canvas_wraps_invalid_wide_sheet_size(self) -> None:
+        settings = AppSettings(ai_image_provider="compatible", ai_image_model="gpt-image-2")
+
+        api_size = sequence_api_canvas_size(QSize(2500, 401), settings)
+
+        self.assertEqual(api_size.width() % 16, 0)
+        self.assertEqual(api_size.height() % 16, 0)
+        self.assertGreaterEqual(api_size.width(), 2500)
+        self.assertGreaterEqual(api_size.height(), 401)
+        self.assertLessEqual(api_size.width() / api_size.height(), 3.0)
+
+    def test_api_generation_template_centers_sheet_and_crop_restores_exact_region(self) -> None:
+        settings = AppSettings(ai_image_provider="compatible", ai_image_model="gpt-image-2")
+        sheet = self._solid_image(2500, 401, "#123456")
+
+        template = build_api_generation_template(sheet, settings)
+        restored = crop_returned_api_canvas(template.image, template.sheet_rect, template.api_size)
+
+        self.assertGreater(template.api_size.height(), sheet.height())
+        self.assertEqual(template.sheet_rect.width(), sheet.width())
+        self.assertEqual(template.sheet_rect.height(), sheet.height())
+        self.assertEqual(restored.width(), sheet.width())
+        self.assertEqual(restored.height(), sheet.height())
+        self.assertEqual(restored.pixelColor(0, 0).name().upper(), "#123456")
 
     def test_clear_connected_corner_background_keeps_foreground_and_clears_edge_fill(self) -> None:
         image = self._solid_image(10, 8, "#000000")
