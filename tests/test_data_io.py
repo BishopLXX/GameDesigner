@@ -76,6 +76,8 @@ class DataIoTests(unittest.TestCase):
                                 "sort_mode": "x",
                                 "target_folder": "D:/body",
                                 "export_edges": True,
+                                "export_groups": True,
+                                "export_layout_info": True,
                             }
                         },
                     }
@@ -92,6 +94,8 @@ class DataIoTests(unittest.TestCase):
         self.assertEqual(canvas_state["sort_mode"], "x")
         self.assertEqual(canvas_state["target_folder"], "D:/body")
         self.assertTrue(canvas_state["export_edges"])
+        self.assertTrue(canvas_state["export_groups"])
+        self.assertTrue(canvas_state["export_layout_info"])
 
     def test_project_gdc_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -335,6 +339,85 @@ class DataIoTests(unittest.TestCase):
             self.assertEqual(rows[4][0], "D")
             self.assertEqual(rows[4][-1], "")
 
+    def test_canvas_csv_export_can_append_blueprint_group_membership(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            tmp_path = Path(folder)
+            project = ProjectData(name="蓝图组导出")
+            project.ensure_canvas_structure()
+            canvas = project.root_canvas()
+            group = canvas.add_group(BlueprintGroup(title="攻击模块", x=120, y=80, width=520, height=260, color="#335577"))
+            canvas.add_node(Node(title="火球", group_id=group.id, fields=[NodeField("值", "文本", "12")]))
+            canvas.add_node(Node(title="冰墙", fields=[NodeField("值", "文本", "8")]))
+
+            outputs = export_all_canvas_csv(
+                project,
+                tmp_path,
+                canvas_specs=[CanvasCsvExportSpec(canvas_id=canvas.id, export_groups=True)],
+            )
+
+            with outputs[0].open("r", encoding="utf-8-sig", newline="") as file:
+                rows = list(csv.reader(file))
+
+            self.assertEqual(rows[0][2:4], ["蓝图组ID", "蓝图组名称"])
+            self.assertEqual(rows[1][2:4], ["文本", "文本"])
+            self.assertEqual(rows[2][0], "火球")
+            self.assertEqual(rows[2][2:4], [group.id, "攻击模块"])
+            self.assertEqual(rows[3][0], "冰墙")
+            self.assertEqual(rows[3][2:4], ["", ""])
+
+    def test_canvas_csv_export_can_append_node_and_blueprint_layout_info(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            tmp_path = Path(folder)
+            project = ProjectData(name="位置信息导出")
+            project.ensure_canvas_structure()
+            canvas = project.root_canvas()
+            group = canvas.add_group(BlueprintGroup(title="攻击模块", x=120, y=80, width=520, height=260, color="#335577"))
+            canvas.add_node(Node(title="火球", group_id=group.id, x=300, y=400, fields=[NodeField("值", "文本", "12")]))
+            canvas.add_node(Node(title="冰墙", x=700, y=400, fields=[NodeField("值", "文本", "8")]))
+
+            outputs = export_all_canvas_csv(
+                project,
+                tmp_path,
+                canvas_specs=[CanvasCsvExportSpec(canvas_id=canvas.id, export_layout_info=True)],
+            )
+
+            with outputs[0].open("r", encoding="utf-8-sig", newline="") as file:
+                rows = list(csv.reader(file))
+
+            self.assertEqual(
+                rows[0][2:11],
+                ["蓝图组ID", "蓝图组名称", "节点X", "节点Y", "蓝图组X", "蓝图组Y", "蓝图组宽", "蓝图组高", "蓝图组颜色"],
+            )
+            self.assertEqual(rows[1][2:11], ["文本", "文本", "数字", "数字", "数字", "数字", "数字", "数字", "颜色"])
+            self.assertEqual(rows[2][0], "火球")
+            self.assertEqual(rows[2][2:11], [group.id, "攻击模块", "300", "400", "120", "80", "520", "260", "#335577"])
+            self.assertEqual(rows[3][0], "冰墙")
+            self.assertEqual(rows[3][2:11], ["", "", "700", "400", "", "", "", "", ""])
+
+    def test_canvas_csv_export_omits_blueprint_columns_when_canvas_has_no_groups(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            tmp_path = Path(folder)
+            project = ProjectData(name="无蓝图导出")
+            project.ensure_canvas_structure()
+            canvas = project.root_canvas()
+            canvas.add_node(Node(title="火球", x=300, y=400, fields=[NodeField("值", "文本", "12")]))
+
+            outputs = export_all_canvas_csv(
+                project,
+                tmp_path,
+                canvas_specs=[
+                    CanvasCsvExportSpec(canvas_id=canvas.id, export_groups=True, export_layout_info=True),
+                ],
+            )
+
+            with outputs[0].open("r", encoding="utf-8-sig", newline="") as file:
+                rows = list(csv.reader(file))
+
+            self.assertIn("节点X", rows[0])
+            self.assertIn("节点Y", rows[0])
+            self.assertNotIn("蓝图组ID", rows[0])
+            self.assertNotIn("蓝图组X", rows[0])
+
     def test_data_canvas_csv_export_ignores_edge_export_flag(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             tmp_path = Path(folder)
@@ -358,6 +441,30 @@ class DataIoTests(unittest.TestCase):
                 rows = list(csv.reader(file))
 
             self.assertNotIn("连线", rows[0])
+
+    def test_data_canvas_csv_export_ignores_group_export_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            tmp_path = Path(folder)
+            project = ProjectData(name="数据画布蓝图组导出")
+            project.ensure_canvas_structure()
+            data_canvas = project.add_canvas("数据画布", canvas_type="data")
+            data_canvas.add_group(BlueprintGroup(title="数据组"))
+            data_canvas.add_node(Node(title="A"))
+
+            outputs = export_all_canvas_csv(
+                project,
+                tmp_path,
+                canvas_specs=[
+                    CanvasCsvExportSpec(canvas_id=project.root_canvas_id, enabled=False),
+                    CanvasCsvExportSpec(canvas_id=data_canvas.id, export_groups=True, export_layout_info=True),
+                ],
+            )
+
+            with outputs[0].open("r", encoding="utf-8-sig", newline="") as file:
+                rows = list(csv.reader(file))
+
+            self.assertNotIn("蓝图组ID", rows[0])
+            self.assertNotIn("节点X", rows[0])
 
     def test_all_canvas_csv_export_writes_one_file_per_canvas(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -635,6 +742,43 @@ class DataIoTests(unittest.TestCase):
             self.assertEqual(canvas.template_id, template.id)
             self.assertEqual([node.title for node in sorted(canvas.nodes, key=lambda node: node.order)], ["节点A", "节点B"])
             self.assertTrue(all(not node.template_locked for node in canvas.nodes))
+
+    def test_import_canvas_sheet_restores_blueprint_group_membership_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            tmp_path = Path(folder)
+            source = tmp_path / "groups.csv"
+            source.write_text(
+                "名字,图标,蓝图组ID,蓝图组名称,节点X,节点Y,蓝图组X,蓝图组Y,蓝图组宽,蓝图组高,蓝图组颜色,描述\n"
+                "文本,文本,文本,文本,数字,数字,数字,数字,数字,数字,颜色,文本\n"
+                "火球,,group_attack,攻击模块,300,400,120,80,520,260,#335577,说明A\n"
+                "冰墙,,group_attack,攻击模块,700,400,120,80,520,260,#335577,说明B\n"
+                "金币,,,,100,200,,,,,,说明C\n",
+                encoding="utf-8",
+            )
+
+            project = ProjectData(name="蓝图组导入测试")
+            project.ensure_canvas_structure()
+            canvas = project.root_canvas()
+
+            template = import_canvas_sheet(project, canvas, source)
+
+            self.assertEqual([field.name for field in template.fields], ["名字", "图标", "描述"])
+            self.assertEqual(len(canvas.groups), 1)
+            self.assertEqual(canvas.groups[0].id, "group_attack")
+            self.assertEqual(canvas.groups[0].title, "攻击模块")
+            self.assertEqual(canvas.groups[0].x, 120)
+            self.assertEqual(canvas.groups[0].y, 80)
+            self.assertEqual(canvas.groups[0].width, 520)
+            self.assertEqual(canvas.groups[0].height, 260)
+            self.assertEqual(canvas.groups[0].color, "#335577")
+            ordered = sorted(canvas.nodes, key=lambda node: node.order)
+            self.assertEqual([node.title for node in ordered], ["火球", "冰墙", "金币"])
+            self.assertEqual(ordered[0].group_id, "group_attack")
+            self.assertEqual(ordered[1].group_id, "group_attack")
+            self.assertEqual(ordered[2].group_id, "")
+            self.assertEqual((ordered[0].x, ordered[0].y), (300, 400))
+            self.assertEqual((ordered[1].x, ordered[1].y), (700, 400))
+            self.assertEqual((ordered[2].x, ordered[2].y), (100, 200))
 
     def test_data_canvas_grid_rows_layout_wraps_by_row_limit(self) -> None:
         canvas = CanvasData(name="数据", canvas_type="data", data_layout="grid", data_grid_rows=2)

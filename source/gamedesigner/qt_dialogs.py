@@ -241,7 +241,7 @@ class ExportCanvasCsvDialog(QDialog):
             if default_sort_mode in CSV_SORT_MODE_LABELS
             else "created"
         )
-        self._canvas_rows: dict[str, tuple[QCheckBox, QComboBox, QLineEdit, QCheckBox]] = {}
+        self._canvas_rows: dict[str, tuple[QCheckBox, QComboBox, QLineEdit, QCheckBox, QCheckBox, QCheckBox]] = {}
 
         saved_folder = str(self._export_state.get("folder") or "").strip()
         self.folder_edit = QLineEdit(saved_folder or default_folder)
@@ -338,6 +338,18 @@ class ExportCanvasCsvDialog(QDialog):
         edge_check.setEnabled(not canvas.is_data_canvas())
         edge_check.setToolTip("追加最后一列：当前节点连接到的目标节点名，用 | 分隔")
 
+        group_check = QCheckBox("导出蓝图组")
+        group_check.setObjectName("exportCanvasGroupCheck")
+        group_check.setChecked(bool(saved.get("export_groups", False)) and not canvas.is_data_canvas())
+        group_check.setEnabled(not canvas.is_data_canvas())
+        group_check.setToolTip("追加蓝图组归属列；画布没有蓝图组时自动省略")
+
+        layout_check = QCheckBox("导出节点/蓝图位置")
+        layout_check.setObjectName("exportCanvasLayoutCheck")
+        layout_check.setChecked(bool(saved.get("export_layout_info", False)) and not canvas.is_data_canvas())
+        layout_check.setEnabled(not canvas.is_data_canvas())
+        layout_check.setToolTip("追加节点 X/Y；有蓝图组时同时追加蓝图组 X/Y/宽/高/颜色")
+
         header = QWidget()
         header.setObjectName("exportCanvasRowHeader")
         header_layout = QHBoxLayout(header)
@@ -345,6 +357,8 @@ class ExportCanvasCsvDialog(QDialog):
         header_layout.setSpacing(12)
         header_layout.addWidget(checkbox, 1)
         header_layout.addWidget(edge_check, 0)
+        header_layout.addWidget(group_check, 0)
+        header_layout.addWidget(layout_check, 0)
         sort_label = QLabel("排序")
         sort_label.setObjectName("exportCanvasMutedLabel")
         header_layout.addWidget(sort_label, 0)
@@ -366,7 +380,7 @@ class ExportCanvasCsvDialog(QDialog):
         layout.addWidget(header)
         layout.addWidget(folder_row_host)
         self.canvas_list_layout.addWidget(row)
-        self._canvas_rows[canvas.id] = (checkbox, combo, folder_edit, edge_check)
+        self._canvas_rows[canvas.id] = (checkbox, combo, folder_edit, edge_check, group_check, layout_check)
 
     def _coerce_canvas_export_state(self, raw: object) -> dict[str, dict[str, object]]:
         if not isinstance(raw, dict):
@@ -389,13 +403,15 @@ class ExportCanvasCsvDialog(QDialog):
     def export_state(self) -> dict[str, object]:
         canvases: dict[str, object] = {}
         for canvas in self.project.canvases:
-            checkbox, combo, folder_edit, edge_check = self._canvas_rows[canvas.id]
+            checkbox, combo, folder_edit, edge_check, group_check, layout_check = self._canvas_rows[canvas.id]
             canvases[canvas.id] = {
                 "canvas_name": canvas.name,
                 "enabled": checkbox.isChecked(),
                 "sort_mode": str(combo.currentData() or "created"),
                 "target_folder": folder_edit.text().strip(),
                 "export_edges": edge_check.isChecked() and not canvas.is_data_canvas(),
+                "export_groups": group_check.isChecked() and not canvas.is_data_canvas(),
+                "export_layout_info": layout_check.isChecked() and not canvas.is_data_canvas(),
             }
         return {
             "folder": self.folder_edit.text().strip(),
@@ -429,7 +445,9 @@ class ExportCanvasCsvDialog(QDialog):
             color: {colors["text"]};
             font-weight: 600;
         }}
-        QCheckBox#exportCanvasEdgeCheck {{
+        QCheckBox#exportCanvasEdgeCheck,
+        QCheckBox#exportCanvasGroupCheck,
+        QCheckBox#exportCanvasLayoutCheck {{
             background: transparent;
             color: {colors["text_muted"]};
         }}
@@ -464,13 +482,17 @@ class ExportCanvasCsvDialog(QDialog):
             edit.setText(folder)
 
     def _set_all_enabled(self, enabled: bool) -> None:
-        for checkbox, _combo, _folder_edit, _edge_check in self._canvas_rows.values():
+        for checkbox, _combo, _folder_edit, _edge_check, _group_check, _layout_check in self._canvas_rows.values():
             checkbox.setChecked(enabled)
         self._refresh_selected_count()
 
     def _refresh_selected_count(self) -> None:
         total = len(self._canvas_rows)
-        selected = sum(1 for checkbox, _combo, _folder_edit, _edge_check in self._canvas_rows.values() if checkbox.isChecked())
+        selected = sum(
+            1
+            for checkbox, _combo, _folder_edit, _edge_check, _group_check, _layout_check in self._canvas_rows.values()
+            if checkbox.isChecked()
+        )
         self.count_label.setText(f"已选 {selected} / {total}")
 
     def _accept(self) -> None:
@@ -481,7 +503,7 @@ class ExportCanvasCsvDialog(QDialog):
 
         specs: list[CanvasCsvExportSpec] = []
         for canvas in self.project.canvases:
-            checkbox, combo, folder_edit, edge_check = self._canvas_rows[canvas.id]
+            checkbox, combo, folder_edit, edge_check, group_check, layout_check = self._canvas_rows[canvas.id]
             mode = combo.currentData()
             specs.append(
                 CanvasCsvExportSpec(
@@ -490,6 +512,8 @@ class ExportCanvasCsvDialog(QDialog):
                     sort_mode=str(mode or "created"),
                     target_folder=folder_edit.text().strip(),
                     export_edges=edge_check.isChecked() and not canvas.is_data_canvas(),
+                    export_groups=group_check.isChecked() and not canvas.is_data_canvas(),
+                    export_layout_info=layout_check.isChecked() and not canvas.is_data_canvas(),
                 )
             )
 

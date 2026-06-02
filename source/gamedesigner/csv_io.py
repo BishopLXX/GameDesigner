@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from .models import FIELD_EXPORT_PROPS, CanvasData, Node, NodeField, ProjectData
+from .models import FIELD_EXPORT_PROPS, BlueprintGroup, CanvasData, Node, NodeField, ProjectData
 
 
 CSV_SORT_MODES = {"created", "x", "y"}
@@ -21,6 +21,24 @@ DATA_CANVAS_SORT_LABEL = "按画布顺序"
 BASE_COLUMNS = [
     ("名字", "文本", lambda node: node.title),
     ("图标", "文本", lambda node: node.icon),
+]
+
+GROUP_MEMBERSHIP_COLUMNS = [
+    ("id", "蓝图组ID", "文本"),
+    ("title", "蓝图组名称", "文本"),
+]
+
+NODE_LAYOUT_COLUMNS = [
+    ("x", "节点X", "数字"),
+    ("y", "节点Y", "数字"),
+]
+
+GROUP_LAYOUT_COLUMNS = [
+    ("x", "蓝图组X", "数字"),
+    ("y", "蓝图组Y", "数字"),
+    ("width", "蓝图组宽", "数字"),
+    ("height", "蓝图组高", "数字"),
+    ("color", "蓝图组颜色", "颜色"),
 ]
 
 PROP_LABELS = {
@@ -58,6 +76,8 @@ class CanvasCsvExportSpec:
     sort_mode: str = "created"
     target_folder: str = ""
     export_edges: bool = False
+    export_groups: bool = False
+    export_layout_info: bool = False
 
 
 def export_game_csv(
@@ -66,6 +86,8 @@ def export_game_csv(
     canvas: CanvasData | None = None,
     sort_mode: str = "created",
     export_edges: bool = False,
+    export_groups: bool = False,
+    export_layout_info: bool = False,
 ) -> Path:
     path = Path(target)
     if path.suffix.lower() != ".csv":
@@ -74,7 +96,14 @@ def export_game_csv(
 
     project.ensure_canvas_structure()
     source_canvas = canvas or project.root_canvas()
-    return _write_canvas_csv(path, source_canvas, sort_mode, export_edges=export_edges)
+    return _write_canvas_csv(
+        path,
+        source_canvas,
+        sort_mode,
+        export_edges=export_edges,
+        export_groups=export_groups,
+        export_layout_info=export_layout_info,
+    )
 
 
 def export_all_canvas_csv(
@@ -99,14 +128,37 @@ def export_all_canvas_csv(
             export_folder = export_folder.parent
         export_folder.mkdir(parents=True, exist_ok=True)
         path = export_folder / _canvas_csv_filename(canvas)
-        paths.append(_write_canvas_csv(path, canvas, spec.sort_mode, export_edges=spec.export_edges))
+        paths.append(
+            _write_canvas_csv(
+                path,
+                canvas,
+                spec.sort_mode,
+                export_edges=spec.export_edges,
+                export_groups=spec.export_groups,
+                export_layout_info=spec.export_layout_info,
+            )
+        )
     return paths
 
 
-def _write_canvas_csv(path: Path, source_canvas: CanvasData, sort_mode: str, export_edges: bool = False) -> Path:
+def _write_canvas_csv(
+    path: Path,
+    source_canvas: CanvasData,
+    sort_mode: str,
+    export_edges: bool = False,
+    export_groups: bool = False,
+    export_layout_info: bool = False,
+) -> Path:
     source_canvas.normalize_node_order()
     nodes = _sorted_nodes(source_canvas.nodes, _resolved_sort_mode(source_canvas, sort_mode))
-    columns = _build_columns(nodes, source_canvas if export_edges and not source_canvas.is_data_canvas() else None)
+    is_data_canvas = source_canvas.is_data_canvas()
+    has_groups = bool(source_canvas.groups)
+    columns = _build_columns(
+        nodes,
+        source_canvas if export_edges and not is_data_canvas else None,
+        source_canvas if (export_groups or export_layout_info) and not is_data_canvas and has_groups else None,
+        source_canvas if export_layout_info and not is_data_canvas else None,
+    )
     with path.open("w", encoding="utf-8-sig", newline="") as file:
         writer = csv.writer(file)
         writer.writerow([column.header for column in columns])
@@ -116,11 +168,22 @@ def _write_canvas_csv(path: Path, source_canvas: CanvasData, sort_mode: str, exp
     return path
 
 
-def _build_columns(nodes: list[Node], edge_canvas: CanvasData | None = None) -> list[Column]:
+def _build_columns(
+    nodes: list[Node],
+    edge_canvas: CanvasData | None = None,
+    group_canvas: CanvasData | None = None,
+    layout_canvas: CanvasData | None = None,
+) -> list[Column]:
     columns = [
         Column(header, data_type, getter)
         for header, data_type, getter in BASE_COLUMNS
     ]
+
+    if group_canvas is not None:
+        _append_group_membership_columns(columns, group_canvas)
+
+    if layout_canvas is not None:
+        _append_layout_columns(columns, layout_canvas)
 
     field_columns: dict[str, tuple[str, str]] = {}
     pinned_columns: dict[tuple[str, str], str] = {}
@@ -197,10 +260,79 @@ def _resolved_canvas_specs(
                     sort_mode=_resolved_sort_mode(canvas, spec.sort_mode),
                     target_folder=str(spec.target_folder or ""),
                     export_edges=bool(spec.export_edges) and not canvas.is_data_canvas(),
+                    export_groups=bool(spec.export_groups) and not canvas.is_data_canvas(),
+                    export_layout_info=bool(spec.export_layout_info) and not canvas.is_data_canvas(),
                 ),
             )
         )
     return result
+
+
+def _append_group_membership_columns(columns: list[Column], canvas: CanvasData) -> None:
+    groups_by_id = {group.id: group for group in canvas.groups}
+    for prop, header, data_type in GROUP_MEMBERSHIP_COLUMNS:
+        columns.append(
+            Column(
+                _unique_header(columns, header),
+                data_type,
+                lambda node, prop=prop, groups_by_id=groups_by_id: _group_property_value(
+                    groups_by_id.get(node.group_id),
+                    prop,
+                ),
+            )
+        )
+
+
+def _append_layout_columns(columns: list[Column], canvas: CanvasData) -> None:
+    groups_by_id = {group.id: group for group in canvas.groups}
+    for prop, header, data_type in NODE_LAYOUT_COLUMNS:
+        columns.append(
+            Column(
+                _unique_header(columns, header),
+                data_type,
+                lambda node, prop=prop: _node_layout_value(node, prop),
+            )
+        )
+    if groups_by_id:
+        for prop, header, data_type in GROUP_LAYOUT_COLUMNS:
+            columns.append(
+                Column(
+                    _unique_header(columns, header),
+                    data_type,
+                    lambda node, prop=prop, groups_by_id=groups_by_id: _group_property_value(
+                        groups_by_id.get(node.group_id),
+                        prop,
+                    ),
+                )
+            )
+
+
+def _node_layout_value(node: Node, prop: str) -> str:
+    if prop == "x":
+        return _format_number(node.x)
+    if prop == "y":
+        return _format_number(node.y)
+    return ""
+
+
+def _group_property_value(group: BlueprintGroup | None, prop: str) -> str:
+    if group is None:
+        return ""
+    if prop == "id":
+        return group.id
+    if prop == "title":
+        return group.title
+    if prop == "x":
+        return _format_number(group.x)
+    if prop == "y":
+        return _format_number(group.y)
+    if prop == "width":
+        return _format_number(group.width)
+    if prop == "height":
+        return _format_number(group.height)
+    if prop == "color":
+        return group.color
+    return ""
 
 
 def _edge_targets_by_source(canvas: CanvasData) -> dict[str, str]:

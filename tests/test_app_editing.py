@@ -2211,10 +2211,12 @@ class AppEditingTests(unittest.TestCase):
         link.canvas_id = child.id
 
         dialog = ExportCanvasCsvDialog(None, project, "D:/default")
-        checkbox, combo, folder_edit, edge_check = dialog._canvas_rows[child.id]
+        checkbox, combo, folder_edit, edge_check, group_check, layout_check = dialog._canvas_rows[child.id]
         self.assertIn("自由画布", checkbox.text())
         folder_edit.setText("D:/custom")
         edge_check.setChecked(True)
+        group_check.setChecked(True)
+        layout_check.setChecked(True)
         dialog._accept()
 
         self.assertIsNotNone(dialog.result_data)
@@ -2222,6 +2224,8 @@ class AppEditingTests(unittest.TestCase):
         child_spec = next(spec for spec in specs if spec.canvas_id == child.id)
         self.assertEqual(child_spec.target_folder, "D:/custom")
         self.assertTrue(child_spec.export_edges)
+        self.assertTrue(child_spec.export_groups)
+        self.assertTrue(child_spec.export_layout_info)
         dialog.deleteLater()
 
     def test_export_canvas_csv_dialog_restores_saved_state(self) -> None:
@@ -2241,21 +2245,27 @@ class AppEditingTests(unittest.TestCase):
                     "sort_mode": "x",
                     "target_folder": "D:/body",
                     "export_edges": True,
+                    "export_groups": True,
+                    "export_layout_info": True,
                 }
             },
         }
 
         dialog = ExportCanvasCsvDialog(None, project, "D:/default", export_state=state)
-        checkbox, combo, folder_edit, edge_check = dialog._canvas_rows[child.id]
+        checkbox, combo, folder_edit, edge_check, group_check, layout_check = dialog._canvas_rows[child.id]
 
         self.assertEqual(dialog.folder_edit.text(), "D:/saved")
         self.assertFalse(checkbox.isChecked())
         self.assertEqual(combo.currentData(), "x")
         self.assertEqual(folder_edit.text(), "D:/body")
         self.assertTrue(edge_check.isChecked())
+        self.assertTrue(group_check.isChecked())
+        self.assertTrue(layout_check.isChecked())
 
         checkbox.setChecked(True)
         edge_check.setChecked(False)
+        group_check.setChecked(False)
+        layout_check.setChecked(False)
         folder_edit.setText("D:/changed")
         dialog._accept()
 
@@ -2264,6 +2274,8 @@ class AppEditingTests(unittest.TestCase):
         self.assertEqual(saved["folder"], "D:/saved")
         self.assertTrue(saved["canvases"][child.id]["enabled"])
         self.assertFalse(saved["canvases"][child.id]["export_edges"])
+        self.assertFalse(saved["canvases"][child.id]["export_groups"])
+        self.assertFalse(saved["canvases"][child.id]["export_layout_info"])
         self.assertEqual(saved["canvases"][child.id]["target_folder"], "D:/changed")
         dialog.deleteLater()
 
@@ -2283,17 +2295,25 @@ class AppEditingTests(unittest.TestCase):
                     data_canvas.id: {
                         "canvas_name": data_canvas.name,
                         "export_edges": True,
+                        "export_groups": True,
+                        "export_layout_info": True,
                     }
                 }
             },
         )
-        _checkbox, _combo, _folder_edit, edge_check = dialog._canvas_rows[data_canvas.id]
+        _checkbox, _combo, _folder_edit, edge_check, group_check, layout_check = dialog._canvas_rows[data_canvas.id]
 
         self.assertFalse(edge_check.isEnabled())
         self.assertFalse(edge_check.isChecked())
+        self.assertFalse(group_check.isEnabled())
+        self.assertFalse(group_check.isChecked())
+        self.assertFalse(layout_check.isEnabled())
+        self.assertFalse(layout_check.isChecked())
         dialog._accept()
         spec = next(item for item in dialog.result_data["canvas_specs"] if item.canvas_id == data_canvas.id)
         self.assertFalse(spec.export_edges)
+        self.assertFalse(spec.export_groups)
+        self.assertFalse(spec.export_layout_info)
         dialog.deleteLater()
 
     def test_export_canvas_csv_dialog_uses_dark_list_colors(self) -> None:

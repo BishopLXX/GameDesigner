@@ -453,6 +453,8 @@ def _coerce_export_canvas_csv_dialog(raw: Any) -> dict[str, Any]:
                     "sort_mode": str(canvas_raw.get("sort_mode") or "created"),
                     "target_folder": str(canvas_raw.get("target_folder") or ""),
                     "export_edges": bool(canvas_raw.get("export_edges", False)),
+                    "export_groups": bool(canvas_raw.get("export_groups", False)),
+                    "export_layout_info": bool(canvas_raw.get("export_layout_info", False)),
                 }
         projects[project_key] = {
             "folder": str(state_raw.get("folder") or ""),
