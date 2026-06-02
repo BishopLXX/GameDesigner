@@ -34,6 +34,7 @@ from gamedesigner.ui.sequence_frame_dialog import (
     sequence_api_canvas_size,
     sequence_request_background,
     split_horizontal_spritesheet,
+    stabilize_frame_anchors,
 )
 
 
@@ -120,6 +121,45 @@ class SequenceFrameDialogTests(unittest.TestCase):
 
         self.assertLess(self._opaque_width(frames[0]), self._opaque_width(frames[1]))
         self.assertEqual(self._opaque_center_x(frames[0]), self._opaque_center_x(frames[1]))
+
+    def test_align_frame_content_locks_bottom_anchor(self) -> None:
+        high = self._transparent_image(12, 12)
+        low = self._transparent_image(12, 12)
+        painter = QPainter(high)
+        painter.fillRect(4, 2, 4, 4, QColor("#00FF00"))
+        painter.end()
+        painter = QPainter(low)
+        painter.fillRect(4, 7, 4, 4, QColor("#00FF00"))
+        painter.end()
+
+        frames = align_frame_content([high, low], QSize(12, 12), pixel_mode=True)
+
+        self.assertEqual(self._opaque_bottom_y(frames[0]), self._opaque_bottom_y(frames[1]))
+
+    def test_stabilize_frame_anchors_matches_first_frame_bottom_center(self) -> None:
+        first = self._transparent_image(16, 16)
+        shifted_down = self._transparent_image(16, 16)
+        shifted_up = self._transparent_image(16, 16)
+        painter = QPainter(first)
+        painter.fillRect(6, 6, 4, 6, QColor("#CC0000"))
+        painter.end()
+        painter = QPainter(shifted_down)
+        painter.fillRect(6, 9, 4, 6, QColor("#00AA00"))
+        painter.end()
+        painter = QPainter(shifted_up)
+        painter.fillRect(6, 2, 4, 6, QColor("#0000CC"))
+        painter.end()
+
+        frames = stabilize_frame_anchors(
+            [first, shifted_down, shifted_up],
+            QSize(16, 16),
+            pixel_mode=True,
+        )
+
+        self.assertEqual(self._opaque_bottom_y(frames[0]), self._opaque_bottom_y(frames[1]))
+        self.assertEqual(self._opaque_bottom_y(frames[0]), self._opaque_bottom_y(frames[2]))
+        self.assertEqual(self._opaque_center_x(frames[0]), self._opaque_center_x(frames[1]))
+        self.assertEqual(self._opaque_center_x(frames[0]), self._opaque_center_x(frames[2]))
 
     def test_animation_prompt_includes_user_motion_frame_grid_and_pixel_rules(self) -> None:
         prompt = build_animation_generation_prompt(
@@ -413,6 +453,11 @@ class SequenceFrameDialogTests(unittest.TestCase):
         image.fill(QColor(color))
         return image
 
+    def _transparent_image(self, width: int, height: int) -> QImage:
+        image = QImage(width, height, QImage.Format_ARGB32_Premultiplied)
+        image.fill(QColor(0, 0, 0, 0))
+        return image
+
     def _png_bytes(self, image: QImage) -> bytes:
         data = QByteArray()
         buffer = QBuffer(data)
@@ -438,6 +483,15 @@ class SequenceFrameDialogTests(unittest.TestCase):
             if image.pixelColor(x, y).alpha() > 0
         ]
         return max(xs) - min(xs) + 1 if xs else 0
+
+    def _opaque_bottom_y(self, image: QImage) -> int:
+        ys = [
+            y
+            for y in range(image.height())
+            for x in range(image.width())
+            if image.pixelColor(x, y).alpha() > 0
+        ]
+        return max(ys) if ys else -1
 
 
 if __name__ == "__main__":

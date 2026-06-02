@@ -426,6 +426,8 @@ def align_frame_content(frames: list[QImage], frame_size: QSize, *, pixel_mode: 
     max_content_width = max(1, max(box.width() for box in boxes))
     max_content_height = max(1, max(box.height() for box in boxes))
     scale = min(target_width / max_content_width, target_height / max_content_height)
+    bottom_margin = min(max(0, frame.height() - box.bottom() - 1) for frame, box in records if box is not None)
+    target_bottom = max(0, target_height - bottom_margin - 1)
     aligned: list[QImage] = []
     for frame, box in records:
         output = QImage(target_width, target_height, QImage.Format_ARGB32_Premultiplied)
@@ -444,10 +446,44 @@ def align_frame_content(frames: list[QImage], frame_size: QSize, *, pixel_mode: 
         )
         painter = QPainter(output)
         painter.setRenderHint(QPainter.SmoothPixmapTransform, not pixel_mode)
-        painter.drawImage((target_width - scaled.width()) // 2, (target_height - scaled.height()) // 2, scaled)
+        x = (target_width - scaled.width()) // 2
+        y = max(0, min(target_height - scaled.height(), target_bottom - scaled.height() + 1))
+        painter.drawImage(x, y, scaled)
         painter.end()
         aligned.append(output)
     return aligned
+
+
+def stabilize_frame_anchors(frames: list[QImage], frame_size: QSize, *, pixel_mode: bool = False) -> list[QImage]:
+    normalized = [fit_image_to_frame(frame, frame_size, pixel_mode=pixel_mode) for frame in frames if not frame.isNull()]
+    records: list[tuple[QImage, QRect | None]] = [
+        (frame, foreground_content_rect(frame)) for frame in normalized
+    ]
+    target_box = next((box for _frame, box in records if box is not None and box.width() > 0 and box.height() > 0), None)
+    if target_box is None:
+        return normalized
+    target_center_x = target_box.center().x()
+    target_bottom = target_box.bottom()
+    target_width = max(1, frame_size.width())
+    target_height = max(1, frame_size.height())
+    stabilized: list[QImage] = []
+    for frame, box in records:
+        if box is None:
+            stabilized.append(frame.copy())
+            continue
+        dx = target_center_x - box.center().x()
+        dy = target_bottom - box.bottom()
+        if dx == 0 and dy == 0:
+            stabilized.append(frame.copy())
+            continue
+        output = QImage(target_width, target_height, QImage.Format_ARGB32_Premultiplied)
+        output.fill(Qt.transparent)
+        painter = QPainter(output)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, not pixel_mode)
+        painter.drawImage(dx, dy, frame)
+        painter.end()
+        stabilized.append(output)
+    return stabilized
 
 
 def foreground_content_rect(image: QImage, *, background_tolerance: int = 18, alpha_threshold: int = 8) -> QRect | None:
@@ -685,7 +721,7 @@ def generate_sequence_frames_with_ai(
         frames.append(frame)
     if any(job.source_has_transparency for job in jobs):
         frames = align_frame_content(frames, output_size, pixel_mode=pixel_mode)
-    return frames
+    return stabilize_frame_anchors(frames, output_size, pixel_mode=pixel_mode)
 
 
 class SequenceFrameGenerationThread(QThread):
