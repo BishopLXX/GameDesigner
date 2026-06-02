@@ -232,6 +232,16 @@ def _floor_to_multiple(value: int, multiple: int) -> int:
     return max(multiple, (max(1, int(value)) // multiple) * multiple)
 
 
+def sequence_request_background(settings: AppSettings | None, template_has_transparency: bool) -> str:
+    background = str(getattr(settings, "ai_image_background", "auto") or "auto").strip() or "auto"
+    model = str(getattr(settings, "ai_image_model", "") or "").strip().lower()
+    if model == "gpt-image-2" and background == "transparent":
+        return "auto"
+    if template_has_transparency:
+        return "auto" if model == "gpt-image-2" else "transparent"
+    return background
+
+
 def image_has_transparency(image: QImage) -> bool:
     if image.isNull():
         return False
@@ -442,8 +452,7 @@ class SequenceFrameGenerationThread(QThread):
         self.settings.ai_image_count = 1
         self.settings.ai_image_output_format = "png"
         self.settings.ai_image_size = f"{max(1, api_size.width())}x{max(1, api_size.height())}"
-        if template_has_transparency:
-            self.settings.ai_image_background = "transparent"
+        self.settings.ai_image_background = sequence_request_background(self.settings, template_has_transparency)
         self.prompt = prompt
         self.template_path = template_path
         self.frame_count = max(1, int(frame_count))
@@ -451,11 +460,16 @@ class SequenceFrameGenerationThread(QThread):
         self.sheet_rect = QRect(sheet_rect)
         self.api_size = QSize(max(1, api_size.width()), max(1, api_size.height()))
         self.template_has_transparency = bool(template_has_transparency)
+        self.transparent_background_fallback = bool(
+            template_has_transparency and self.settings.ai_image_background != "transparent"
+        )
         self.pixel_mode = bool(pixel_mode)
 
     def run(self) -> None:  # type: ignore[override]
         try:
             self.progress.emit("正在构建 AI 生图请求...")
+            if self.transparent_background_fallback:
+                self.progress.emit("当前模型不支持透明背景参数，已改用自动背景；返回后会清理边角背景。")
             request = build_ai_image_request(
                 self.settings,
                 self.prompt,

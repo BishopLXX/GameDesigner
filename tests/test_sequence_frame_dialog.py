@@ -24,6 +24,7 @@ from gamedesigner.ui.sequence_frame_dialog import (
     fit_image_to_frame,
     save_spritesheet,
     sequence_api_canvas_size,
+    sequence_request_background,
     split_horizontal_spritesheet,
 )
 
@@ -167,6 +168,28 @@ class SequenceFrameDialogTests(unittest.TestCase):
         self.assertEqual(restored.width(), sheet.width())
         self.assertEqual(restored.height(), sheet.height())
         self.assertEqual(restored.pixelColor(0, 0).name().upper(), "#123456")
+
+    def test_gpt_image_2_sequence_request_does_not_send_transparent_background(self) -> None:
+        settings = AppSettings(
+            ai_image_provider="compatible",
+            ai_image_model="gpt-image-2",
+            ai_image_background="transparent",
+        )
+
+        background = sequence_request_background(settings, template_has_transparency=True)
+
+        self.assertEqual(background, "auto")
+
+    def test_sequence_request_keeps_transparent_background_for_supported_models(self) -> None:
+        settings = AppSettings(
+            ai_image_provider="compatible",
+            ai_image_model="gpt-image-1.5",
+            ai_image_background="auto",
+        )
+
+        background = sequence_request_background(settings, template_has_transparency=True)
+
+        self.assertEqual(background, "transparent")
 
     def test_clear_connected_corner_background_keeps_foreground_and_clears_edge_fill(self) -> None:
         image = self._solid_image(10, 8, "#000000")
