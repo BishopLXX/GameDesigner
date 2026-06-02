@@ -3169,6 +3169,7 @@ class GameDesignerApp(QMainWindow):
             pixel_mode=pixel_mode,
             initial_path=initial_path,
             output_path=output_path,
+            settings=self.settings,
         )
         dialog.exec()
 

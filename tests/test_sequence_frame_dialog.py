@@ -12,9 +12,11 @@ from PySide6.QtWidgets import QApplication
 from gamedesigner.image_rendering import is_pixel_art_image_path
 from gamedesigner.ui.sequence_frame_dialog import (
     SequenceFrameDialog,
+    build_animation_generation_prompt,
     build_horizontal_spritesheet,
     fit_image_to_frame,
     save_spritesheet,
+    split_horizontal_spritesheet,
 )
 
 
@@ -56,6 +58,31 @@ class SequenceFrameDialogTests(unittest.TestCase):
             self.assertTrue(path.exists())
             self.assertTrue(is_pixel_art_image_path(str(path)))
 
+    def test_split_horizontal_spritesheet_returns_equal_preview_frames(self) -> None:
+        red = self._solid_image(3, 2, "#FF0000")
+        green = self._solid_image(3, 2, "#00FF00")
+        sheet = build_horizontal_spritesheet([red, green], frame_size=QSize(3, 2))
+
+        frames = split_horizontal_spritesheet(sheet, 2, QSize(3, 2), pixel_mode=True)
+
+        self.assertEqual(len(frames), 2)
+        self.assertEqual(frames[0].pixelColor(0, 0).name().upper(), "#FF0000")
+        self.assertEqual(frames[1].pixelColor(0, 0).name().upper(), "#00FF00")
+
+    def test_animation_prompt_includes_user_motion_frame_grid_and_pixel_rules(self) -> None:
+        prompt = build_animation_generation_prompt(
+            "向右走路，手臂摆动",
+            frame_count=6,
+            frame_width=128,
+            frame_height=128,
+            pixel_mode=True,
+        )
+
+        self.assertIn("exactly 6", prompt)
+        self.assertIn("128x128", prompt)
+        self.assertIn("向右走路", prompt)
+        self.assertIn("crisp square pixels", prompt)
+
     def test_dialog_exports_seeded_frames_to_configured_output_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp)
@@ -73,6 +100,24 @@ class SequenceFrameDialogTests(unittest.TestCase):
             self.assertEqual(exported.width(), 6)
             self.assertEqual(exported.height(), 2)
             self.assertTrue(is_pixel_art_image_path(str(output)))
+            dialog.deleteLater()
+
+    def test_dialog_loads_dropped_image_paths_without_file_picker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            first = folder / "first.png"
+            second = folder / "second.png"
+            self._solid_image(5, 4, "#AA0000").save(str(first), "PNG")
+            self._solid_image(5, 4, "#00AA00").save(str(second), "PNG")
+
+            dialog = SequenceFrameDialog(pixel_mode=False)
+            dialog._load_dropped_images([str(first), str(second)])
+
+            self.assertEqual(dialog.frame_count_spin.value(), 2)
+            self.assertEqual(len(dialog.source_frames), 2)
+            self.assertEqual(dialog.width_spin.value(), 5)
+            self.assertEqual(dialog.height_spin.value(), 4)
+            self.assertEqual(dialog.base_image_path, first)
             dialog.deleteLater()
 
     def _solid_image(self, width: int, height: int, color: str) -> QImage:

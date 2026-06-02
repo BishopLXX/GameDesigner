@@ -277,11 +277,19 @@ class AppEditingTests(unittest.TestCase):
             page = window._add_page(project, project_path, dirty=False, canvas_data=project.root_canvas())
             window.tabs.setCurrentWidget(page)
             page.canvas.select_node(node.id)
-            opened: list[tuple[bool, str | None, Path | None]] = []
+            opened: list[tuple[bool, str | None, Path | None, object]] = []
 
             class FakeSequenceFrameDialog:
-                def __init__(self, _parent, *, pixel_mode: bool, initial_path: str | None, output_path: Path | None) -> None:
-                    opened.append((pixel_mode, initial_path, output_path))
+                def __init__(
+                    self,
+                    _parent,
+                    *,
+                    pixel_mode: bool,
+                    initial_path: str | None,
+                    output_path: Path | None,
+                    settings: object,
+                ) -> None:
+                    opened.append((pixel_mode, initial_path, output_path, settings))
 
                 def exec(self) -> int:
                     return 0
@@ -294,6 +302,8 @@ class AppEditingTests(unittest.TestCase):
             self.assertEqual([item[1] for item in opened], [str(image_path), str(image_path)])
             self.assertIn("sequence_frames", opened[0][2].parts if opened[0][2] else [])
             self.assertIn("pixel_sequence_frames", opened[1][2].parts if opened[1][2] else [])
+            self.assertIs(opened[0][3], window.settings)
+            self.assertIs(opened[1][3], window.settings)
             window.deleteLater()
 
     def test_ai_image_generate_button_uses_click_wrapper_without_signal_args(self) -> None:
