@@ -5,7 +5,7 @@ from io import StringIO
 
 from PySide6.QtCore import QPoint, Qt, Signal
 from PySide6.QtGui import QKeySequence
-from PySide6.QtWidgets import QApplication, QAbstractItemView, QMenu, QTableWidget, QTableWidgetItem
+from PySide6.QtWidgets import QApplication, QAbstractItemView, QInputDialog, QMenu, QTableWidget, QTableWidgetItem
 
 from ..models import CanvasData, Node, NodeField, NodeTemplate, ProjectData
 
@@ -21,6 +21,7 @@ class DataCanvasTableWidget(QTableWidget):
         self._field_ids: list[str] = []
         self._row_node_ids: list[str] = []
         self._loading = False
+        self._renaming_column = False
 
         self.setAlternatingRowColors(True)
         self.setSelectionBehavior(QAbstractItemView.SelectItems)
@@ -31,6 +32,8 @@ class DataCanvasTableWidget(QTableWidget):
             | QAbstractItemView.AnyKeyPressed
         )
         self.horizontalHeader().setStretchLastSection(True)
+        self.horizontalHeader().setSectionsClickable(True)
+        self.horizontalHeader().sectionClicked.connect(self._edit_column_name)
         self.itemChanged.connect(self._apply_item_change)
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self._show_context_menu)
@@ -96,6 +99,50 @@ class DataCanvasTableWidget(QTableWidget):
         if node.title_field_id == field.id:
             node.title = item.text().strip() or field.name.strip() or (self.template.name if self.template else "数据项")
         self.projectChanged.emit()
+
+    def _edit_column_name(self, column: int) -> None:
+        if self._renaming_column or self.template is None or not (0 <= column < len(self._field_ids)):
+            return
+        field = self._template_field_for_column(column)
+        if field is None:
+            return
+        self._renaming_column = True
+        try:
+            name, ok = QInputDialog.getText(self, "重命名列", "列名", text=field.name or "字段")
+        finally:
+            self._renaming_column = False
+        if not ok:
+            return
+        self._rename_column(column, name)
+
+    def _rename_column(self, column: int, name: str) -> None:
+        if self.template is None or not (0 <= column < len(self._field_ids)):
+            return
+        new_name = name.strip()
+        if not new_name:
+            return
+        field = self._template_field_for_column(column)
+        if field is None or field.name == new_name:
+            return
+        field_id = self._field_ids[column]
+        field.name = new_name
+        if self.canvas is not None:
+            for node in self.canvas.nodes:
+                node_field = next((candidate for candidate in node.fields if candidate.id == field_id), None)
+                if node_field is None:
+                    continue
+                node_field.name = new_name
+                if node.title_field_id == field_id:
+                    value = node_field.image_path if node_field.data_type == "图片" else node_field.value
+                    node.title = value.strip() or new_name or (self.template.name if self.template else "数据项")
+        self._reload()
+        self.projectChanged.emit()
+
+    def _template_field_for_column(self, column: int) -> NodeField | None:
+        if self.template is None or not (0 <= column < len(self._field_ids)):
+            return None
+        field_id = self._field_ids[column]
+        return next((candidate for candidate in self.template.fields if candidate.id == field_id), None)
 
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
         if event.matches(QKeySequence.Copy):

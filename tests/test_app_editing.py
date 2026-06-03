@@ -41,6 +41,7 @@ from gamedesigner.storage import (
 from gamedesigner.ui.link_document_dialog import LinkDocumentDialog
 from gamedesigner.ui.ai_chat_dialog import AiChatPanel, AiSettingsDialog
 from gamedesigner.ui.ai_image_panel import AiImagePanel, AiImageSettingsDialog
+from gamedesigner.ui.data_canvas_table import DataCanvasTableWidget
 from gamedesigner.ui.node_preview_panel import NodePreviewPanel
 from gamedesigner.ui.submit_text_edit import SubmitPlainTextEdit
 
@@ -2199,6 +2200,34 @@ class AppEditingTests(unittest.TestCase):
         self.assertEqual(data_canvas.nodes[0].fields[0].value, "A")
         self.assertEqual(data_canvas.nodes[1].fields[1].value, "2")
         window.deleteLater()
+
+    def test_data_canvas_table_header_click_renames_column(self) -> None:
+        field = NodeField("字段1", "文本", "")
+        template = NodeTemplate(name="数据模板", fields=[field])
+        project = ProjectData(name="表头重命名测试", templates=[template])
+        project.ensure_canvas_structure()
+        data_canvas = project.add_canvas(
+            "排序画布",
+            canvas_type="data",
+            data_layout="table",
+            template_id=template.id,
+            parent_canvas_id=project.root_canvas_id,
+            parent_node_id="node_parent",
+        )
+        data_canvas.add_node(template.create_node(0, 0))
+        table = DataCanvasTableWidget()
+        table.set_canvas(project, data_canvas)
+        changed: list[bool] = []
+        table.projectChanged.connect(lambda: changed.append(True))
+
+        with mock.patch("gamedesigner.ui.data_canvas_table.QInputDialog.getText", return_value=("  攻击力  ", True)):
+            table.horizontalHeader().sectionClicked.emit(0)
+
+        self.assertEqual(template.fields[0].name, "攻击力")
+        self.assertEqual(data_canvas.nodes[0].fields[0].name, "攻击力")
+        self.assertEqual(table.horizontalHeaderItem(0).text(), "攻击力")
+        self.assertTrue(changed)
+        table.deleteLater()
 
     def test_export_canvas_csv_dialog_collects_per_canvas_folder(self) -> None:
         from gamedesigner.qt_dialogs import ExportCanvasCsvDialog
