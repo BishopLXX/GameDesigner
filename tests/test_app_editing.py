@@ -317,6 +317,34 @@ class AppEditingTests(unittest.TestCase):
             self.assertIs(opened[1][3], window.settings)
             window.deleteLater()
 
+    def test_ai_menu_exports_imagegen_codex_skill(self) -> None:
+        window = GameDesignerApp()
+        result = mock.Mock()
+        result.skill_name = "gamedesigner-imagegen"
+        result.codex_skill_dir = Path("C:/Users/Test/.codex/skills/gamedesigner-imagegen")
+        result.portable_skill_dir = Path("D:/GameDesignerData/codex_skills/gamedesigner-imagegen")
+        result.written_dirs = (result.codex_skill_dir, result.portable_skill_dir)
+
+        action = next(
+            action
+            for action in window.ai_menu.actions()
+            if action.text() == "生图功能制作成 Codex Skill"
+        )
+        with (
+            mock.patch(
+                "gamedesigner.codex_skill_export.install_gamedesigner_imagegen_codex_skill",
+                return_value=result,
+            ) as export,
+            mock.patch("gamedesigner.app.QMessageBox.information") as info,
+        ):
+            action.trigger()
+
+        export.assert_called_once_with()
+        self.assertIn("gamedesigner-imagegen", info.call_args.args[2])
+        self.assertIn(".codex", info.call_args.args[2])
+        self.assertIn("codex_skills", info.call_args.args[2])
+        window.deleteLater()
+
     def test_ai_image_generate_button_uses_click_wrapper_without_signal_args(self) -> None:
         settings = AppSettings(ai_image_api_key="secret", ai_image_base_url="https://api.openai.com/v1")
 

@@ -68,6 +68,10 @@ from gamedesigner.ai_presets import (
     ai_profile_key_for_snapshot,
     clean_ai_saved_connections,
 )
+from gamedesigner.codex_skill_export import (
+    GAMEDESIGNER_IMAGEGEN_SKILL_NAME,
+    install_gamedesigner_imagegen_codex_skill,
+)
 from gamedesigner.models import BlueprintGroup, CanvasData, DesignNote, Edge, Node, NodeField, ProjectData
 from gamedesigner.storage import AppSettings, load_settings, save_settings, settings_backup_path, settings_path
 
@@ -117,6 +121,43 @@ class AiToolsTests(unittest.TestCase):
         self.assertEqual(request.count, 2)
         self.assertEqual(request.output_format, "webp")
         self.assertEqual(request.reference_paths, [Path("D:/ref.png")])
+
+    def test_gamedesigner_imagegen_codex_skill_export_writes_installable_skill(self) -> None:
+        with tempfile.TemporaryDirectory() as home_dir, tempfile.TemporaryDirectory() as data_dir:
+            home = Path(home_dir)
+            (home / ".agents" / "skills").mkdir(parents=True)
+
+            result = install_gamedesigner_imagegen_codex_skill(home=home, data_root=Path(data_dir))
+
+            self.assertEqual(result.skill_name, GAMEDESIGNER_IMAGEGEN_SKILL_NAME)
+            self.assertEqual(
+                set(result.written_dirs),
+                {
+                    home / ".codex" / "skills" / GAMEDESIGNER_IMAGEGEN_SKILL_NAME,
+                    home / ".agents" / "skills" / GAMEDESIGNER_IMAGEGEN_SKILL_NAME,
+                    Path(data_dir) / "codex_skills" / GAMEDESIGNER_IMAGEGEN_SKILL_NAME,
+                },
+            )
+            skill_text = (result.codex_skill_dir / "SKILL.md").read_text(encoding="utf-8")
+            openai_yaml = (result.codex_skill_dir / "agents" / "openai.yaml").read_text(encoding="utf-8")
+
+            self.assertIn("name: gamedesigner-imagegen", skill_text)
+            self.assertIn("agent-imagegen.cmd", skill_text)
+            self.assertIn("--final-size 256x256", skill_text)
+            self.assertIn("D:/GameDesignerData/config/settings.json", skill_text)
+            self.assertIn("$gamedesigner-imagegen", openai_yaml)
+            self.assertNotIn("secret", skill_text.lower())
+
+    def test_gamedesigner_imagegen_codex_skill_export_skips_missing_legacy_agents_root(self) -> None:
+        with tempfile.TemporaryDirectory() as home_dir, tempfile.TemporaryDirectory() as data_dir:
+            home = Path(home_dir)
+
+            result = install_gamedesigner_imagegen_codex_skill(home=home, data_root=Path(data_dir))
+
+            self.assertIsNone(result.legacy_skill_dir)
+            self.assertEqual(len(result.written_dirs), 2)
+            self.assertTrue(result.codex_skill_dir.is_dir())
+            self.assertTrue(result.portable_skill_dir.is_dir())
 
     def test_ai_image_request_allows_small_gpt_image_2_size(self) -> None:
         settings = AppSettings(

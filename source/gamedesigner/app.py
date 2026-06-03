@@ -740,6 +740,9 @@ class GameDesignerApp(QMainWindow):
         self.ai_image_action = QAction("AI 生图助手...", self)
         self.ai_image_action.triggered.connect(self._open_ai_image_assistant)
 
+        self.export_imagegen_codex_skill_action = QAction("生图功能制作成 Codex Skill", self)
+        self.export_imagegen_codex_skill_action.triggered.connect(self._export_imagegen_codex_skill)
+
         self.sequence_frame_action = QAction("序列帧动画...", self)
         self.sequence_frame_action.triggered.connect(lambda: self._open_sequence_frame_dialog(pixel_mode=False))
 
@@ -811,6 +814,7 @@ class GameDesignerApp(QMainWindow):
         self.ai_menu = QMenu("AI", self)
         self.ai_menu.addAction(self.ai_chat_action)
         self.ai_menu.addAction(self.ai_image_action)
+        self.ai_menu.addAction(self.export_imagegen_codex_skill_action)
         self.ai_menu.addSeparator()
         self.ai_menu.addAction(self.sequence_frame_action)
         self.ai_menu.addAction(self.pixel_sequence_frame_action)
@@ -3175,6 +3179,24 @@ class GameDesignerApp(QMainWindow):
                 self.ai_assistant_panel.bind_canvas("", "")
         self.ai_assistant_panel.show()
         self.ai_assistant_panel.input.setFocus(Qt.OtherFocusReason)
+
+    def _export_imagegen_codex_skill(self) -> None:
+        from .codex_skill_export import install_gamedesigner_imagegen_codex_skill
+
+        try:
+            result = install_gamedesigner_imagegen_codex_skill()
+        except OSError as exc:
+            QMessageBox.warning(self, "Codex Skill", f"无法生成 Codex Skill：\n{exc}")
+            return
+        locations = "\n".join(str(path) for path in result.written_dirs)
+        QMessageBox.information(
+            self,
+            "Codex Skill",
+            f"已生成 {result.skill_name}。\n\n"
+            f"当前机器 Codex 可直接读取：\n{result.codex_skill_dir}\n\n"
+            f"可复制到其他机器的目录：\n{result.portable_skill_dir}\n\n"
+            f"本次写入：\n{locations}",
+        )
 
     def _open_sequence_frame_dialog(self, *, pixel_mode: bool = False) -> None:
         page = self._current_page()
