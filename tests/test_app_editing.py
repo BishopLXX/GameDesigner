@@ -1,16 +1,26 @@
 import os
 import tempfile
 import unittest
+from ctypes import addressof, wintypes
 from pathlib import Path
 from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEvent, QMimeData, QPointF, Qt
+from PySide6.QtCore import QEvent, QMimeData, QPoint, QPointF, QRect, Qt
 from PySide6.QtGui import QColor, QImage, QKeyEvent, QPixmap, QTextCursor
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QWidget
 
-from gamedesigner.app import EDGE_LABEL_MAX_LENGTH, GameDesignerApp
+from gamedesigner.app import (
+    EDGE_LABEL_MAX_LENGTH,
+    HTBOTTOMLEFT,
+    HTBOTTOMRIGHT,
+    HTRIGHT,
+    HTTOPLEFT,
+    HTTOPRIGHT,
+    WM_NCHITTEST,
+    GameDesignerApp,
+)
 from gamedesigner.image_ai import AiGeneratedImage, AiImageReference, CachedAiImage, cache_generated_ai_image
 from gamedesigner.ai_tools import AiCanvasAction, AiCanvasFieldChange
 from gamedesigner.ai_tools import AiChatMessage, build_project_chat_context, load_project_chat_history, save_project_chat_history
@@ -3304,6 +3314,93 @@ class AppEditingTests(unittest.TestCase):
                 self.assertEqual(window.titlebar.window_mode_button.text(), "全屏")
                 self.assertEqual(window.width(), 1280)
                 self.assertEqual(window.height(), 760)
+                window.deleteLater()
+
+    def test_window_mode_exit_shrinks_screen_sized_normal_geometry(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            settings = AppSettings(workspace_dir=folder, export_dir=str(Path(folder) / "exports"))
+            with mock.patch.dict(os.environ, {"APPDATA": folder}):
+                save_settings(settings)
+                window = GameDesignerApp()
+                available = QRect(0, 0, 1920, 1040)
+                screen = mock.Mock()
+                screen.availableGeometry.return_value = available
+                window._window_fullscreen = True
+                window._normal_window_geometry = QRect(available)
+
+                with (
+                    mock.patch("gamedesigner.app.QApplication.screens", return_value=[screen]),
+                    mock.patch.object(window, "_window_action_screen", return_value=screen),
+                ):
+                    window._exit_window_fullscreen()
+
+                self.assertFalse(window.is_window_fullscreen())
+                self.assertNotEqual(window.geometry(), available)
+                self.assertLess(window.geometry().width(), available.width())
+                self.assertLess(window.geometry().height(), available.height())
+                self.assertEqual(
+                    window._windows_hit_test(QPoint(window.geometry().right(), window.geometry().center().y())),
+                    HTRIGHT,
+                )
+                window.deleteLater()
+
+    def test_window_mode_screen_choice_ignores_cursor_screen(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            settings = AppSettings(workspace_dir=folder, export_dir=str(Path(folder) / "exports"))
+            with mock.patch.dict(os.environ, {"APPDATA": folder}):
+                save_settings(settings)
+                window = GameDesignerApp()
+                window.setGeometry(2100, 120, 1200, 780)
+                window_screen = mock.Mock(name="window_screen")
+                cursor_screen = mock.Mock(name="cursor_screen")
+
+                def screen_at(point: QPoint):
+                    if point == window.frameGeometry().center():
+                        return window_screen
+                    return cursor_screen
+
+                with (
+                    mock.patch("gamedesigner.app.QApplication.screenAt", side_effect=screen_at),
+                    mock.patch("gamedesigner.app.QCursor.pos", return_value=QPoint(100, 100)),
+                ):
+                    self.assertIs(window._window_action_screen(), window_screen)
+                window.deleteLater()
+
+    def test_main_window_hit_test_has_wide_corner_resize_zones(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            settings = AppSettings(workspace_dir=folder, export_dir=str(Path(folder) / "exports"))
+            with mock.patch.dict(os.environ, {"APPDATA": folder}):
+                save_settings(settings)
+                window = GameDesignerApp()
+                window.setGeometry(120, 140, 1280, 760)
+                rect = window.frameGeometry()
+                inset = 10
+
+                self.assertEqual(window._windows_hit_test(rect.topLeft() + QPoint(inset, inset)), HTTOPLEFT)
+                self.assertEqual(window._windows_hit_test(rect.topRight() + QPoint(-inset, inset)), HTTOPRIGHT)
+                self.assertEqual(window._windows_hit_test(rect.bottomLeft() + QPoint(inset, -inset)), HTBOTTOMLEFT)
+                self.assertEqual(window._windows_hit_test(rect.bottomRight() + QPoint(-inset, -inset)), HTBOTTOMRIGHT)
+                window.deleteLater()
+
+    def test_main_window_native_hit_test_uses_windows_message_position(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            settings = AppSettings(workspace_dir=folder, export_dir=str(Path(folder) / "exports"))
+            with mock.patch.dict(os.environ, {"APPDATA": folder}):
+                save_settings(settings)
+                window = GameDesignerApp()
+                msg = wintypes.MSG()
+                msg.message = WM_NCHITTEST
+                msg.lParam = ((30 & 0xFFFF) << 16) | (-7 & 0xFFFF)
+
+                with (
+                    mock.patch("gamedesigner.app.sys.platform", "win32"),
+                    mock.patch.object(window, "_windows_hit_test", return_value=HTBOTTOMRIGHT) as hit_test,
+                ):
+                    handled, result = window.nativeEvent(b"windows_generic_MSG", int(addressof(msg)))
+
+                self.assertTrue(handled)
+                self.assertEqual(result, HTBOTTOMRIGHT)
+                hit_test.assert_called_once_with(QPoint(-7, 30))
                 window.deleteLater()
 
 

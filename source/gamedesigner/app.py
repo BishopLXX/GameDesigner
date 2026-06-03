@@ -150,7 +150,26 @@ HTTOPRIGHT = 14
 HTBOTTOM = 15
 HTBOTTOMLEFT = 16
 HTBOTTOMRIGHT = 17
-RESIZE_BORDER = 6
+RESIZE_BORDER = 12
+
+
+def _is_windows_generic_message(event_type: Any) -> bool:
+    if isinstance(event_type, str):
+        return event_type == "windows_generic_MSG"
+    try:
+        return bytes(event_type).decode("ascii", errors="ignore") == "windows_generic_MSG"
+    except (TypeError, ValueError):
+        return False
+
+
+def _windows_point_from_lparam(lparam: int) -> QPoint:
+    value = int(lparam)
+    return QPoint(_signed_short(value & 0xFFFF), _signed_short((value >> 16) & 0xFFFF))
+
+
+def _signed_short(value: int) -> int:
+    value = int(value) & 0xFFFF
+    return value - 0x10000 if value & 0x8000 else value
 
 
 def _app_icon_path() -> Path | None:
@@ -853,10 +872,10 @@ class GameDesignerApp(QMainWindow):
         escape.activated.connect(self._cancel_connection)
 
     def nativeEvent(self, event_type, message):  # type: ignore[override]
-        if sys.platform.startswith("win") and event_type == "windows_generic_MSG":
+        if sys.platform.startswith("win") and _is_windows_generic_message(event_type):
             msg = wintypes.MSG.from_address(int(message))
             if msg.message == WM_NCHITTEST:
-                hit = self._windows_hit_test(QCursor.pos())
+                hit = self._windows_hit_test(_windows_point_from_lparam(msg.lParam))
                 if hit:
                     return True, hit
         return super().nativeEvent(event_type, message)
@@ -3750,27 +3769,60 @@ class GameDesignerApp(QMainWindow):
             titlebar.set_fullscreen_mode(self._window_fullscreen)
 
     def _window_action_screen(self):
-        for point in (QCursor.pos(), self.frameGeometry().center()):
-            screen = QApplication.screenAt(point)
-            if screen is not None:
-                return screen
+        screen = QApplication.screenAt(self.frameGeometry().center())
+        if screen is not None:
+            return screen
         handle = self.windowHandle()
         if handle is not None and handle.screen() is not None:
             return handle.screen()
         return QApplication.primaryScreen()
 
     def _constrain_window_geometry_to_screens(self, geometry: QRect) -> QRect:
+        target_screen = None
         if geometry.isValid():
-            for screen in QApplication.screens():
-                if geometry.intersects(screen.availableGeometry()):
+            target_screen, visible_area = self._best_screen_for_geometry(geometry)
+            if target_screen is not None:
+                available = target_screen.availableGeometry()
+                if self._geometry_matches_available_screen(geometry, available):
+                    return self._default_window_geometry_on_screen(available, geometry)
+                total_area = max(1, geometry.width() * geometry.height())
+                if visible_area / total_area >= 0.35:
                     return QRect(geometry)
-        screen = self._window_action_screen() or QApplication.primaryScreen()
+        screen = target_screen or self._window_action_screen() or QApplication.primaryScreen()
         if screen is None:
             return QRect(geometry)
         available = screen.availableGeometry()
-        width = min(max(geometry.width(), self.minimumWidth()), available.width())
-        height = min(max(geometry.height(), self.minimumHeight()), available.height())
-        return QRect(available.left() + 40, available.top() + 40, width, height)
+        return self._default_window_geometry_on_screen(available, geometry)
+
+    def _best_screen_for_geometry(self, geometry: QRect):
+        best_screen = None
+        best_area = 0
+        for screen in QApplication.screens():
+            available = screen.availableGeometry()
+            intersection = geometry.intersected(available)
+            area = max(0, intersection.width()) * max(0, intersection.height())
+            if area > best_area:
+                best_screen = screen
+                best_area = area
+        return best_screen, best_area
+
+    def _geometry_matches_available_screen(self, geometry: QRect, available: QRect) -> bool:
+        return (
+            abs(geometry.left() - available.left()) <= 2
+            and abs(geometry.top() - available.top()) <= 2
+            and abs(geometry.width() - available.width()) <= 2
+            and abs(geometry.height() - available.height()) <= 2
+        )
+
+    def _default_window_geometry_on_screen(self, available: QRect, preferred: QRect | None = None) -> QRect:
+        preferred = preferred if preferred is not None and preferred.isValid() else QRect(0, 0, 1360, 860)
+        max_width = max(self.minimumWidth(), available.width() - 96)
+        max_height = max(self.minimumHeight(), available.height() - 96)
+        width = min(max(self.minimumWidth(), min(preferred.width(), 1360)), max_width)
+        height = min(max(self.minimumHeight(), min(preferred.height(), 860)), max_height)
+        x = available.left() + max(0, (available.width() - width) // 2)
+        y = available.top() + max(0, (available.height() - height) // 2)
+        return QRect(x, y, width, height)
 
     def _remember_normal_window_geometry(self) -> None:
         if self._window_fullscreen or self.isMinimized():
