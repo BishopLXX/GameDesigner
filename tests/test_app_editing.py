@@ -2346,6 +2346,76 @@ class AppEditingTests(unittest.TestCase):
         self.assertEqual(saved["canvases"][child.id]["target_folder"], "D:/changed")
         dialog.deleteLater()
 
+    def test_export_canvas_csv_dialog_restores_saved_canvas_state_by_name_for_new_id(self) -> None:
+        from gamedesigner.qt_dialogs import ExportCanvasCsvDialog
+
+        project = ProjectData(name="导出状态按名字恢复")
+        project.ensure_canvas_structure()
+        body = project.add_canvas("BodyData")
+        state = {
+            "canvases": {
+                "old_canvas_id": {
+                    "canvas_name": "BodyData",
+                    "enabled": False,
+                    "sort_mode": "y",
+                    "target_folder": "D:/body",
+                    "export_edges": True,
+                }
+            }
+        }
+
+        dialog = ExportCanvasCsvDialog(None, project, "D:/default", export_state=state)
+        checkbox, combo, folder_edit, edge_check, _group_check, _layout_check = dialog._canvas_rows[body.id]
+
+        self.assertFalse(checkbox.isChecked())
+        self.assertEqual(combo.currentData(), "y")
+        self.assertEqual(folder_edit.text(), "D:/body")
+        self.assertTrue(edge_check.isChecked())
+        dialog.deleteLater()
+
+    def test_export_canvas_csv_dialog_state_is_saved_when_cancelled(self) -> None:
+        project_path = Path(self._appdata_temp.name) / "ExportState.gdc"
+        window = GameDesignerApp()
+        project = ProjectData(name="取消保存导出状态")
+        project.ensure_canvas_structure()
+        page = window._add_page(project, project_path, dirty=False, canvas_data=project.root_canvas())
+        window.tabs.setCurrentWidget(page)
+        state = {
+            "folder": "D:/chosen",
+            "canvases": {
+                project.root_canvas_id: {
+                    "canvas_name": project.root_canvas().name,
+                    "enabled": False,
+                    "sort_mode": "created",
+                    "target_folder": "D:/root-only",
+                    "export_edges": False,
+                    "export_groups": False,
+                    "export_layout_info": False,
+                }
+            },
+        }
+
+        class FakeExportCanvasCsvDialog:
+            Accepted = 1
+
+            def __init__(self, *_args, **_kwargs) -> None:
+                self.result_data = None
+
+            def exec(self) -> int:
+                return 0
+
+            def export_state(self) -> dict[str, object]:
+                return state
+
+        with mock.patch("gamedesigner.qt_dialogs.ExportCanvasCsvDialog", FakeExportCanvasCsvDialog):
+            window._export_all_canvas_csv()
+
+        saved = load_settings().export_canvas_csv_dialog
+        project_state = saved["projects"][str(project_path.resolve())]
+        self.assertEqual(project_state["folder"], "D:/chosen")
+        self.assertEqual(project_state["canvases"][project.root_canvas_id]["target_folder"], "D:/root-only")
+        window.deleteLater()
+
     def test_export_canvas_csv_dialog_disables_edge_export_for_data_canvas(self) -> None:
         from gamedesigner.qt_dialogs import ExportCanvasCsvDialog
 

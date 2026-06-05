@@ -1994,11 +1994,12 @@ class GameDesignerApp(QMainWindow):
             theme=self.theme,
             export_state=self._export_canvas_csv_dialog_state(page),
         )
-        if dialog.exec() != ExportCanvasCsvDialog.Accepted or not dialog.result_data:
+        result = dialog.exec()
+        self._save_export_canvas_csv_dialog_state(page, dialog.export_state())
+        if result != ExportCanvasCsvDialog.Accepted or not dialog.result_data:
             return
         folder = str(dialog.result_data["folder"])
         canvas_specs = list(dialog.result_data["canvas_specs"])
-        self._save_export_canvas_csv_dialog_state(page, dict(dialog.result_data.get("export_state") or {}))
         try:
             export_paths = export_all_canvas_csv(
                 page.project,
