@@ -22,6 +22,7 @@ from gamedesigner.image_ai import (
     load_cached_ai_images,
     pixel_source_path_for_candidate,
     _encode_multipart,
+    _json_payload,
     _multipart_body,
     _post,
 )
@@ -932,6 +933,22 @@ class AiToolsTests(unittest.TestCase):
         self.assertIn("high", text)
         self.assertIn("output_format", text)
         self.assertNotIn("input_fidelity", text)
+
+    def test_compatible_gpt_image_request_omits_response_format(self) -> None:
+        settings = AppSettings(
+            ai_image_provider="compatible",
+            ai_image_model="gpt-image-2",
+            ai_image_api_key="secret",
+            ai_image_base_url="https://www.packyapi.com",
+            ai_image_quality="high",
+        )
+
+        request = build_ai_image_request(settings, "生成酒馆资源图")
+        payload = _json_payload(request)
+
+        self.assertEqual(request.base_url, "https://www.packyapi.com/v1")
+        self.assertIn("output_format", payload)
+        self.assertNotIn("response_format", payload)
 
     def test_ai_image_multipart_handles_chinese_prompt_and_filename(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

@@ -448,8 +448,6 @@ def _add_optional_image_params(payload: dict[str, Any], request: AiImageRequest)
         payload["output_format"] = request.output_format
         if request.reference_paths and request.model in {"gpt-image-1.5", "gpt-image-1", "gpt-image-1-mini"}:
             payload["input_fidelity"] = "high"
-        if request.provider == "compatible":
-            payload["response_format"] = "b64_json"
         if request.background != "auto":
             payload["background"] = request.background
     elif request.model == "dall-e-3":
