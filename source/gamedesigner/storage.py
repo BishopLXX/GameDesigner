@@ -139,7 +139,7 @@ class AppSettings:
         if ai_auth_mode not in {"official", "api_key"}:
             ai_auth_mode = "official"
         ai_image_provider = str(raw.get("ai_image_provider", "openai") or "openai")
-        if ai_image_provider not in {"openai", "compatible"}:
+        if ai_image_provider not in {"codex", "openai", "compatible"}:
             ai_image_provider = "openai"
         ai_api_key, ai_base_url = normalize_ai_credentials(
             str(raw.get("ai_api_key", "") or ""),

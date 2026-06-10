@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import shutil
+import sys
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QSize, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtCore import QProcess, QSize, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QIcon, QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -52,6 +53,7 @@ from ..image_ai import (
     save_ai_image_reference_from_qimage,
 )
 from ..image_rendering import PixmapCache
+from ..ai_tools import resolve_ai_cli_program
 from ..pixel_art import (
     AI_IMAGE_PIXEL_OUTPUT_SIZE_PRESETS,
     api_ai_image_size,
@@ -107,6 +109,7 @@ class AiImageSettingsDialog(QDialog):
         self.settings = settings
 
         self.provider_combo = QComboBox()
+        self.provider_combo.addItem("Codex 官方登录", "codex")
         self.provider_combo.addItem("OpenAI 官方 API", "openai")
         self.provider_combo.addItem("OpenAI 兼容 API", "compatible")
         provider_index = self.provider_combo.findData(getattr(settings, "ai_image_provider", "openai"))
@@ -121,6 +124,8 @@ class AiImageSettingsDialog(QDialog):
         self.api_key_edit = QLineEdit(settings.ai_image_api_key)
         self.api_key_edit.setEchoMode(QLineEdit.Password)
         self.api_key_edit.setPlaceholderText("OpenAI 或兼容服务 API Key")
+        self.login_button = QPushButton("打开 Codex 登录")
+        self.login_button.clicked.connect(self._open_codex_login)
 
         self.base_url_edit = QLineEdit(settings.ai_image_base_url)
         self.base_url_edit.setPlaceholderText("例如 https://api.openai.com/v1")
@@ -175,6 +180,7 @@ class AiImageSettingsDialog(QDialog):
         form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         form.addRow("服务", self.provider_combo)
         form.addRow("模型", self.model_combo)
+        form.addRow("", self.login_button)
         form.addRow("API Key", self.api_key_edit)
         form.addRow("Base URL", self.base_url_edit)
         form.addRow("Aseprite CLI", self.aseprite_cli_edit)
@@ -202,8 +208,33 @@ class AiImageSettingsDialog(QDialog):
         self._refresh_provider_fields()
 
     def _refresh_provider_fields(self) -> None:
-        official = self.provider_combo.currentData() == "openai"
-        self.base_url_edit.setEnabled(not official)
+        provider = self.provider_combo.currentData()
+        codex = provider == "codex"
+        official = provider == "openai"
+        self.login_button.setEnabled(codex)
+        self.api_key_edit.setEnabled(not codex)
+        self.base_url_edit.setEnabled(not codex and not official)
+
+    def _open_codex_login(self) -> None:
+        program = "codex"
+        resolved_program = resolve_ai_cli_program(program)
+        if resolved_program == program and not Path(resolved_program).exists():
+            QMessageBox.warning(
+                self,
+                "无法打开登录",
+                "找不到 codex CLI。请先运行 release 里的 GameDesigner-Setup.exe 安装 AI 运行环境，或确认 CLI 已安装并在 PATH 中。",
+            )
+            return
+        if sys.platform.startswith("win"):
+            started = QProcess.startDetached("cmd.exe", ["/d", "/c", "start", "", resolved_program, "login"])
+        else:
+            started = QProcess.startDetached(resolved_program, ["login"])
+        if not started:
+            QMessageBox.warning(
+                self,
+                "无法打开登录",
+                "无法启动 codex CLI。请先运行 release 里的 GameDesigner-Setup.exe 安装 AI 运行环境，或确认 CLI 已安装并在 PATH 中。",
+            )
 
     def _choose_pixel_refiner_model_dir(self) -> None:
         folder = QFileDialog.getExistingDirectory(
@@ -217,8 +248,12 @@ class AiImageSettingsDialog(QDialog):
     def _save(self) -> None:
         self.settings.ai_image_provider = str(self.provider_combo.currentData() or "openai")
         self.settings.ai_image_model = self.model_combo.currentText().strip() or AI_IMAGE_MODEL_PRESETS[0]
-        self.settings.ai_image_api_key = self.api_key_edit.text().strip()
-        self.settings.ai_image_base_url = self.base_url_edit.text().strip()
+        if self.settings.ai_image_provider == "codex":
+            self.settings.ai_image_api_key = ""
+            self.settings.ai_image_base_url = ""
+        else:
+            self.settings.ai_image_api_key = self.api_key_edit.text().strip()
+            self.settings.ai_image_base_url = self.base_url_edit.text().strip()
         self.settings.aseprite_cli_path = normalize_aseprite_cli_path(self.aseprite_cli_edit.text())
         self.settings.pixel_refiner_service_url = normalize_pixel_refiner_service_url(self.pixel_refiner_url_edit.text())
         self.settings.pixel_refiner_model_dir = self.pixel_refiner_model_dir_edit.text().strip()
@@ -562,8 +597,15 @@ class AiImagePanel(QWidget):
         _fill_value_combo(combo, values, current)
 
     def _refresh_header(self) -> None:
-        provider = "OpenAI 官方" if self.settings.ai_image_provider == "openai" else "兼容 API"
-        base_url = self.settings.ai_image_base_url.strip() if self.settings.ai_image_provider == "compatible" else "api.openai.com"
+        if self.settings.ai_image_provider == "codex":
+            provider = "Codex 官方登录"
+            base_url = "~/.codex/auth.json"
+        elif self.settings.ai_image_provider == "openai":
+            provider = "OpenAI 官方"
+            base_url = "api.openai.com"
+        else:
+            provider = "兼容 API"
+            base_url = self.settings.ai_image_base_url.strip()
         if self.settings.ai_image_provider == "compatible" and base_url and "/v1" not in base_url.rstrip("/"):
             base_url = f"{base_url.rstrip('/')}/v1"
         binding = f"    绑定: {self._bound_canvas_name}" if self._bound_canvas_name else ""

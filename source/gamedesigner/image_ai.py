@@ -47,6 +47,7 @@ from .pixel_refiner import (
     resolve_pixel_refiner_service_model,
 )
 from .storage import AppSettings, project_bundle_dir
+from .ai_tools import portable_ai_runtime_environment, resolve_ai_cli_program
 
 
 AI_IMAGE_DIR = "ai_images"
@@ -64,7 +65,7 @@ AI_IMAGE_MODEL_PRESETS = [
 AI_IMAGE_QUALITY_PRESETS = ["auto", "low", "medium", "high"]
 AI_IMAGE_BACKGROUND_PRESETS = ["auto", "transparent", "opaque"]
 AI_IMAGE_OUTPUT_FORMAT_PRESETS = ["png", "webp", "jpeg"]
-AI_IMAGE_PROVIDERS = {"openai", "compatible"}
+AI_IMAGE_PROVIDERS = {"codex", "openai", "compatible"}
 AI_IMAGE_POST_MAX_ATTEMPTS = 3
 AI_IMAGE_TRANSIENT_HTTP_CODES = {408, 409, 429, 500, 502, 503, 504}
 PIXEL_ART_OUTLINE_LUMA_MAX = 72
@@ -145,6 +146,49 @@ def normalized_ai_image_provider(value: str) -> str:
     return value if value in AI_IMAGE_PROVIDERS else "openai"
 
 
+def codex_auth_path() -> Path:
+    override = os.getenv("CODEX_HOME", "").strip()
+    if override:
+        return Path(override).expanduser() / "auth.json"
+    return Path.home() / ".codex" / "auth.json"
+
+
+def load_codex_access_token() -> str:
+    _refresh_codex_login_token()
+    path = codex_auth_path()
+    try:
+        with path.open("r", encoding="utf-8-sig") as file:
+            raw = json.load(file)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise AiImageError(
+            f"没有找到可用的 Codex 官方登录。请先在生图设置里点击“打开 Codex 登录”，完成登录后再生图。\n路径：{path}"
+        ) from exc
+    tokens = raw.get("tokens") if isinstance(raw, dict) else None
+    access_token = tokens.get("access_token") if isinstance(tokens, dict) else ""
+    if not isinstance(access_token, str) or not access_token.strip():
+        raise AiImageError(
+            f"Codex 登录文件里没有可用的 access_token。请重新打开 Codex 登录。\n路径：{path}"
+        )
+    return access_token.strip()
+
+
+def _refresh_codex_login_token() -> None:
+    program = resolve_ai_cli_program("codex")
+    env = os.environ.copy()
+    env.update(portable_ai_runtime_environment())
+    try:
+        subprocess.run(
+            [program, "login", "status"],
+            check=False,
+            capture_output=True,
+            timeout=20,
+            env=env,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return
+
+
 def build_ai_image_request(
     settings: AppSettings,
     prompt: str,
@@ -156,11 +200,11 @@ def build_ai_image_request(
         str(getattr(settings, "ai_image_base_url", "") or ""),
     )
     base_url = configured_base_url
-    if provider == "openai" or not base_url:
+    if provider in {"codex", "openai"} or not base_url:
         base_url = "https://api.openai.com/v1"
     else:
         base_url = _normalized_compatible_base_url(base_url)
-    api_key = configured_key or os.getenv("OPENAI_API_KEY", "").strip()
+    api_key = load_codex_access_token() if provider == "codex" else configured_key or os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise AiImageError("请先在生图设置里填写 OpenAI 或兼容服务的 API Key。")
     requested_background = _coerce_choice(
@@ -193,24 +237,32 @@ def build_ai_image_request(
 def generate_ai_images(request: AiImageRequest) -> list[AiGeneratedImage]:
     if not request.prompt:
         raise AiImageError("请输入生图描述。")
-    if request.reference_paths:
-        body, content_type = _multipart_body(request)
-        raw = _post(
-            f"{request.base_url}/images/edits",
-            request.api_key,
-            body,
-            content_type,
-            timeout=request.timeout,
-        )
-    else:
-        payload = _json_payload(request)
-        raw = _post(
-            f"{request.base_url}/images/generations",
-            request.api_key,
-            json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            "application/json",
-            timeout=request.timeout,
-        )
+    try:
+        if request.reference_paths:
+            body, content_type = _multipart_body(request)
+            raw = _post(
+                f"{request.base_url}/images/edits",
+                request.api_key,
+                body,
+                content_type,
+                timeout=request.timeout,
+            )
+        else:
+            payload = _json_payload(request)
+            raw = _post(
+                f"{request.base_url}/images/generations",
+                request.api_key,
+                json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                "application/json",
+                timeout=request.timeout,
+            )
+    except AiImageError as exc:
+        if request.provider == "codex" and _looks_like_missing_image_scope(str(exc)):
+            raise AiImageError(
+                "Codex 官方登录已读取成功，但当前 Codex 登录 token 没有图片 API 权限（缺少 api.model.images.request scope）。"
+                "Codex 桌面端内置生图可用，不代表 CLI 登录态可直接调用图片 API。请暂时切换到 OpenAI 官方 API Key 或兼容 API Key。"
+            ) from exc
+        raise
     return _parse_images_response(raw, request.output_format)
 
 
@@ -526,6 +578,11 @@ def _format_api_error(code: int, detail: str) -> str:
         elif isinstance(error, str):
             message = error
     return f"生图 API 请求失败（HTTP {code}）：{message or _plain_error_detail(detail) or '没有错误详情'}"
+
+
+def _looks_like_missing_image_scope(message: str) -> bool:
+    text = message.casefold()
+    return "api.model.images.request" in text or ("missing scopes" in text and "image" in text)
 
 
 def _plain_error_detail(detail: str) -> str:

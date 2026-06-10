@@ -17,6 +17,7 @@ from gamedesigner.image_ai import (
     ai_image_cache_dir,
     build_ai_image_request,
     cache_generated_ai_image,
+    generate_ai_images,
     generate_pixel_refiner_candidates,
     generate_pixel_downscale_candidates,
     load_cached_ai_images,
@@ -242,6 +243,67 @@ class AiToolsTests(unittest.TestCase):
             with self.assertRaises(AiImageError):
                 build_ai_image_request(settings, "asset")
 
+    def test_ai_image_request_can_use_codex_login_token(self) -> None:
+        with tempfile.TemporaryDirectory() as codex_home:
+            auth_path = Path(codex_home) / "auth.json"
+            auth_path.write_text(
+                '{"auth_mode":"chatgpt","tokens":{"access_token":"codex-access-token"}}',
+                encoding="utf-8",
+            )
+            settings = AppSettings(
+                ai_image_provider="codex",
+                ai_image_model="gpt-image-1.5",
+                ai_image_api_key="",
+                ai_image_base_url="https://ignored.example/v1",
+            )
+
+            with (
+                mock.patch.dict(os.environ, {"CODEX_HOME": codex_home, "OPENAI_API_KEY": ""}),
+                mock.patch("gamedesigner.image_ai._refresh_codex_login_token"),
+            ):
+                request = build_ai_image_request(settings, "asset")
+
+        self.assertEqual(request.provider, "codex")
+        self.assertEqual(request.api_key, "codex-access-token")
+        self.assertEqual(request.base_url, "https://api.openai.com/v1")
+
+    def test_ai_image_request_explains_missing_codex_login(self) -> None:
+        with tempfile.TemporaryDirectory() as codex_home:
+            settings = AppSettings(ai_image_provider="codex", ai_image_api_key="")
+
+            with (
+                mock.patch.dict(os.environ, {"CODEX_HOME": codex_home, "OPENAI_API_KEY": ""}),
+                mock.patch("gamedesigner.image_ai._refresh_codex_login_token"),
+            ):
+                with self.assertRaises(AiImageError) as raised:
+                    build_ai_image_request(settings, "asset")
+
+        self.assertIn("Codex 官方登录", str(raised.exception))
+
+    def test_codex_image_generation_explains_missing_image_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as codex_home:
+            auth_path = Path(codex_home) / "auth.json"
+            auth_path.write_text(
+                '{"auth_mode":"chatgpt","tokens":{"access_token":"codex-access-token"}}',
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.dict(os.environ, {"CODEX_HOME": codex_home}),
+                mock.patch("gamedesigner.image_ai._refresh_codex_login_token"),
+            ):
+                request = build_ai_image_request(AppSettings(ai_image_provider="codex"), "asset")
+
+        with mock.patch(
+            "gamedesigner.image_ai._post",
+            side_effect=AiImageError("Missing scopes: api.model.images.request"),
+        ):
+            with self.assertRaises(AiImageError) as raised:
+                generate_ai_images(request)
+
+        message = str(raised.exception)
+        self.assertIn("api.model.images.request", message)
+        self.assertIn("API Key", message)
+
     def test_ai_image_post_retries_transient_gateway_timeout(self) -> None:
         class FakeResponse:
             def __enter__(self):  # noqa: ANN204
@@ -343,6 +405,13 @@ class AiToolsTests(unittest.TestCase):
         self.assertEqual(loaded.pixel_refiner_model_id, "pixel-refiner-custom")
         self.assertEqual(loaded.pixel_refiner_strength, 0.8)
         self.assertEqual(loaded.pixel_refiner_candidates, 3)
+
+    def test_app_settings_roundtrip_codex_image_provider(self) -> None:
+        settings = AppSettings(ai_image_provider="codex", ai_image_api_key="", ai_image_base_url="")
+
+        loaded = AppSettings.from_dict(settings.to_dict())
+
+        self.assertEqual(loaded.ai_image_provider, "codex")
 
     def test_pixel_refiner_settings_fall_back_to_v1_defaults(self) -> None:
         settings = AppSettings.from_dict(

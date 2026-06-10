@@ -394,6 +394,30 @@ class AppEditingTests(unittest.TestCase):
                 self.assertEqual(loaded.pixel_refiner_service_url, "http://127.0.0.1:9001")
                 dialog.deleteLater()
 
+    def test_ai_image_settings_dialog_can_select_codex_login(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            settings = AppSettings(
+                workspace_dir=folder,
+                export_dir=str(Path(folder) / "exports"),
+                ai_image_provider="openai",
+                ai_image_api_key="saved-image-key",
+                ai_image_base_url="https://ignored.example/v1",
+            )
+            with mock.patch.dict(os.environ, {"APPDATA": folder}):
+                save_settings(settings)
+                dialog = AiImageSettingsDialog(None, settings)
+                codex_index = dialog.provider_combo.findData("codex")
+                dialog.provider_combo.setCurrentIndex(codex_index)
+
+                dialog._save()
+
+                self.assertEqual(settings.ai_image_provider, "codex")
+                self.assertEqual(settings.ai_image_api_key, "")
+                self.assertEqual(settings.ai_image_base_url, "")
+                loaded = load_settings()
+                self.assertEqual(loaded.ai_image_provider, "codex")
+                dialog.deleteLater()
+
     def test_ai_image_panel_shows_chinese_background_labels(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             project_path = Path(folder) / "PanelBackground.gdc"

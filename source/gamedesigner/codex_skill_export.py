@@ -76,7 +76,8 @@ The command reads config in this order:
 1. CLI arguments.
 2. `%USERPROFILE%/.agent-imagegen/config.json`.
 3. GameDesigner fallback: `D:/GameDesignerData/config/settings.json` or `%GAMEDESIGNER_DATA_DIR%/config/settings.json`.
-4. `OPENAI_API_KEY`.
+4. Codex official login when provider is `codex`, from `%CODEX_HOME%/auth.json` or `%USERPROFILE%/.codex/auth.json`.
+5. `OPENAI_API_KEY` for API-key providers.
 
 Never print or expose API keys.
 
@@ -119,7 +120,7 @@ Reference redraw:
 
 After generation, import the PNG as the engine's normal 2D sprite/texture asset. For Unity, use `Sprite (2D and UI)`; for 9-slice UI chrome, set Sprite borders and use `Image.Type.Sliced`.
 
-If the API/config is missing, report the exact missing config path and stop.
+If provider is `codex` and login is missing, ask the user to run `codex login`. If an API-key provider is configured and the API/config is missing, report the exact missing config path and stop.
 """
 
 
